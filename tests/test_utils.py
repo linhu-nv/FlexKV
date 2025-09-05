@@ -40,7 +40,7 @@ DEFAULT_CACHE_CONFIG = {
     'enable_trace': False,
     'use_pinned_memory': False,
     'ssd_cache_dir': ["./ssd_cache", "./ssd_cache2/"],
-    'ssd_cache_iouring_entries': 0,
+    'ssd_cache_iouring_entries': 32,
     'remote_cache_path': ["remote_cache1", "remote_cache2"],
     'remote_config_custom': {
         "pcfs_fsid": "f_l91fz6",
@@ -342,7 +342,7 @@ class KVManagerServerClient:
         from flexkv.server.client import KVTPClient
         from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 
-        tp_client = KVTPClient(server_recv_port, dp_client_id, device_id, tp_rank)
+        tp_client = KVTPClient(server_recv_port, dp_client_id, device_id)
         # Convert dtype string back to torch dtype
         if dtype_str == "torch.float16":
             dtype = torch.float16
