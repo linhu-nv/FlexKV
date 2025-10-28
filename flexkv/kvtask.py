@@ -106,7 +106,6 @@ class KVTaskManager:
         model_config_for_transfer = copy.deepcopy(self.model_config)
         if self.is_multinode_tp and not self.model_config.use_mla:
             model_config_for_transfer.num_kv_heads = self.tp_size_per_node
-
         self.transfer_handles = [TransferManagerHandle(
             model_config_for_transfer,
             self.cache_config,
