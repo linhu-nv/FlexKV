@@ -103,7 +103,9 @@ class KVTaskManager:
                  cache_config: CacheConfig,
                  gpu_register_port: Optional[str] = None,
                  redis_meta: RedisMeta = None,
-                 event_collector: Optional[KVEventCollector] = None
+                 event_collector: Optional[KVEventCollector] = None,
+                 shm_te_server_id: Optional[str] = None,
+                 shm_te_channel_id: Optional[int] = None,
                  ):
         if not cache_config.enable_cpu:
             raise ValueError("enable_cpu must be True")
@@ -143,7 +145,21 @@ class KVTaskManager:
                 model_config_for_transfer.num_kv_heads //= self.tp_node_count
 
         combine_with_trtllm = os.getenv("FLEXKV_WITH_TRTLLM", "0") == "1"
-        if not combine_with_trtllm:
+        # Multi-DP shm path: connect this CE to a pre-existing TE process
+        # via a named ShmChannel rather than spawning a new TE subprocess.
+        use_shm_te = (shm_te_server_id is not None
+                      and shm_te_channel_id is not None
+                      and not combine_with_trtllm)
+        if use_shm_te:
+            self.transfer_handles = [TransferManagerHandle(
+                model_config_for_transfer,
+                self.cache_config,
+                mode="shm",
+                gpu_register_port=gpu_register_port,
+                shm_server_id=shm_te_server_id,
+                shm_channel_id=shm_te_channel_id,
+            )]
+        elif not combine_with_trtllm:
             self.transfer_handles = [TransferManagerHandle(
                 model_config_for_transfer,
                 self.cache_config,
@@ -530,9 +546,14 @@ class KVTaskEngine(KVTaskManager):
                  cache_config: CacheConfig,
                  gpu_register_port: Optional[str] = None,
                  redis_meta: Optional[RedisMeta] = None,
-                 event_collector: Optional[KVEventCollector] = None
+                 event_collector: Optional[KVEventCollector] = None,
+                 shm_te_server_id: Optional[str] = None,
+                 shm_te_channel_id: Optional[int] = None,
                  ):
-        super().__init__(model_config, cache_config, gpu_register_port, redis_meta, event_collector)
+        super().__init__(model_config, cache_config, gpu_register_port,
+                         redis_meta, event_collector,
+                         shm_te_server_id=shm_te_server_id,
+                         shm_te_channel_id=shm_te_channel_id)
         self.tracer = FlexKVTracer()
         self.tracer.trace_config(model_config, cache_config, gpu_layout=None)
 
