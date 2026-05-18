@@ -375,6 +375,12 @@ class GlobalCacheEngine:
         self.remote_cache_engine = None
 
         self.index_accel = GLOBAL_CONFIG_FROM_ENV.index_accel
+        # When True, replace per-device CacheEngine{,Accel} with the radixshmem-
+        # backed engine so multiple DP processes share a single index in shm.
+        self.use_radix_shmem = bool(getattr(GLOBAL_CONFIG_FROM_ENV, "radix_shmem", False))
+        self._shm_radix_server_id = getattr(
+            GLOBAL_CONFIG_FROM_ENV, "shm_radix_server_id", "default"
+        )
         if cache_config.enable_kv_sharing:
             assert redis_meta is not None
             self.redis_meta = redis_meta
@@ -410,6 +416,10 @@ class GlobalCacheEngine:
         if cache_config.enable_cpu:
             if cache_config.enable_p2p_cpu:
                 self.cpu_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.CPU, meta=self.redis_meta) #TODO
+            elif self.use_radix_shmem:
+                self.cpu_cache_engine = self._build_radix_shmem_engine(
+                    DeviceType.CPU, cache_config.num_cpu_blocks, event_collector
+                )
             elif self.index_accel:
                 self.cpu_cache_engine = CacheEngineAccel(
                     device_type=DeviceType.CPU,
@@ -440,6 +450,10 @@ class GlobalCacheEngine:
         if cache_config.enable_ssd:
             if cache_config.enable_p2p_ssd:
                 self.ssd_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.SSD, meta=self.redis_meta) #TODO
+            elif self.use_radix_shmem:
+                self.ssd_cache_engine = self._build_radix_shmem_engine(
+                    DeviceType.SSD, cache_config.num_ssd_blocks, event_collector
+                )
             elif self.index_accel:
                 self.ssd_cache_engine = CacheEngineAccel(
                     device_type=DeviceType.SSD,
@@ -471,6 +485,10 @@ class GlobalCacheEngine:
             if cache_config.enable_kv_sharing:
                 # Build PCFSCacheEngine from CacheConfig directly (replacing RemotePCFSCacheEngine) TODO
                 self.remote_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.REMOTE, meta=self.redis_meta)
+            elif self.use_radix_shmem:
+                self.remote_cache_engine = self._build_radix_shmem_engine(
+                    DeviceType.REMOTE, cache_config.num_remote_blocks, None
+                )
             elif self.index_accel:
                 self.remote_cache_engine = CacheEngineAccel(
                     device_type=DeviceType.REMOTE,
@@ -509,6 +527,34 @@ class GlobalCacheEngine:
         
         # Update initial mempool stats
         self._update_mempool_metrics()
+
+    def _build_radix_shmem_engine(self,
+                                   device_type: DeviceType,
+                                   num_blocks: int,
+                                   event_collector) -> "object":
+        """Attach to a pre-created radixshmem region as a TreeClient.
+
+        The shm region itself (TreeServer) is owned by the KVManager bootstrap
+        process via `flexkv.server.shm_radix_bootstrap.create_shm_radix_regions`.
+        Non-bootstrap procs poll for region availability before reaching this
+        point, so the attach is unconditional here.
+        """
+        from flexkv.cache.radix_shmem_engine import CacheEngineRadixShmem
+        from flexkv.server.shm_radix_bootstrap import shm_name_for
+
+        return CacheEngineRadixShmem(
+            device_type=device_type,
+            num_total_blocks=num_blocks,
+            tokens_per_block=self.cache_config.tokens_per_block,
+            shm_name=shm_name_for(device_type, self._shm_radix_server_id),
+            evict_ratio=self.evict_ratio,
+            evict_start_threshold=self.evict_start_threshold,
+            hit_reward_seconds=self.hit_reward_seconds,
+            eviction_policy=self.eviction_policy,
+            event_collector=event_collector,
+            metrics_collector=self._metrics_collector,
+            protected_threshold=self.protected_threshold,
+        )
 
     def start(self) -> None:
         if self.cpu_cache_engine and self.cache_config.enable_p2p_cpu:
