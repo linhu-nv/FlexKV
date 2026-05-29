@@ -197,9 +197,13 @@ class FlexKVSchedulerConnector:
         self.maybe_skip_put = os.getenv('FLEXKV_MAYBE_SKIP_PUT', '0') == '1'
 
         # only support local batching for now
+        # TEMP DIAGNOSTIC: hard-disable batching to see if merge_to_batch_graph
+        # is the source of the duplicate-op_id KeyError under multi-DP. Set
+        # FLEXKV_DISABLE_BATCH=1 to keep it off in the launcher script.
         self.enable_batch = (not self.cache_config.enable_kv_sharing
                              and not self.cache_config.enable_remote
-                             and not self.cache_config.enable_gds)
+                             and not self.cache_config.enable_gds
+                             and os.getenv("FLEXKV_DISABLE_BATCH", "0") != "1")
 
         while not self.is_ready():
             logger.info("Waiting for flexkv init...")
@@ -336,6 +340,7 @@ class FlexKVSchedulerConnector:
         task_id, matched_mask = self.flexkv_manager.get_match(
             token_ids=np_token_ids,
             token_mask=np_token_mask,
+            dp_id=self.flexkv_manager.dp_client_id,
             namespace=namespace,
         )
         num_new_matched_tokens = matched_mask.sum().item()
@@ -486,6 +491,7 @@ class FlexKVSchedulerConnector:
         namespace = self._extract_namespace(request)
         task_id, unmatched_mask = self.flexkv_manager.put_match(
             token_ids=np_token_ids,
+            dp_id=self.flexkv_manager.dp_client_id,
             namespace=namespace,
         )
 
@@ -752,7 +758,35 @@ class FlexKVConnectorV1Impl:
         self.role = role
         flexkv_config = FlexKVConfig.from_env()
         flexkv_config.post_init_from_vllm_config(vllm_config)
-        dp_rank = vllm_config.parallel_config.data_parallel_rank
+        # In vllm v0.19+ DP-server mode each engine subprocess sees
+        # `parallel_config.data_parallel_rank=0` (only the DP coordinator
+        # process holds the true rank). The actual global rank lives on
+        # `data_parallel_index`. Falling back to data_parallel_rank for
+        # older vllm or non-DP-server modes preserves single-engine setups.
+        _pc = vllm_config.parallel_config
+        _idx = getattr(_pc, "data_parallel_index", None)
+        if _idx is not None:
+            dp_rank = int(_idx)
+        else:
+            dp_rank = _pc.data_parallel_rank
+        # Allow env override so the launcher can pin a known rank when the
+        # vllm view of rank can't be trusted.
+        _env_dp = os.environ.get("FLEXKV_DP_RANK")
+        if _env_dp is not None:
+            dp_rank = int(_env_dp)
+        # Mirror FLEXKV_DP_SIZE — vllm DP-server children report dp_size=1.
+        _env_dp_size = os.environ.get("FLEXKV_DP_SIZE")
+        if _env_dp_size and int(_env_dp_size) > flexkv_config.model_config.dp_size:
+            flexkv_config.model_config.dp_size = int(_env_dp_size)
+            logger.info(
+                f"FlexKV: overriding dp_size -> {_env_dp_size} from env "
+                "(vllm engine sees fewer)"
+            )
+        logger.info(
+            f"FlexKV vllm_config dp_rank={_pc.data_parallel_rank} "
+            f"data_parallel_index={_idx} chosen_dp_rank={dp_rank} "
+            f"dp_size={flexkv_config.model_config.dp_size}"
+        )
 
         if role == KVConnectorRole.SCHEDULER:
             self.connector = FlexKVSchedulerConnector(flexkv_config, dp_rank)

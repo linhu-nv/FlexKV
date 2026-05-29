@@ -140,10 +140,14 @@ class CacheEngineRadixShmem:
 
         # TreeClient always; TreeServer is owned by the bootstrap process.
         self._tree = shmradix.TreeClient(shm_name)
-        # node_id -> (hashes_uint64_copy, matched_prefix, inserted_count).
-        # FlexKV calls insert(is_ready=False) then set_ready(node, True, length)
-        # later; radixshmem set_ready needs hashes, so remember them here.
-        self._pending_ready: dict = {}
+
+        # Diagnostics: how often does the race that route-A guards against
+        # actually fire? Counted per-instance so each (device, DP) reports
+        # its own rate.
+        self._insert_count = 0
+        self._race_count = 0
+        self._unused_slot_total = 0
+        self._race_log_interval = 50
 
     # ---------- Mempool view (compatibility shims for CacheEngineAccel API) ----------
 
@@ -173,7 +177,14 @@ class CacheEngineRadixShmem:
         # share the same byte width, so view-cast is safe.
         hashes = sequence_meta.block_hashes.view(np.uint64)
 
-        detail = self._tree.query_detail(hashes)
+        # `lock=True` inc_refs `last_ready_node_id` atomically under the
+        # read_lock, preventing another process from auto-evicting the matched
+        # nodes (and recycling our slot ids) between `match()` and the H2D
+        # that consumes the slots. By the radixshmem tree invariant, locking
+        # the deepest ready node also protects every ancestor on the ready
+        # prefix. cache_engine.py's `_transfer_callback` calls
+        # `unlock(last_ready_node)` to release this ref.
+        detail = self._tree.query_detail(hashes, lock=True)
 
         # Build MatchResultAccel mirroring CacheEngineAccel.match().
         last_node_id = detail.last_node_id
@@ -208,6 +219,9 @@ class CacheEngineRadixShmem:
             physical_blocks=physical,
             block_node_ids=None,
             matched_pos="local",
+            # `query_detail(lock=True)` atomically inc_ref'd last_ready_node_id
+            # — the cache_engine layer owns releasing this exactly once.
+            pre_locked_node=last_ready_node if last_ready_node is not None else None,
         )
 
     def insert(self,
@@ -215,27 +229,51 @@ class CacheEngineRadixShmem:
                physical_block_ids: np.ndarray,
                num_insert_blocks: int = -1,
                is_ready: bool = True,
-               match_result: Optional[MatchResultAccel] = None) -> Optional[ShmRadixNode]:
+               match_result: Optional[MatchResultAccel] = None
+               ) -> "tuple[Optional[ShmRadixNode], np.ndarray]":
+        """Attach `physical_block_ids` as a suffix in the shared radix tree.
+
+        Returns (node, unused_slots) where:
+          - `node` is the inserted leaf (or None if nothing got attached).
+          - `unused_slots` (int64) is the subset of `physical_block_ids` that
+            radixshmem did NOT attach — either because the matched_prefix at
+            insert time has advanced (another process won the race for the
+            same prefix) or because the caller supplied excess slots. The
+            caller MUST recycle these AFTER any in-flight transfer that
+            references them has completed (typically via `buffer_to_free` in
+            `_transfer_callback`). Returning them straight to the mempool
+            here would race with the caller's pipelined transfer and let
+            another process reuse the slot mid-write, corrupting data.
+        """
         sequence_meta.gen_hashes()
         hashes = sequence_meta.block_hashes.view(np.uint64)
 
-        # FlexKV pattern: `physical_block_ids` are slots that the caller
-        # reserved via `take()` for the SUFFIX (the new portion beyond the
-        # existing matched prefix). Length of `physical_block_ids` may be the
-        # full prefix or just the suffix depending on call site; radixshmem
-        # walks the prefix internally and only consumes as many supplied slots
-        # as it actually attaches.
         suffix_slots = np.asarray(physical_block_ids, dtype=np.int32)
 
         if num_insert_blocks > 0:
-            # Caller wants to register only the first `num_insert_blocks`
-            # blocks of the prefix. Trim the hash array to that length so
-            # radixshmem doesn't try to attach beyond.
             target_hashes = hashes[:num_insert_blocks]
         else:
             target_hashes = hashes
 
-        result = self._tree.insert_with_slots(target_hashes, suffix_slots, is_ready)
+        result = self._tree.insert_with_slots(
+            target_hashes, suffix_slots, is_ready, auto_recycle=False
+        )
+
+        # Diagnostics: count how often the insert race fires (matched_prefix
+        # grew between caller's match() and this insert, OR caller supplied
+        # excess slots, so radixshmem couldn't attach them all).
+        self._insert_count += 1
+        num_unused = len(result.unused_slots)
+        if num_unused > 0:
+            self._race_count += 1
+            self._unused_slot_total += num_unused
+        if self._insert_count % self._race_log_interval == 0:
+            race_pct = 100.0 * self._race_count / max(1, self._insert_count)
+            flexkv_logger.info(
+                f"[shmradix race-counter device={_DEVICE_TYPE_NAMES[self.device_type]}] "
+                f"inserts={self._insert_count} race_hits={self._race_count} "
+                f"({race_pct:.2f}%) cumulative_unused_slots={self._unused_slot_total}"
+            )
 
         if self.event_collector is not None and result.inserted_count > 0:
             attached_hashes = sequence_meta.block_hashes[
@@ -247,22 +285,13 @@ class CacheEngineRadixShmem:
                 medium=_DEVICE_TYPE_NAMES[self.device_type]
             )
 
+        unused_slots_i64 = np.asarray(result.unused_slots, dtype=np.int64)
+
         if result.last_node_id == INVALID_NODE_ID or result.inserted_count <= 0:
-            return None
-        # Remember the hash path so set_ready(node, ...) can walk it later.
-        # Stores (hashes up to end of inserted suffix, matched_prefix offset,
-        # inserted_count). set_ready marks only the inserted suffix ready —
-        # ancestor nodes are the responsibility of their own insert/set_ready.
-        matched_prefix = int(result.matched_prefix)
-        inserted_count = int(result.inserted_count)
-        total_path_len = matched_prefix + inserted_count
-        self._pending_ready[int(result.last_node_id)] = (
-            np.ascontiguousarray(target_hashes[:total_path_len]).copy(),
-            matched_prefix,
-            inserted_count,
-        )
-        return ShmRadixNode(node_id=int(result.last_node_id),
-                             num_blocks=int(result.inserted_count))
+            return None, unused_slots_i64
+        node = ShmRadixNode(node_id=int(result.last_node_id),
+                            num_blocks=int(result.inserted_count))
+        return node, unused_slots_i64
 
     def lock_node(self, node: ShmRadixNode) -> None:
         if node is None or not node.is_valid():
@@ -275,21 +304,13 @@ class CacheEngineRadixShmem:
         self._tree.dec_ref_node(node.node_id)
 
     def set_ready(self, node: ShmRadixNode, ready: bool, ready_length: int) -> None:
+        # radixshmem ready flag is at node granularity (the whole node is
+        # either ready or not). `ready_length` is accepted for API parity
+        # with CacheEngineAccel but ignored — partial-within-node ready is
+        # not expressible in radixshmem.
         if node is None or not node.is_valid():
             return
-        entry = self._pending_ready.pop(int(node.node_id), None)
-        if entry is None:
-            flexkv_logger.debug(
-                f"CacheEngineRadixShmem.set_ready: no pending entry for "
-                f"node_id={node.node_id} (insert from another process or "
-                f"already set_ready)."
-            )
-            return
-        hashes, matched_prefix, inserted_count = entry
-        # Mark only the NEWLY inserted suffix ready. Marking the ancestor
-        # blocks ready here would expose them before their own D2H finishes,
-        # serving stale data -> garbled inference output.
-        self._tree.set_ready(hashes, matched_prefix, inserted_count, bool(ready))
+        self._tree.set_ready_node(int(node.node_id), bool(ready))
 
     def set_ready_path(self,
                        sequence_meta: SequenceMeta,

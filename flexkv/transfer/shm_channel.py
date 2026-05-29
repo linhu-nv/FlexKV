@@ -94,7 +94,7 @@ HEADER_SIZE = 6 * _CL  # 384 B
 
 # Default sizing — overridable via constructor for tests.
 DEFAULT_SUBMIT_SLOTS = 256          # power of 2
-DEFAULT_RESULT_SLOTS = 256          # power of 2
+DEFAULT_RESULT_SLOTS = 1024         # power of 2 — sized for DP=8/c=64 burst
 DEFAULT_SLOT_SIZE = 64 * 1024       # 64 KB; transfer graphs are small
 
 _PAGE = 4096
@@ -342,18 +342,35 @@ class ShmChannel:
         return out
 
     def result_send(self, payload: Any) -> None:
-        """Enqueue a result to CE."""
+        """Enqueue a result to CE. Blocks (spin+yield) until space is
+        available — dropping a completion silently is far worse than
+        backpressuring the TE, because losing one completion leaves the
+        owning task RUNNING forever and the user sees a hang."""
         blob = pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
         wp = self._result_w.value
         slots = self.result_slots
-        for spin in range(1_000_000):
+        spin = 0
+        warned = False
+        while True:
             rp = self._result_r.value
             if not self._ring_full(wp, rp, slots):
                 break
             if spin > 1000:
                 os.sched_yield()
-        else:
-            raise RuntimeError("shm channel result ring full")
+            spin += 1
+            # Periodic warn so a genuinely-dead CE shows up in logs instead
+            # of hanging silently. The TE thread keeps trying — it will
+            # unblock as soon as the CE comes back and consumes.
+            if spin % 5_000_000 == 0 and not warned:
+                try:
+                    from flexkv.common.debug import flexkv_logger
+                    flexkv_logger.error(
+                        f"shm channel result ring stuck full "
+                        f"(slots={slots}); is the CE consumer alive?"
+                    )
+                except Exception:
+                    pass
+                warned = True
 
         self._write_blob(self._result_off + wp * self.slot_size, blob)
         self._result_w.value = (wp + 1) & (slots - 1)
