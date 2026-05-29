@@ -103,7 +103,18 @@ class TransferManagerShmChannelHandle:
         nvtx_range = nvtx.start_range(
             message="TransferManagerShmChannelHandle.submit", color="green"
         )
+        # DIAG: trace graph_id at CE submit so we can correlate with TE/CE receive.
+        if os.environ.get("FLEXKV_TRACE_TE", "0") == "1":
+            flexkv_logger.info(
+                f"[TE-TRACE] CE submit ch={self.channel_id} "
+                f"graph_id={transfer_graph.graph_id}"
+            )
         self._channel.submit_send(_SubmitMsg(transfer_graph, task_end_op_id))
+        # The TE poll loop idles on the global ctrl wake counter, not the
+        # per-channel submit_wake that submit_send bumps. Without this nudge
+        # the TE only notices new graphs after a 100ms futex timeout — adds
+        # up to a noticeable tail latency under load.
+        self._ctrl.notify()
         nvtx.end_range(nvtx_range)
 
     def submit_batch(self, transfer_graphs: List[TransferOpGraph]) -> None:
@@ -112,6 +123,8 @@ class TransferManagerShmChannelHandle:
         # benchmarks show it matters.
         for g in transfer_graphs:
             self._channel.submit_send(_SubmitMsg(g, -1, is_batch=True))
+        # See `submit()` — wake the TE poll loop from its idle futex.
+        self._ctrl.notify()
 
     def wait(self, timeout: Optional[float] = None) -> List[CompletedOp]:
         if timeout is None:
@@ -121,6 +134,13 @@ class TransferManagerShmChannelHandle:
         for m in msgs:
             if isinstance(m, _ResultMsg):
                 out.extend(m.ops)
+        if out and os.environ.get("FLEXKV_TRACE_TE", "0") == "1":
+            completed_graphs = sorted({op.graph_id for op in out
+                                        if op.is_graph_completed()})
+            flexkv_logger.info(
+                f"[TE-TRACE] CE recv ch={self.channel_id} "
+                f"completed_graphs={completed_graphs} n_ops={len(out)}"
+            )
         return out
 
     def shutdown(self) -> None:
@@ -232,6 +252,11 @@ class _TEShmDispatcher:
                     graph = m.graph
                     with self._owner_lock:
                         self._graph_owner[graph.graph_id] = ch.channel_id
+                    if os.environ.get("FLEXKV_TRACE_TE", "0") == "1":
+                        flexkv_logger.info(
+                            f"[TE-TRACE] TE recv ch={ch.channel_id} "
+                            f"graph_id={graph.graph_id}"
+                        )
                     self._tm.submit(graph)
             if had_work:
                 idle_spins = 0
@@ -279,7 +304,24 @@ class _TEShmDispatcher:
                 by_channel.setdefault(owner, []).append(op)
             for ch_id, ops in by_channel.items():
                 if 0 <= ch_id < len(self._channels):
-                    self._channels[ch_id].result_send(_ResultMsg(ops))
+                    if os.environ.get("FLEXKV_TRACE_TE", "0") == "1":
+                        completed_graphs = sorted({op.graph_id for op in ops
+                                                    if op.is_graph_completed()})
+                        flexkv_logger.info(
+                            f"[TE-TRACE] TE send ch={ch_id} "
+                            f"completed_graphs={completed_graphs} "
+                            f"n_ops={len(ops)}"
+                        )
+                    try:
+                        self._channels[ch_id].result_send(_ResultMsg(ops))
+                    except Exception as e:
+                        # Don't let a stuck channel kill the whole result
+                        # thread — that would silently hang every DP.
+                        flexkv_logger.error(
+                            f"TE result_send failed for ch={ch_id} "
+                            f"n_ops={len(ops)}: {e}",
+                            exc_info=True,
+                        )
 
 
 def te_shm_main(model_config: ModelConfig,

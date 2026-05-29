@@ -394,13 +394,19 @@ def merge_to_batch_graph(batch_id: int, transfer_graphs: List[TransferOpGraph], 
     Returns:
         (merged_graph, batch_end_op_id, new_op_callback_dict)
     """
+    # IMPORTANT: do NOT call set_graph_id(batch_id) on the merged graph.
+    # batch_id comes from per-CE-local task_id_counter and collides across DPs;
+    # set_graph_id_range() carved out a disjoint id range per CE process and
+    # the default __init__ already allocates from it. Overwriting with batch_id
+    # would cause two DPs to publish merged graphs with the same id to the
+    # shared TE, which overwrites _transfer_graphs[id] and _graph_owner[id] —
+    # the older request then never receives its completion and hangs.
+    # graph_to_task[merged.graph_id] = batch_id (line 883 of kvtask.py) handles
+    # the reverse lookup using whatever id the constructor assigned.
     if not transfer_graphs:
-        empty_graph = TransferOpGraph()
-        empty_graph.set_graph_id(batch_id)
-        return empty_graph, -1, {}
+        return TransferOpGraph(), -1, {}
 
     merged_graph = TransferOpGraph()
-    merged_graph.set_graph_id(batch_id)
 
     ops_by_type: Dict[TransferType, List[TransferOp]] = {}
     callbacks_by_type: Dict[TransferType, List[Callable]] = {}
