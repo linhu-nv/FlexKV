@@ -28,6 +28,8 @@ from flexkv.storage.storage_engine import StorageEngine
 from flexkv.transfer.transfer_engine import TransferEngine
 from flexkv.server.utils import get_zmq_socket
 from flexkv.server.request import RegisterTPClientRequest, Response
+from flexkv.numa.topology import NumaTopology
+from flexkv.numa.planner import NumaPlan, build_numa_plan, NumaArrangement
 
 
 class TransferManager:
@@ -112,25 +114,42 @@ class TransferManager:
             f"Expected {self.expected_gpus} GPU layouts, got {len(self.all_gpu_layouts)}"
         assert len(self.all_gpu_blocks) == self.expected_gpus, \
             f"Expected {self.expected_gpus} GPU blocks, got {len(self.all_gpu_blocks)}"
-        
+
         # Register GPU blocks with their global device IDs
         for device_id, gpu_blocks_wrapper in self.all_gpu_blocks.items():
             self.storage_engine.register_gpu_blocks(gpu_blocks_wrapper,
                                                     self.all_gpu_layouts[device_id],
                                                     device_id,
                                                     dtype=self.model_config.dtype)
-        
-        # Group GPU handles by dp_client_id
+
+        # Group GPU handles by dp_client_id. We also build a parallel mapping
+        # dp_id -> ordered list of global GPU device ids, because the NUMA
+        # planner needs device ids (not StorageHandle objects).
         grouped_gpu_handles: Dict[int, List] = {}
+        grouped_device_ids: Dict[int, List[int]] = {}
         for device_id in sorted(self.all_gpu_blocks.keys()):
             dp_client_id = self.gpu_client_mapping[device_id]
-            if dp_client_id not in grouped_gpu_handles:
-                grouped_gpu_handles[dp_client_id] = []
-            grouped_gpu_handles[dp_client_id].append(
+            grouped_gpu_handles.setdefault(dp_client_id, []).append(
                 self.storage_engine.get_storage_handle(DeviceType.GPU, device_id))
-        
-        cpu_handle = self.storage_engine.get_storage_handle(DeviceType.CPU) \
-            if self.cache_config.enable_cpu else None
+            grouped_device_ids.setdefault(dp_client_id, []).append(device_id)
+
+        # ------------------------------------------------------------------
+        # NUMA plan (Phase 1: TP_WITHIN_NUMA only).
+        # ------------------------------------------------------------------
+        self.numa_plan: NumaPlan = self._build_numa_plan(grouped_device_ids)
+        flexkv_logger.info(self.numa_plan.describe())
+
+        # Allocate CPU pool(s). If the plan is enabled, allocate one pool per
+        # NUMA node; otherwise stick with the legacy single pool that
+        # StorageEngine.__init__ already created.
+        cpu_handles: List = []
+        if self.cache_config.enable_cpu:
+            if self.numa_plan.enabled:
+                self.storage_engine.allocate_cpu_pools_per_numa(self.numa_plan)
+                cpu_handles = self.storage_engine.get_cpu_pool_handles()
+            else:
+                cpu_handles = [self.storage_engine.get_storage_handle(DeviceType.CPU)]
+
         ssd_handle = self.storage_engine.get_storage_handle(DeviceType.SSD) \
             if self.cache_config.enable_ssd else None
         remote_handle = (
@@ -141,10 +160,39 @@ class TransferManager:
         self.transfer_engine = TransferEngine(gpu_handles=grouped_gpu_handles,
                                               model_config=self.model_config,
                                               cache_config=self.cache_config,
-                                              cpu_handle=cpu_handle,
+                                              cpu_handle=cpu_handles[0] if cpu_handles else None,
+                                              cpu_handles_per_numa=cpu_handles if self.numa_plan.enabled else None,
+                                              numa_plan=self.numa_plan,
                                               ssd_handle=ssd_handle,
                                               remote_handle=remote_handle)
         flexkv_logger.info("Initialized TransferEngine successfully")
+
+    def _build_numa_plan(self, grouped_device_ids: Dict[int, List[int]]) -> NumaPlan:
+        if not self.cache_config.enable_numa_aware:
+            return build_numa_plan(
+                enable_numa_aware=False,
+                topology=NumaTopology(nodes=[0], is_fabricated=True),
+                tp_size=self.model_config.tp_size,
+                dp_size=self.model_config.dp_size,
+                grouped_gpu_device_ids=grouped_device_ids,
+                total_num_blocks=self.cache_config.num_cpu_blocks,
+            )
+
+        all_device_ids = sorted({d for ids in grouped_device_ids.values() for d in ids})
+        topology = NumaTopology.detect(
+            device_ids=all_device_ids,
+            override=self.cache_config.numa_gpu_map,
+        )
+        flexkv_logger.info(f"NUMA topology: {topology.describe()}")
+        return build_numa_plan(
+            enable_numa_aware=True,
+            topology=topology,
+            tp_size=self.model_config.tp_size,
+            dp_size=self.model_config.dp_size,
+            grouped_gpu_device_ids=grouped_device_ids,
+            total_num_blocks=self.cache_config.num_cpu_blocks,
+            allow_tp_crosses_numa=self.cache_config.allow_tp_crosses_numa,
+        )
 
     def submit(self, transfer_graph: TransferOpGraph) -> None:
         self.transfer_engine.submit_transfer_graph(transfer_graph)

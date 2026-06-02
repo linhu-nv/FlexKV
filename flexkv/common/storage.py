@@ -172,6 +172,11 @@ class StorageHandle:
     num_blocks_per_file: Optional[int] = None
     gpu_device_id: Optional[int] = None
     remote_config_custom: Optional[Dict[str, Any]] = None
+    # NUMA-aware bookkeeping. Both are None for legacy single-pool CPU handles.
+    # numa_node:        the host NUMA node these pages live on (-1 = unknown).
+    # numa_pool_index:  position in the NumaPlan.pool_nodes list.
+    numa_node: Optional[int] = None
+    numa_pool_index: Optional[int] = None
 
     def get_tensor_list(self) -> List[torch.Tensor]:
         assert isinstance(self.data, list) and \

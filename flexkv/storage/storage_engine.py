@@ -6,10 +6,12 @@ import torch
 import hashlib
 
 from flexkv.common.config import ModelConfig, CacheConfig, GLOBAL_CONFIG_FROM_ENV
+from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import StorageHandle, KVCacheLayout, KVCacheLayoutType
 from flexkv.common.transfer import DeviceType
 from flexkv.storage.allocator import CPUAllocator, GPUAllocator, SSDAllocator, RemoteAllocator
+from flexkv.numa.planner import NumaPlan, NumaArrangement
 
 
 class StorageEngine:
@@ -20,8 +22,22 @@ class StorageEngine:
         self._storage_handles: Dict[Tuple[DeviceType, int], StorageHandle] = {}
         self._model_config = model_config
         self._cache_config = cache_config
+        # When NUMA-aware mode is on, allocate_cpu_pools_per_numa replaces the
+        # default single-pool allocation below. Track which pool indices we
+        # populated so callers can enumerate them.
+        self._numa_pool_indices: List[int] = []
+        # Per-pool layout (each pool has its own num_block). Index = pool idx.
+        # In legacy mode this stays empty; consumers must use the single
+        # _cpu_layout / get_storage_handle(DeviceType.CPU, 0) path.
+        self._numa_pool_layouts: List[KVCacheLayout] = []
+
+        self._cpu_layout: Optional[KVCacheLayout] = None
         if self._cache_config.enable_cpu:
-            self._cpu_layout: Optional[KVCacheLayout] = KVCacheLayout(
+            # Logical layout used by SSD/Remote sanity checks and by the
+            # transfer engine. It always describes "the full pool" — in
+            # NUMA-aware mode the actual physical pools are smaller, but they
+            # share this layout's shape (only num_block differs per pool).
+            self._cpu_layout = KVCacheLayout(
                 type=GLOBAL_CONFIG_FROM_ENV.cpu_layout_type,
                 num_layer=self._model_config.num_layers,
                 num_block=self._cache_config.num_cpu_blocks,
@@ -30,11 +46,12 @@ class StorageEngine:
                 head_size=self._model_config.head_size,
                 is_mla=self._model_config.use_mla
             )
-            self.allocate(
-                device_type=DeviceType.CPU,
-                layout=self._cpu_layout,
-                dtype=self._model_config.dtype,
-            )
+            if not self._cache_config.enable_numa_aware:
+                self.allocate(
+                    device_type=DeviceType.CPU,
+                    layout=self._cpu_layout,
+                    dtype=self._model_config.dtype,
+                )
         if self._cache_config.enable_ssd:
             if not GLOBAL_CONFIG_FROM_ENV.ssd_layout_type == self._cpu_layout.type:
                 raise ValueError(f"SSD layout type must be the same as CPU layout type: {self._cpu_layout.type}")
@@ -231,3 +248,79 @@ class StorageEngine:
                            device_id: int = 0) -> bool:
         """Check if storage handle exists for given device type and id"""
         return (device_type, device_id) in self._storage_handles
+
+    # ------------------------------------------------------------------
+    # NUMA-aware CPU pool API
+    # ------------------------------------------------------------------
+
+    def allocate_cpu_pools_per_numa(self, plan: NumaPlan) -> None:
+        """Allocate one CPU StorageHandle per NUMA pool described in ``plan``.
+
+        Must be called instead of (not in addition to) the legacy single CPU
+        allocation. Idempotent if invoked twice with the same plan.
+
+        Pool storage handles are keyed by ``(DeviceType.CPU, pool_index)`` so
+        the legacy ``get_storage_handle(DeviceType.CPU, 0)`` still returns
+        pool 0 — which is convenient for code paths that haven't been taught
+        NUMA yet (SSD/Remote workers, sanity checks). Pool 0 is in every
+        config, including when ``num_pools == 1``.
+        """
+        if not self._cache_config.enable_cpu:
+            raise RuntimeError("cache_config.enable_cpu must be True for NUMA pools")
+        if self._cpu_layout is None:
+            raise RuntimeError("_cpu_layout was not initialized")
+        if plan.arrangement is not NumaArrangement.TP_WITHIN_NUMA:
+            raise NotImplementedError(
+                f"NUMA arrangement {plan.arrangement} is not supported in Phase 1"
+            )
+
+        per_pool_blocks = plan.per_pool_num_blocks()
+        if len(per_pool_blocks) != len(plan.pool_nodes):
+            raise AssertionError("plan inconsistent: pool count mismatch")
+
+        for pool_index, (num_blocks, node) in enumerate(zip(per_pool_blocks, plan.pool_nodes)):
+            key = (DeviceType.CPU, pool_index)
+            if key in self._storage_handles:
+                flexkv_logger.warning(
+                    f"CPU pool {pool_index} (NUMA node {node}) already allocated; skipping"
+                )
+                continue
+            pool_layout = KVCacheLayout(
+                type=self._cpu_layout.type,
+                num_layer=self._cpu_layout.num_layer,
+                num_block=num_blocks,
+                tokens_per_block=self._cpu_layout.tokens_per_block,
+                num_head=self._cpu_layout.num_head,
+                head_size=self._cpu_layout.head_size,
+                is_mla=self._cpu_layout.is_mla,
+            )
+            handle = CPUAllocator.allocate_on_numa_node(
+                layout=pool_layout,
+                dtype=self._model_config.dtype,
+                numa_node=node,
+                numa_pool_index=pool_index,
+            )
+            self._storage_handles[key] = handle
+            self._numa_pool_indices.append(pool_index)
+            self._numa_pool_layouts.append(pool_layout)
+        flexkv_logger.info(
+            f"Allocated {len(plan.pool_nodes)} NUMA CPU pools: {plan.describe()}"
+        )
+
+    def get_cpu_pool_handles(self) -> List[StorageHandle]:
+        """Return CPU pool handles in pool-index order.
+
+        Falls back to ``[get_storage_handle(DeviceType.CPU, 0)]`` when the
+        engine was initialized in legacy single-pool mode. Callers can use
+        ``len(...) == 1`` to detect that.
+        """
+        if self._numa_pool_indices:
+            return [self._storage_handles[(DeviceType.CPU, i)] for i in self._numa_pool_indices]
+        if (DeviceType.CPU, 0) in self._storage_handles:
+            return [self._storage_handles[(DeviceType.CPU, 0)]]
+        return []
+
+    def num_cpu_pools(self) -> int:
+        if self._numa_pool_indices:
+            return len(self._numa_pool_indices)
+        return 1 if (DeviceType.CPU, 0) in self._storage_handles else 0

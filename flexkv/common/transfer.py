@@ -97,6 +97,11 @@ class TransferOp:
     remote_node_ids: Optional[np.ndarray] = None
     # used for distributed cpu and ssd
     src_block_node_ids: Optional[np.ndarray] = None
+    # NUMA routing. -1 means "not NUMA-aware / fall back to legacy dispatch".
+    # Otherwise this is the index of the CPU pool / NUMA group that should
+    # handle this op. Populated by the cache engine when enable_numa_aware
+    # is on. The TransferEngine uses it to pick the per-(dp, numa) worker.
+    home_numa_id: int = -1
 
     def __post_init__(self) -> None:
         if self.transfer_type != TransferType.VIRTUAL and \
@@ -322,6 +327,17 @@ def _merge_ops(ops: List[TransferOp], transfer_type: TransferType,
         return None
     src_blocks = np.concatenate([op.src_block_ids for op in ops])
     dst_blocks = np.concatenate([op.dst_block_ids for op in ops])
+    # All ops here come from the same DP (caller groups them), and under
+    # arrangement (a) a DP only ever touches its home NUMA pool, so a
+    # batch always shares one home_numa_id. Validate for safety; if it ever
+    # mismatches (e.g. arrangement (b) once added) the merge would corrupt
+    # routing.
+    home_numa = ops[0].home_numa_id
+    if any(op.home_numa_id != home_numa for op in ops):
+        raise ValueError(
+            "Cannot batch-merge TransferOps from different NUMA pools: "
+            f"{[op.home_numa_id for op in ops]}"
+        )
     merged_op = TransferOp(
         graph_id=graph.graph_id,
         transfer_type=transfer_type,
@@ -330,6 +346,7 @@ def _merge_ops(ops: List[TransferOp], transfer_type: TransferType,
         layer_id=ops[0].layer_id,
         layer_granularity=ops[0].layer_granularity,
         dp_id=ops[0].dp_id,
+        home_numa_id=home_numa,
     )
     graph.add_transfer_op(merged_op)
     if callbacks:

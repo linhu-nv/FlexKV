@@ -83,6 +83,20 @@ class CacheConfig:
     # Mooncake transfer engine config path (serialized via pickle to survive spawn subprocesses)
     mooncake_config_path: Optional[str] = None
 
+    # ------------------------------------------------------------------
+    # NUMA-aware CPU pool (Phase 1: arrangement TP_WITHIN_NUMA only).
+    # ------------------------------------------------------------------
+    # Master toggle. Default False keeps the legacy single-pool behavior.
+    enable_numa_aware: bool = False
+    # Optional explicit GPU->NUMA mapping, used to override or supplement
+    # sysfs/NVML auto-detection. Keys are CUDA device ids (global, same id
+    # that vLLM passes via KVTPClient), values are NUMA node ids.
+    numa_gpu_map: Optional[Dict[int, int]] = None
+    # Phase-2 escape hatch (not yet implemented): allow TP groups to span
+    # multiple NUMA nodes (arrangement b). Default False makes the planner
+    # fail loudly if the launcher places a single TP group across nodes.
+    allow_tp_crosses_numa: bool = False
+
     def __post_init__(self):
         self.enable_kv_sharing = self.enable_p2p_cpu or \
             self.enable_p2p_ssd or self.enable_3rd_remote

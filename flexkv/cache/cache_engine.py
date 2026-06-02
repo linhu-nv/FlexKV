@@ -40,6 +40,57 @@ from flexkv.common.debug import flexkv_logger
 from flexkv.common.type import MatchResultAccel
 from flexkv.integration.dynamo.collector import KVEventCollector
 from flexkv.metrics import FlexKVMetricsCollector, init_global_collector, get_global_collector
+from flexkv.numa.mempool import NumaMempool
+from flexkv.numa.planner import NumaPlan, NumaArrangement
+
+
+class _AllocatorAdapter:
+    """Uniform API over :class:`Mempool` and :class:`NumaMempool`.
+
+    The CacheEngine implementations don't care which one is underneath; they
+    just need ``allocate_blocks(num, home_numa_pool=...)``, ``recycle_blocks``,
+    and the free/total counters. ``home_numa_pool`` is silently ignored for the
+    legacy single-pool :class:`Mempool` so existing call sites still work.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.is_numa = isinstance(inner, NumaMempool)
+
+    @property
+    def num_total_blocks(self) -> int:
+        return self._inner.num_total_blocks
+
+    @property
+    def num_free_blocks(self) -> int:
+        return self._inner.num_free_blocks
+
+    def reset(self) -> None:
+        self._inner.reset()
+
+    def allocate_blocks(self, num: int, home_numa_pool: Optional[int] = None) -> np.ndarray:
+        if self.is_numa:
+            return self._inner.allocate_blocks(num, home_numa_pool=home_numa_pool)
+        # Legacy Mempool ignores NUMA hint.
+        return self._inner.allocate_blocks(num)
+
+    def recycle_blocks(self, block_ids: np.ndarray) -> None:
+        self._inner.recycle_blocks(block_ids)
+
+    def pool_of(self, block_id: int) -> int:
+        if self.is_numa:
+            return self._inner.pool_of(int(block_id))
+        return 0
+
+    def pools_of(self, block_ids: np.ndarray) -> np.ndarray:
+        if self.is_numa:
+            return self._inner.pools_of(block_ids)
+        return np.zeros(block_ids.shape, dtype=np.int64)
+
+    def num_free_in_pool(self, pool_id: int) -> int:
+        if self.is_numa:
+            return self._inner.num_free_in_pool(pool_id)
+        return self._inner.num_free_blocks if pool_id == 0 else 0
 
 DEVICE_TYPE: List[str] = ['CPU', 'GPU', 'SSD', 'REMOTE']
 _VALID_EVICTION_POLICIES = {'lru', 'lfu', 'slru', 'fifo', 'mru', 'filo'}
@@ -55,7 +106,8 @@ class CacheEngineAccel:
                  eviction_policy: str = "lru",
                  event_collector: Optional[KVEventCollector] = None,
                  metrics_collector = None,
-                 protected_threshold: int = 2):
+                 protected_threshold: int = 2,
+                 mempool=None):
         if not isinstance(device_type, DeviceType):
             raise ValueError(f"Unknown device type: {device_type}")
         if num_total_blocks <= 0:
@@ -75,13 +127,17 @@ class CacheEngineAccel:
         self.index = CRadixTreeIndex(tokens_per_block, num_total_blocks, hit_reward_seconds, eviction_policy,
                                      protected_threshold)
 
-        self.mempool = Mempool(num_total_blocks=num_total_blocks)
+        # Optional: caller may pre-construct a NumaMempool (or anything else
+        # implementing the same shape) and inject it here. When None we fall
+        # back to the legacy single-pool Mempool keyed by num_total_blocks.
+        inner = mempool if mempool is not None else Mempool(num_total_blocks=num_total_blocks)
+        self.mempool = _AllocatorAdapter(inner)
 
         self.tokens_per_block = tokens_per_block
-        self.num_total_blocks = num_total_blocks
+        self.num_total_blocks = self.mempool.num_total_blocks
         self.evict_ratio = evict_ratio
         self.evict_start_threshold = evict_start_threshold
-        
+
         self.event_collector = event_collector
         self._metrics_collector = metrics_collector
 
@@ -158,12 +214,21 @@ class CacheEngineAccel:
     def take(self,
              num_required_blocks: int,
              protected_node: Optional[CRadixNode] = None,
-             strict: bool = True) -> torch.Tensor:
-        # Calculate current utilization
-        utilization = (self.mempool.num_total_blocks - self.mempool.num_free_blocks) / self.mempool.num_total_blocks if self.mempool.num_total_blocks > 0 else 0
-        
+             strict: bool = True,
+             home_numa_pool: Optional[int] = None) -> torch.Tensor:
+        # NUMA-aware utilization: when home_numa_pool is set, we only care
+        # whether that specific pool has space. Otherwise look at the
+        # aggregated counters (legacy behavior).
+        if home_numa_pool is not None and self.mempool.is_numa:
+            free_blocks = self.mempool.num_free_in_pool(home_numa_pool)
+            total_blocks = self.mempool._inner._pool_sizes[home_numa_pool]
+        else:
+            free_blocks = self.mempool.num_free_blocks
+            total_blocks = self.mempool.num_total_blocks
+        utilization = (total_blocks - free_blocks) / total_blocks if total_blocks > 0 else 0
+
         # Proactive eviction: trigger when utilization exceeds threshold OR when blocks are needed
-        should_evict = (utilization >= self.evict_start_threshold) or (num_required_blocks > self.mempool.num_free_blocks)
+        should_evict = (utilization >= self.evict_start_threshold) or (num_required_blocks > free_blocks)
         
         if should_evict:
             if protected_node is not None:
@@ -201,18 +266,30 @@ class CacheEngineAccel:
                     )
             if protected_node is not None:
                 self.index.unlock(protected_node)
-        
-        if strict and num_required_blocks > self.mempool.num_free_blocks:
+
+        # Re-compute the "available" count after eviction. When NUMA-aware
+        # and constrained to a single pool, the eviction above may have
+        # freed blocks in *other* pools, which doesn't help us. In that
+        # case strict=False callers will get a short return and silently
+        # bail; the alternative (per-pool eviction) is a Phase 2 item.
+        if home_numa_pool is not None and self.mempool.is_numa:
+            available = self.mempool.num_free_in_pool(home_numa_pool)
+        else:
+            available = self.mempool.num_free_blocks
+        if strict and num_required_blocks > available:
             raise RuntimeError(f"Not enough free blocks to take, "
                                f"required: {num_required_blocks}, "
-                               f"available: {self.mempool.num_free_blocks}")
-        num_allocated_blocks = min(num_required_blocks, self.mempool.num_free_blocks)
-        allocated_blocks = self.mempool.allocate_blocks(num_allocated_blocks)
-        
+                               f"available: {available} "
+                               f"(home_numa_pool={home_numa_pool})")
+        num_allocated_blocks = min(num_required_blocks, available)
+        allocated_blocks = self.mempool.allocate_blocks(
+            num_allocated_blocks, home_numa_pool=home_numa_pool
+        )
+
         # Record allocation metrics
         if self._metrics_collector is not None and num_allocated_blocks > 0:
             self._metrics_collector.record_allocation(DEVICE_TYPE[self.device_type].lower(), num_allocated_blocks)
-        
+
         return allocated_blocks
 
     def recycle(self, physical_blocks: np.ndarray) -> None:
@@ -229,7 +306,8 @@ class CacheEngine:
                  eviction_policy: str = "lru",
                  event_collector: Optional[KVEventCollector] = None,
                  metrics_collector = None,
-                 protected_threshold: int = 2):
+                 protected_threshold: int = 2,
+                 mempool=None):
         if not isinstance(device_type, DeviceType):
             raise ValueError(f"Unknown device type: {device_type}")
         if num_total_blocks <= 0:
@@ -249,10 +327,11 @@ class CacheEngine:
         self.index = RadixTreeIndex(tokens_per_block=tokens_per_block, hit_reward_seconds=hit_reward_seconds, eviction_policy=eviction_policy,
                                        protected_threshold=protected_threshold)
 
-        self.mempool = Mempool(num_total_blocks=num_total_blocks)
+        inner = mempool if mempool is not None else Mempool(num_total_blocks=num_total_blocks)
+        self.mempool = _AllocatorAdapter(inner)
 
         self.tokens_per_block = tokens_per_block
-        self.num_total_blocks = num_total_blocks
+        self.num_total_blocks = self.mempool.num_total_blocks
         self.evict_ratio = evict_ratio
         self.evict_start_threshold = evict_start_threshold
 
@@ -297,12 +376,18 @@ class CacheEngine:
     def take(self,
              num_required_blocks: int,
              protected_node: Optional[RadixNode] = None,
-             strict: bool = True) -> np.ndarray:
-        # Calculate current utilization
-        utilization = (self.mempool.num_total_blocks - self.mempool.num_free_blocks) / self.mempool.num_total_blocks if self.mempool.num_total_blocks > 0 else 0
-        
+             strict: bool = True,
+             home_numa_pool: Optional[int] = None) -> np.ndarray:
+        if home_numa_pool is not None and self.mempool.is_numa:
+            free_blocks = self.mempool.num_free_in_pool(home_numa_pool)
+            total_blocks = self.mempool._inner._pool_sizes[home_numa_pool]
+        else:
+            free_blocks = self.mempool.num_free_blocks
+            total_blocks = self.mempool.num_total_blocks
+        utilization = (total_blocks - free_blocks) / total_blocks if total_blocks > 0 else 0
+
         # Proactive eviction: trigger when utilization exceeds threshold OR when blocks are needed
-        should_evict = (utilization >= self.evict_start_threshold) or (num_required_blocks > self.mempool.num_free_blocks)
+        should_evict = (utilization >= self.evict_start_threshold) or (num_required_blocks > free_blocks)
         
         if should_evict:
             if protected_node is not None:
@@ -331,13 +416,20 @@ class CacheEngine:
                                                          medium=DEVICE_TYPE[self.device_type])
             if protected_node is not None:
                 self.index.unlock(protected_node)
-        
-        if strict and num_required_blocks > self.mempool.num_free_blocks:
+
+        if home_numa_pool is not None and self.mempool.is_numa:
+            available = self.mempool.num_free_in_pool(home_numa_pool)
+        else:
+            available = self.mempool.num_free_blocks
+        if strict and num_required_blocks > available:
             raise RuntimeError("Not enough free blocks to take, ",
                                f"required: {num_required_blocks}, "
-                               f"available: {self.mempool.num_free_blocks}")
-        num_allocated_blocks = min(num_required_blocks, self.mempool.num_free_blocks)
-        allocated_blocks = self.mempool.allocate_blocks(num_allocated_blocks)
+                               f"available: {available} "
+                               f"(home_numa_pool={home_numa_pool})")
+        num_allocated_blocks = min(num_required_blocks, available)
+        allocated_blocks = self.mempool.allocate_blocks(
+            num_allocated_blocks, home_numa_pool=home_numa_pool
+        )
         
         # Record allocation metrics
         if self._metrics_collector is not None and num_allocated_blocks > 0:
@@ -364,6 +456,16 @@ DEFAULT_CACHE_STRATEGY = CacheStrategy()
 class GlobalCacheEngine:
     def __init__(self, cache_config: CacheConfig, model_config: ModelConfig, redis_meta: RedisMeta = None,
                  event_collector: Optional[KVEventCollector] = None):
+        # NUMA-aware plan. Built up-front (in the main process) using the
+        # contiguous-device-id assumption ({dp_id: [dp*tp, dp*tp+1, ...]}).
+        # The TransferManager subprocess builds its own plan from the
+        # actually-registered device ids; both will agree as long as the
+        # launcher uses the default contiguous mapping (true for vLLM).
+        self.numa_plan: Optional[NumaPlan] = self._build_initial_numa_plan(
+            cache_config, model_config
+        )
+        if self.numa_plan is not None and self.numa_plan.enabled:
+            flexkv_logger.info(f"GlobalCacheEngine NUMA plan:\n{self.numa_plan.describe()}")
         self.cache_config = cache_config
         self.model_config = model_config
         self.tokens_per_block = cache_config.tokens_per_block
@@ -406,12 +508,23 @@ class GlobalCacheEngine:
             )
 
         if cache_config.enable_cpu:
+            # When NUMA-aware is on, allocate the cpu cache engine with a
+            # NumaMempool so that block ids are partitioned across pools and
+            # take() honors the per-DP home_numa_pool hint. The radix tree
+            # is global — eviction may free a block in one pool even when
+            # another pool wanted space (a known Phase-1 limitation).
+            cpu_mempool = self._build_cpu_mempool(cache_config.num_cpu_blocks)
             if cache_config.enable_p2p_cpu:
+                if self.numa_plan is not None and self.numa_plan.enabled:
+                    raise NotImplementedError(
+                        "enable_p2p_cpu + enable_numa_aware not supported in Phase 1.5"
+                    )
                 self.cpu_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.CPU, meta=self.redis_meta) #TODO
             elif self.index_accel:
                 self.cpu_cache_engine = CacheEngineAccel(
                     device_type=DeviceType.CPU,
                     num_total_blocks=cache_config.num_cpu_blocks,
+                    mempool=cpu_mempool,
                     tokens_per_block=cache_config.tokens_per_block,
                     evict_ratio=self.evict_ratio,
                     hit_reward_seconds=self.hit_reward_seconds,
@@ -425,6 +538,7 @@ class GlobalCacheEngine:
                 self.cpu_cache_engine = CacheEngine(
                     device_type=DeviceType.CPU,
                     num_total_blocks=cache_config.num_cpu_blocks,
+                    mempool=cpu_mempool,
                     tokens_per_block=cache_config.tokens_per_block,
                     evict_ratio=self.evict_ratio,
                     hit_reward_seconds=self.hit_reward_seconds,
@@ -507,6 +621,134 @@ class GlobalCacheEngine:
         
         # Update initial mempool stats
         self._update_mempool_metrics()
+
+    # ------------------------------------------------------------------
+    # NUMA-aware helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _build_initial_numa_plan(cache_config: CacheConfig,
+                                 model_config: ModelConfig) -> Optional[NumaPlan]:
+        """Build the NumaPlan in the main process (before workers register).
+
+        We assume the launcher uses **contiguous** device ids per TP/DP group
+        (the default for vLLM). The TransferManager subprocess builds its
+        own plan with the *actually* registered device ids; if both agree
+        (typical case) routing is correct end-to-end. When they disagree
+        the user must provide cache_config.numa_gpu_map.
+
+        Returns the plan even when disabled, so downstream code can branch
+        on plan.enabled without None-checks.
+        """
+        if not cache_config.enable_numa_aware:
+            from flexkv.numa.planner import _disabled_plan
+            return _disabled_plan(cache_config.num_cpu_blocks)
+        from flexkv.numa.topology import NumaTopology
+        from flexkv.numa.planner import build_numa_plan
+
+        tp = model_config.tp_size
+        dp = model_config.dp_size
+        grouped_gpu_device_ids: Dict[int, List[int]] = {
+            dp_id: list(range(dp_id * tp, (dp_id + 1) * tp)) for dp_id in range(dp)
+        }
+        all_device_ids = sorted({d for ids in grouped_gpu_device_ids.values() for d in ids})
+        topology = NumaTopology.detect(
+            device_ids=all_device_ids,
+            override=cache_config.numa_gpu_map,
+        )
+        try:
+            return build_numa_plan(
+                enable_numa_aware=True,
+                topology=topology,
+                tp_size=tp,
+                dp_size=dp,
+                grouped_gpu_device_ids=grouped_gpu_device_ids,
+                total_num_blocks=cache_config.num_cpu_blocks,
+                allow_tp_crosses_numa=cache_config.allow_tp_crosses_numa,
+            )
+        except (ValueError, NotImplementedError) as e:
+            flexkv_logger.error(
+                f"enable_numa_aware=True but plan construction failed: {e}. "
+                "Falling back to single pool. To force a specific mapping, set "
+                "cache_config.numa_gpu_map."
+            )
+            from flexkv.numa.planner import _disabled_plan
+            return _disabled_plan(cache_config.num_cpu_blocks)
+
+    def _build_cpu_mempool(self, num_cpu_blocks: int):
+        if self.numa_plan is None or not self.numa_plan.enabled:
+            return None  # CacheEngineAccel will fall back to legacy Mempool.
+        if self.numa_plan.arrangement is NumaArrangement.TP_WITHIN_NUMA:
+            return NumaMempool(self.numa_plan.per_pool_num_blocks())
+        # Defensive: TP_CROSSES_NUMA support landed at build_numa_plan level
+        # would route here. Phase 1.5 doesn't ship that — bail loudly.
+        raise NotImplementedError(
+            f"NumaArrangement {self.numa_plan.arrangement} not supported by cache engine"
+        )
+
+    def _home_pool_for_dp(self, dp_id: int) -> Optional[int]:
+        """Return the NUMA pool index that owns the cache slots a given DP
+        allocates into. None when NUMA-aware is disabled."""
+        if self.numa_plan is None or not self.numa_plan.enabled:
+            return None
+        return self.numa_plan.dp_to_home_pool.get(int(dp_id), 0)
+
+    def _emit_h2d_with_pool_fanout(
+        self,
+        graph: TransferOpGraph,
+        src_cpu_blocks: np.ndarray,
+        dst_gpu_blocks: np.ndarray,
+        layer_id: int,
+        layer_granularity: int,
+        predecessors: List[int],
+        finished_ops_ids: List[int],
+    ) -> List[int]:
+        """Build H2D ops, splitting by CPU pool when NUMA-aware.
+
+        Returns the list of created op ids (1 op in legacy mode; potentially
+        N ops in NUMA mode when source blocks span multiple pools — the
+        typical cross-DP cross-NUMA cache hit case).
+        """
+        if src_cpu_blocks.size == 0:
+            return []
+        if self.numa_plan is None or not self.numa_plan.enabled:
+            op = TransferOp(
+                graph_id=graph.graph_id,
+                transfer_type=TransferType.H2D,
+                src_block_ids=src_cpu_blocks,
+                dst_block_ids=dst_gpu_blocks,
+                layer_id=layer_id,
+                layer_granularity=layer_granularity,
+            )
+            graph.add_transfer_op(op)
+            for pred in predecessors:
+                graph.add_dependency(op.id if hasattr(op, "id") else op.op_id, pred)
+            finished_ops_ids.append(op.op_id)
+            return [op.op_id]
+
+        # NUMA-aware: split by NumaMempool.pools_of(src_cpu_blocks)
+        adapter = self.cpu_cache_engine.mempool  # _AllocatorAdapter
+        pool_ids = adapter.pools_of(src_cpu_blocks.astype(np.int64))
+        unique_pools = np.unique(pool_ids)
+        created_op_ids: List[int] = []
+        for pool in unique_pools:
+            mask = pool_ids == pool
+            sub_src = src_cpu_blocks[mask]
+            sub_dst = dst_gpu_blocks[mask]
+            op = TransferOp(
+                graph_id=graph.graph_id,
+                transfer_type=TransferType.H2D,
+                src_block_ids=sub_src.astype(np.int64),
+                dst_block_ids=sub_dst.astype(np.int64),
+                layer_id=layer_id,
+                layer_granularity=layer_granularity,
+                home_numa_id=int(pool),
+            )
+            graph.add_transfer_op(op)
+            for pred in predecessors:
+                graph.add_dependency(op.op_id, pred)
+            finished_ops_ids.append(op.op_id)
+            created_op_ids.append(op.op_id)
+        return created_op_ids
 
     def start(self) -> None:
         if self.cpu_cache_engine and self.cache_config.enable_p2p_cpu:
@@ -591,7 +833,8 @@ class GlobalCacheEngine:
                     block_end_idx,
                     gpu_block_ids,
                     layer_num,
-                    temp_cache_strategy
+                    temp_cache_strategy,
+                    dp_id=dp_id,
                 )
         else:
             #TODO pcfs will be supported later
@@ -855,7 +1098,8 @@ class GlobalCacheEngine:
                         block_mask_end: int,
                         gpu_block_ids: np.ndarray,
                         layer_num: int,
-                        temp_cache_strategy: CacheStrategy) \
+                        temp_cache_strategy: CacheStrategy,
+                        dp_id: int = 0) \
                             -> Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int]:
         """
         transfer pattern:
@@ -938,7 +1182,8 @@ class GlobalCacheEngine:
         allocated_cpu_blocks = self.cpu_cache_engine.take(
             num_required_blocks=allocated_cpu_block_num,
             protected_node=cpu_matched_result.last_node,
-            strict=False
+            strict=False,
+            home_numa_pool=self._home_pool_for_dp(dp_id),
         )
         nvtx.pop_range()
         # NOTE: not enough space to allocate, skip the request
@@ -1043,21 +1288,21 @@ class GlobalCacheEngine:
             fragment12_cpu_blocks = fragment1_cpu_blocks
 
         if enable_gpu:
-            op_h2d = TransferOp(
-                graph_id = transfer_graph.graph_id,
-                transfer_type = TransferType.H2D,
-                src_block_ids = fragment12_cpu_blocks if not enable_gds else fragment1_cpu_blocks,
-                dst_block_ids = fragment12_gpu_blocks if not enable_gds \
-                    else fragment12_gpu_blocks[:fragment1_num_blocks],
-                layer_id = 0,
-                layer_granularity = layer_num
-            )
-            transfer_graph.add_transfer_op(op_h2d)
+            h2d_predecessors: List[int] = []
             if op_disk2h is not None:
-                transfer_graph.add_dependency(op_h2d.op_id, op_disk2h.op_id)
+                h2d_predecessors.append(op_disk2h.op_id)
             if cpu_matched_result.matched_pos == "remote" and fragment1_num_blocks > 0:
-                transfer_graph.add_dependency(op_h2d.op_id, op_peerh2h.op_id)
-            finished_ops_ids.append(op_h2d.op_id)
+                h2d_predecessors.append(op_peerh2h.op_id)
+            self._emit_h2d_with_pool_fanout(
+                graph=transfer_graph,
+                src_cpu_blocks=fragment12_cpu_blocks if not enable_gds else fragment1_cpu_blocks,
+                dst_gpu_blocks=fragment12_gpu_blocks if not enable_gds \
+                    else fragment12_gpu_blocks[:fragment1_num_blocks],
+                layer_id=0,
+                layer_granularity=layer_num,
+                predecessors=h2d_predecessors,
+                finished_ops_ids=finished_ops_ids,
+            )
 
         node_to_unlock = {}
         if cpu_node_to_unlock is not None:
@@ -1112,7 +1357,8 @@ class GlobalCacheEngine:
                     block_end_idx,
                     gpu_block_ids,
                     layer_num,
-                    temp_cache_strategy
+                    temp_cache_strategy,
+                    dp_id=dp_id,
                 )
         else:
             (transfer_graph, finished_ops_ids, node_to_unlock, op_node_to_ready,
@@ -1339,7 +1585,8 @@ class GlobalCacheEngine:
             block_mask_end: int,
             gpu_block_ids: np.ndarray,
             layer_num : int,
-            temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY) \
+            temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY,
+            dp_id: int = 0) \
                 -> Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int, int]:
         """
         transfer pattern:
@@ -1387,10 +1634,12 @@ class GlobalCacheEngine:
 
         fragment12_gpu_blocks = gpu_block_ids[num_skipped_blocks:]
 
+        home_pool = self._home_pool_for_dp(dp_id)
         fragment12_cpu_blocks = self.cpu_cache_engine.take(
             num_required_blocks=fragment12_num_blocks,
             protected_node = cpu_matched_result.last_node,
-            strict=False
+            strict=False,
+            home_numa_pool=home_pool,
         )
 
         if enable_ssd:
@@ -1420,7 +1669,8 @@ class GlobalCacheEngine:
             src_block_ids = fragment12_gpu_blocks,
             dst_block_ids = fragment12_cpu_blocks,
             layer_id = 0,
-            layer_granularity = layer_num
+            layer_granularity = layer_num,
+            home_numa_id = home_pool if home_pool is not None else -1,
         )
         transfer_graph.add_transfer_op(op_d2h)
         finished_ops_ids.append(op_d2h.op_id)

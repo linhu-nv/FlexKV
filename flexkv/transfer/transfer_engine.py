@@ -44,6 +44,7 @@ from flexkv.transfer.worker import (
 )
 from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.ring_buffer import SharedOpPool
+from flexkv.numa.planner import NumaPlan, NumaArrangement
 
 
 def register_op_to_buffer(op: TransferOp, pin_buffer: SharedOpPool) -> None:
@@ -88,13 +89,22 @@ class TransferEngine:
         cache_config: CacheConfig,
         cpu_handle: Optional[StorageHandle] = None,
         ssd_handle: Optional[StorageHandle] = None,
-        remote_handle: Optional[StorageHandle] = None):
+        remote_handle: Optional[StorageHandle] = None,
+        cpu_handles_per_numa: Optional[List[StorageHandle]] = None,
+        numa_plan: Optional[NumaPlan] = None):
         """
         Initialize transfer engine
 
         Args:
             gpu_handles: Dict mapping dp_client_id -> list of GPU handles for that TP group
-            cpu_handle: CPU handle
+            cpu_handle: legacy single CPU handle (pool 0). Always set when
+                enable_cpu is True; in NUMA-aware mode it points to pool 0.
+            cpu_handles_per_numa: when NUMA-aware is on, the full list of CPU
+                pool handles in pool-index order. When None, the engine
+                operates in legacy single-pool mode (same as before).
+            numa_plan: NumaPlan computed by TransferManager. When None or
+                disabled, the engine ignores NUMA routing and uses the
+                legacy per-DP worker layout.
             ssd_handle: Optional SSD handle
             remote_handle: Optional remote handle
         """
@@ -117,6 +127,12 @@ class TransferEngine:
         self.shutdown_read_fd, self.shutdown_write_fd = os.pipe()
         self.gpu_handles = gpu_handles
         self._cpu_handle = cpu_handle
+        self._cpu_handles_per_numa = cpu_handles_per_numa
+        self._numa_plan = numa_plan if (numa_plan is not None and numa_plan.enabled) else None
+        if self._numa_plan is not None:
+            assert cpu_handles_per_numa is not None and len(cpu_handles_per_numa) == self._numa_plan.num_pools, (
+                "cpu_handles_per_numa length must equal numa_plan.num_pools"
+            )
         self._ssd_handle = ssd_handle
         self._remote_handle = remote_handle
         self._cache_config = cache_config
@@ -137,84 +153,48 @@ class TransferEngine:
         self._worker_map: Dict[TransferType, Union[WorkerHandle, List[WorkerHandle]]] = {}
 
         assert self._cpu_handle is not None
-        # Use num_gpu_groups to support multi-instance mode
-        # Use gpu_device_id from StorageHandle for correct CUDA device selection
-        if self.tp_size == 1:
-            self.h2d_workers: List[WorkerHandle] = [
-                GPUCPUTransferWorker.create_worker(
-                    mp_ctx=self.mp_ctx,
-                    finished_ops_queue=self.finished_ops_queue,
-                    op_buffer_tensor=self.pin_buffer.get_buffer(),
-                    gpu_blocks=gpu_handles[0].get_tensor_handle_list(),
-                    cpu_blocks=self._cpu_handle.get_tensor(),
-                    gpu_kv_layout=gpu_handles[0].kv_layout,
-                    cpu_kv_layout=self._cpu_handle.kv_layout,
-                    dtype=gpu_handles[0].dtype,
-                    gpu_device_id=gpu_handles[0].gpu_device_id,
-                    use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
-                    use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
-                    transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
-                    transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
+
+        # When the NumaPlan is enabled (Phase 1: TP_WITHIN_NUMA only), we
+        # spawn one H2D/D2H worker per (dp_id, numa_pool_index) pair. Each
+        # worker pins its assigned NUMA pool tensor. Routing in
+        # _assign_op_to_worker then dispatches by (dp_id, op.home_numa_id).
+        #
+        # When NUMA is disabled, we keep the legacy "one worker per dp"
+        # layout — same as before, with pool index always 0.
+        if self._numa_plan is not None:
+            if (
+                self._ssd_handle is not None
+                or self._remote_handle is not None
+                or self.cache_config.enable_gds
+                or self.cache_config.enable_kv_sharing
+            ):
+                raise NotImplementedError(
+                    "NUMA-aware mode (Phase 1) currently supports only CPU "
+                    "pools without SSD/Remote/GDS/peer-sharing. Disable one "
+                    "of: cache_config.enable_ssd/enable_remote/enable_gds/"
+                    "enable_p2p_cpu/enable_p2p_ssd, or wait for Phase 2."
                 )
-                for _, gpu_handles in self.gpu_handles.items()
-            ]
-            self.d2h_workers: List[WorkerHandle] = [
-                GPUCPUTransferWorker.create_worker(
-                    mp_ctx=self.mp_ctx,
-                    finished_ops_queue=self.finished_ops_queue,
-                    op_buffer_tensor=self.pin_buffer.get_buffer(),
-                    gpu_blocks=gpu_handles[0].get_tensor_handle_list(),
-                    cpu_blocks=self._cpu_handle.get_tensor(),
-                    gpu_kv_layout=gpu_handles[0].kv_layout,
-                    cpu_kv_layout=self._cpu_handle.kv_layout,
-                    dtype=gpu_handles[0].dtype,
-                    gpu_device_id=gpu_handles[0].gpu_device_id,
-                    use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
-                    use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
-                    transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
-                    transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
-                )
-                for _, gpu_handles in self.gpu_handles.items()
-            ]
+            pool_handles = self._cpu_handles_per_numa or []
         else:
-            self.h2d_workers = [
-                tpGPUCPUTransferWorker.create_worker(
-                    mp_ctx=self.mp_ctx,
-                    finished_ops_queue=self.finished_ops_queue,
-                    op_buffer_tensor=self.pin_buffer.get_buffer(),
-                    gpu_blocks=[gpu_handle.get_tensor_handle_list() for gpu_handle in gpu_handles],
-                    cpu_blocks=self._cpu_handle.get_tensor(),
-                    gpu_kv_layouts=[gpu_handle.kv_layout for gpu_handle in gpu_handles],
-                    cpu_kv_layout=self._cpu_handle.kv_layout,
-                    dtype=gpu_handles[0].dtype,
-                    tp_group_size=self.tp_size,
-                    dp_group_id=dp_client_id,
-                    use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
-                    use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
-                    transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
-                    transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
-                )
-                for dp_client_id, gpu_handles in self.gpu_handles.items()
-            ]
-            self.d2h_workers = [
-                tpGPUCPUTransferWorker.create_worker(
-                    mp_ctx=self.mp_ctx,
-                    finished_ops_queue=self.finished_ops_queue,
-                    op_buffer_tensor=self.pin_buffer.get_buffer(),
-                    gpu_blocks=[gpu_handle.get_tensor_handle_list() for gpu_handle in gpu_handles],
-                    cpu_blocks=self._cpu_handle.get_tensor(),
-                    gpu_kv_layouts=[gpu_handle.kv_layout for gpu_handle in gpu_handles],
-                    cpu_kv_layout=self._cpu_handle.kv_layout,
-                    dtype=gpu_handles[0].dtype,
-                    tp_group_size=self.tp_size,
-                    dp_group_id=dp_client_id,
-                    use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
-                    use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
-                    transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
-                    transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
-                )
-                for dp_client_id, gpu_handles in self.gpu_handles.items()
-            ]
+            pool_handles = [self._cpu_handle]
+
+        self.h2d_workers_by_pair: Dict[Tuple[int, int], WorkerHandle] = {}
+        self.d2h_workers_by_pair: Dict[Tuple[int, int], WorkerHandle] = {}
+
+        for dp_client_id, gpu_handles in self.gpu_handles.items():
+            for pool_idx, cpu_pool_handle in enumerate(pool_handles):
+                h2d = self._create_gpu_cpu_worker(dp_client_id, gpu_handles, cpu_pool_handle)
+                d2h = self._create_gpu_cpu_worker(dp_client_id, gpu_handles, cpu_pool_handle)
+                self.h2d_workers_by_pair[(dp_client_id, pool_idx)] = h2d
+                self.d2h_workers_by_pair[(dp_client_id, pool_idx)] = d2h
+
+        # Backwards-compatible list views for legacy code paths that index by
+        # dp_id only. They are correct only when NUMA is disabled (pool 0
+        # exists per dp). When NUMA is enabled, these lists collect all pools'
+        # workers for shutdown / health checks; per-op dispatch uses
+        # ``_workers_by_pair`` instead.
+        self.h2d_workers: List[WorkerHandle] = list(self.h2d_workers_by_pair.values())
+        self.d2h_workers: List[WorkerHandle] = list(self.d2h_workers_by_pair.values())
         self._worker_map[TransferType.H2D] = self.h2d_workers
         self._worker_map[TransferType.D2H] = self.d2h_workers
 
@@ -496,6 +476,55 @@ class TransferEngine:
         sel.close()
         flexkv_logger.info("TransferEngine scheduler loop stopped")
 
+    def _create_gpu_cpu_worker(self,
+                               dp_client_id: int,
+                               gpu_handles: List[StorageHandle],
+                               cpu_pool_handle: StorageHandle) -> WorkerHandle:
+        """Spawn one H2D-or-D2H worker bound to (dp_client_id, this cpu pool).
+
+        The C++/Python worker is unchanged: the only NUMA-specific thing here
+        is that the CPU tensor we pass is the per-NUMA pool tensor (smaller
+        num_block but identical block_stride / kv_stride / layer_stride to
+        the global layout, since arrangement is TP_WITHIN_NUMA). Block ids
+        passed in TransferOps are **global**; the worker handles the
+        per-pool offset internally via WorkerTransferOp.numa_pool_block_offset
+        when set. Phase 1 fix: the cache engine already issues local ids
+        for the home pool, see HierarchyLRCacheEngine. So no offset math is
+        needed inside the worker for now.
+        """
+        if self.tp_size == 1:
+            return GPUCPUTransferWorker.create_worker(
+                mp_ctx=self.mp_ctx,
+                finished_ops_queue=self.finished_ops_queue,
+                op_buffer_tensor=self.pin_buffer.get_buffer(),
+                gpu_blocks=gpu_handles[0].get_tensor_handle_list(),
+                cpu_blocks=cpu_pool_handle.get_tensor(),
+                gpu_kv_layout=gpu_handles[0].kv_layout,
+                cpu_kv_layout=cpu_pool_handle.kv_layout,
+                dtype=gpu_handles[0].dtype,
+                gpu_device_id=gpu_handles[0].gpu_device_id,
+                use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
+                use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
+                transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
+                transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
+            )
+        return tpGPUCPUTransferWorker.create_worker(
+            mp_ctx=self.mp_ctx,
+            finished_ops_queue=self.finished_ops_queue,
+            op_buffer_tensor=self.pin_buffer.get_buffer(),
+            gpu_blocks=[gpu_handle.get_tensor_handle_list() for gpu_handle in gpu_handles],
+            cpu_blocks=cpu_pool_handle.get_tensor(),
+            gpu_kv_layouts=[gpu_handle.kv_layout for gpu_handle in gpu_handles],
+            cpu_kv_layout=cpu_pool_handle.kv_layout,
+            dtype=gpu_handles[0].dtype,
+            tp_group_size=self.tp_size,
+            dp_group_id=dp_client_id,
+            use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
+            use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
+            transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
+            transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
+        )
+
     def _assign_op_to_worker(self, op: TransferOp) -> None:
         self.op_id_to_nvtx_range[op.op_id] = nvtx.start_range(f"schedule {op.transfer_type.name} "
                                                                        f"op_id: {op.op_id}, "
@@ -507,6 +536,24 @@ class TransferEngine:
             return
         if op.transfer_type not in self._worker_map:
             raise ValueError(f"Unsupported transfer type: {op.transfer_type}")
+
+        # NUMA-aware routing: H2D/D2H ops carry op.home_numa_id (set by the
+        # cache engine when enable_numa_aware is on). All other transfer
+        # types still use the legacy by-dp_id routing.
+        if (self._numa_plan is not None
+                and op.transfer_type in (TransferType.H2D, TransferType.D2H)):
+            key = (op.dp_id, op.home_numa_id if op.home_numa_id >= 0
+                   else self._numa_plan.dp_to_home_pool.get(op.dp_id, 0))
+            table = (self.h2d_workers_by_pair if op.transfer_type == TransferType.H2D
+                     else self.d2h_workers_by_pair)
+            handle = table.get(key)
+            if handle is None:
+                raise RuntimeError(
+                    f"No NUMA-aware worker for {op.transfer_type.name} dp={op.dp_id} "
+                    f"home_numa={op.home_numa_id}; available={list(table.keys())}"
+                )
+            handle.submit_transfer(op)
+            return
 
         worker = self._worker_map[op.transfer_type]
         if isinstance(worker, List):

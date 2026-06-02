@@ -12,6 +12,7 @@ import torch
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import StorageHandle, AccessHandleType, KVCacheLayout, KVCacheLayoutType
 from flexkv.common.debug import flexkv_logger
+from flexkv.numa.allocator import HAS_LIBNUMA, numa_alloc_tensor, NumaAllocResult
 
 
 class BaseStorageAllocator(ABC):
@@ -109,6 +110,56 @@ class CPUAllocator(BaseStorageAllocator):
             data=physical_tensor,
             kv_layout=layout,
             dtype=dtype,
+        )
+
+    @classmethod
+    def allocate_on_numa_node(cls,
+                              layout: KVCacheLayout,
+                              dtype: torch.dtype,
+                              numa_node: int,
+                              numa_pool_index: int,
+                              **kwargs: Any) -> StorageHandle:
+        """Allocate one NUMA-bound CPU pool. Pages first-touched on ``numa_node``.
+
+        ``numa_pool_index`` is the logical pool index passed in by the
+        :class:`NumaPlan` (0 .. num_pools-1). It is stored on the returned
+        :class:`StorageHandle` so downstream code (the transfer engine) can
+        route ops to the right worker without re-deriving the mapping.
+        """
+        if not HAS_LIBNUMA:
+            raise RuntimeError(
+                "CPUAllocator.allocate_on_numa_node requires libnuma at runtime. "
+                "Either install libnuma1, disable cache_config.enable_numa_aware, "
+                "or override cache_config.numa_gpu_map to fall back to a single pool."
+            )
+        total_size = layout.get_total_elements()
+        flexkv_logger.info(
+            f"CPU allocate (NUMA node={numa_node}, pool={numa_pool_index}) "
+            f"total_size: {2 * total_size/1024/1024/1024:.2f} GB"
+        )
+        name_hint = kwargs.get("name_hint", "pool")
+        result = numa_alloc_tensor(
+            num_elements=total_size,
+            dtype=dtype,
+            node=numa_node,
+            name_hint=name_hint,
+            pool_index=numa_pool_index,
+            touch=True,
+            keepalive=True,
+        )
+        if not result.numa_bound:
+            flexkv_logger.warning(
+                f"CPU pool {numa_pool_index} for NUMA node {numa_node} "
+                "was created without enforced page-binding; transfers will "
+                "still work but may incur cross-NUMA DMA."
+            )
+        return StorageHandle(
+            handle_type=AccessHandleType.TENSOR,
+            data=result.tensor,
+            kv_layout=layout,
+            dtype=dtype,
+            numa_node=numa_node,
+            numa_pool_index=numa_pool_index,
         )
 
     @classmethod
