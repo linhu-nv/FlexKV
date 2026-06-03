@@ -194,6 +194,16 @@ class FlexKVSchedulerConnector:
         self.flexkv_stats = FlexKVStats(int(os.getenv('FLEXKV_NUM_LOG_INTERVAL_REQUESTS', '200')))
         self.failed_block_ids: set[int] = set()
 
+        # Env-gated per-call timing of get_match / put_match. The wall time of
+        # each call is captured by the existing `match_start_time` /
+        # `match_end_time` pair at the call sites; we aggregate it here so we
+        # can later compare baseline (zmq+KVServer) vs shmradix on the same
+        # workload. Set FLEXKV_TIME_QUERY=N (>0) to enable; logs are emitted
+        # every N samples and reset, so per-engine output stays bounded.
+        self._query_time_log_every = int(os.getenv("FLEXKV_TIME_QUERY", "0") or "0")
+        self._query_time_get_us: list[float] = []
+        self._query_time_put_us: list[float] = []
+
         self.maybe_skip_put = os.getenv('FLEXKV_MAYBE_SKIP_PUT', '0') == '1'
 
         # only support local batching for now
@@ -210,6 +220,27 @@ class FlexKVSchedulerConnector:
             time.sleep(5)
 
         logger.info("Finish init FlexKVSchedulerConnector")
+
+    def _record_query_time(self, kind: str, dt_us: float) -> None:
+        """Append `dt_us` to the rolling buffer for `kind` ('get' or 'put')
+        and emit a one-line summary every `_query_time_log_every` samples."""
+        if self._query_time_log_every <= 0:
+            return
+        buf = self._query_time_get_us if kind == "get" else self._query_time_put_us
+        buf.append(dt_us)
+        if len(buf) < self._query_time_log_every:
+            return
+        arr = np.array(buf, dtype=np.float64)
+        logger.info(
+            "[FLEXKV-QTIME] %s n=%d mean=%.1fus p50=%.1fus p95=%.1fus p99=%.1fus max=%.1fus",
+            kind, arr.size,
+            float(arr.mean()),
+            float(np.percentile(arr, 50)),
+            float(np.percentile(arr, 95)),
+            float(np.percentile(arr, 99)),
+            float(arr.max()),
+        )
+        buf.clear()
 
     def is_ready(
         self,
@@ -347,6 +378,7 @@ class FlexKVSchedulerConnector:
 
         # Auto cancel if not call update_state_after_alloc()
         match_end_time = time.perf_counter()
+        self._record_query_time("get", (match_end_time - match_start_time) * 1e6)
         # logger.debug(f"Get match cost {(match_end_time-match_start_time)*1000:.2f} ms.")
         if num_new_matched_tokens > 0:
             self.req_id_to_task_dict[request.request_id] = task_id
@@ -500,6 +532,7 @@ class FlexKVSchedulerConnector:
 
         # Auto cancel if not need to put.
         match_end_time = time.perf_counter()
+        self._record_query_time("put", (match_end_time - match_start_time) * 1e6)
         # logger.debug(f"Put match cost {(match_end_time-match_start_time)*1000:.2f} ms.")
 
         if num_unmatched_tokens > 0:
