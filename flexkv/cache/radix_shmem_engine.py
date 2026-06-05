@@ -4,32 +4,54 @@ RadixShmem-backed CacheEngine.
 
 A drop-in replacement for `flexkv.cache.cache_engine.CacheEngineAccel` whose
 RadixTree + slot Mempool live in POSIX shared memory (via the `shmradix`
-package, https://github.com/.../radixshmem). Every DP scheduler process can
-attach to the same shm region and run prefix queries / inserts in parallel,
-serialised only by a process-shared rwlock.
+package). Every DP scheduler process can attach to the same shm region and run
+prefix queries / inserts in parallel, serialised only by a process-shared
+rwlock.
 
 Public surface mirrors `CacheEngineAccel` so that `GlobalCacheEngine` and the
-`_get_impl_local`/`_get_impl_global`/`_put_*` helpers in `cache_engine.py` can
-treat both backends uniformly: `match()` returns a `MatchResultAccel`, `insert`
-returns an opaque "node" handle that has `.size()`, etc.
+`_get_impl_*`/`_put_*` helpers in `cache_engine.py` treat both backends
+uniformly: `match()` returns a `MatchResultAccel`, `insert` returns an opaque
+"node" handle with `.size()`, and `lock_node`/`unlock`/`set_ready` operate on
+that handle.
 
-Differences from `CacheEngineAccel`:
-- The slot mempool is owned by radixshmem (one mempool per shm region). The
-  cache engine no longer holds its own `flexkv.cache.mempool.Mempool`. `take()`
-  forwards to `tree.allocate_slots()` and `recycle()` forwards to
-  `tree.recycle_slots()`.
-- `lock_node`/`unlock`/`set_ready(node, ...)` use the radixshmem node_id stored
-  on the `ShmRadixNode` wrapper.
-- `evict()` is performed implicitly by radixshmem's auto-evict during
-  `allocate_slots`. The standalone `evict()` API is not used by FlexKV's
-  `take()` path on this backend.
+==============================  API model  ==============================
 
-Slot IDs returned by radixshmem are `int32`; FlexKV expects `int64`. We cast at
-the boundary (`np.asarray(..., dtype=np.int64)`).
+This module targets the CURRENT shmradix API, which deliberately does NOT
+expose node-id handles (a node id is invalidated by a later split). Instead:
+
+  * `RadixServer` / `RadixClient`        (renamed from TreeServer/TreeClient)
+  * `query(hashes, lock=, update_meta=)` returns a `QueryResult` with
+    `ready_prefix_len`, `total_hit_length`, `ready_prefix_slots`, and a
+    one-shot `finalize` (armed when lock=True).
+  * `insert_with_slots(hashes, slots, is_ready=, lock=)` returns an
+    `InsertResult` with `matched_prefix`, `inserted_count`, and a one-shot
+    `finalize` (armed when is_ready=False / lock=True; it performs
+    set_ready + dec_ref in a single call).
+  * State ops are HASH-PATH based and split-invariant:
+    `set_ready(hashes, start, length, ready)`,
+    `inc_ref(hashes, start, length)`, `dec_ref(hashes, start, length)`.
+
+`ShmRadixNode` therefore carries the hash path (`hashes`, `start`, `length`)
+plus an optional armed `finalize`. Two flavours flow through `cache_engine.py`:
+
+  - **matched node** (from `match()` / `query(lock=True)`): protected by the
+    query's atomic inc_ref. It participates in cache_engine's hand-off
+    protocol (lock_node → release pre-lock → callback unlock), which needs
+    independent counter inc/dec, so lock_node/unlock map to HASH-PATH
+    inc_ref/dec_ref over [0, ready_prefix_len).
+
+  - **inserted node** (from `insert(is_ready=False)`): auto-locked by shmradix,
+    carrying an armed `finalize` (= set_ready + dec_ref). `lock_node` on it is
+    a NO-OP (it is already protected); the callback's `set_ready` is a no-op
+    and `unlock` calls `finalize()` once. This is the "prefer finalize"
+    write-path收尾.
+
+Slot IDs returned by shmradix are `int32`; FlexKV expects `int64`. We cast at
+the boundary.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
 import numpy as np
@@ -39,9 +61,6 @@ from flexkv.common.transfer import DeviceType
 from flexkv.common.type import MatchResultAccel
 
 if TYPE_CHECKING:
-    # `flexkv.common.block` (and `flexkv.integration.dynamo.collector`) pull in
-    # the FlexKV C++ extension transitively. Keep them out of import-time so
-    # this module can be loaded for unit tests without CUDA/libtorch.
     from flexkv.common.block import SequenceMeta
     from flexkv.integration.dynamo.collector import KVEventCollector
 
@@ -56,30 +75,45 @@ else:
 
 _DEVICE_TYPE_NAMES = ['CPU', 'GPU', 'SSD', 'REMOTE']
 
-# Sentinel for "no node" — radixshmem uses uint32 max.
-INVALID_NODE_ID = 0xFFFFFFFF
-
 
 @dataclass
 class ShmRadixNode:
-    """Lightweight handle around a radixshmem node_id.
+    """Hash-path handle into the shared radix tree.
 
-    Mirrors the small subset of `CRadixNode` semantics that FlexKV's
-    `cache_engine.py` actually uses: `.size()` (number of blocks contributed by
-    this node) and pass-through to `lock_node`/`unlock`/`set_ready`.
+    Replaces the old "bare node_id" handle. Carries the prefix path so that
+    `lock_node`/`unlock`/`set_ready` can re-walk the tree (split-invariant),
+    plus an optional armed `finalize` for the insert write-path收尾.
 
-    `ready_length` records how many blocks of this node are ready when the
-    handle was created — FlexKV calls `set_ready(node, ready, ready_length)`
-    later to flip them.
+    Fields:
+      num_blocks : value returned by `.size()` (matched/inserted block count).
+      hashes     : uint64 prefix path copy (kept alive for re-walks).
+      start,length : the sub-range of `hashes` this handle governs.
+      finalize   : armed FinalizeFn from insert(is_ready=False); when set, this
+                   handle is an "inserted node" and is auto-protected by
+                   shmradix until finalize() runs (set_ready + dec_ref).
     """
-    node_id: int
     num_blocks: int
+    hashes: Optional[np.ndarray] = None
+    start: int = 0
+    length: int = 0
+    finalize: object = None
 
     def size(self) -> int:
         return self.num_blocks
 
     def is_valid(self) -> bool:
-        return self.node_id != INVALID_NODE_ID
+        return self.hashes is not None or self.finalize is not None
+
+    @property
+    def is_inserted(self) -> bool:
+        """True if this handle is auto-protected by an armed insert finalize."""
+        return self.finalize is not None
+
+    def run_finalize(self) -> None:
+        """Idempotent one-shot: run the armed finalize then disarm."""
+        if self.finalize is not None:
+            self.finalize()
+            self.finalize = None
 
 
 def _ensure_shmradix():
@@ -110,7 +144,7 @@ class CacheEngineRadixShmem:
                  event_collector: Optional[KVEventCollector] = None,
                  metrics_collector=None,
                  protected_threshold: int = 2):
-        """Attach to an existing radix shm region by name. The TreeServer
+        """Attach to an existing radix shm region by name. The RadixServer
         owning the region must have been created elsewhere (e.g. by
         `flexkv.server.shm_radix_bootstrap.create_shm_radix_regions`)."""
         _ensure_shmradix()
@@ -120,9 +154,6 @@ class CacheEngineRadixShmem:
                 f"radixshmem only supports LRU eviction; ignoring "
                 f"eviction_policy={eviction_policy!r}"
             )
-        # `hit_reward_seconds` and `protected_threshold` aren't expressible in
-        # radixshmem yet — we accept them for ABI compatibility with
-        # CacheEngineAccel and warn if non-default values are requested.
         if hit_reward_seconds != 0 or protected_threshold != 2:
             flexkv_logger.debug(
                 "radixshmem ignores hit_reward_seconds and protected_threshold"
@@ -138,29 +169,25 @@ class CacheEngineRadixShmem:
         self.event_collector = event_collector
         self._metrics_collector = metrics_collector
 
-        # TreeClient always; TreeServer is owned by the bootstrap process.
-        self._tree = shmradix.TreeClient(shm_name)
+        # RadixClient always; the RadixServer is owned by the bootstrap process.
+        self._tree = shmradix.RadixClient(shm_name)
 
-        # Diagnostics: how often does the race that route-A guards against
-        # actually fire? Counted per-instance so each (device, DP) reports
-        # its own rate.
+        # Diagnostics: how often does the insert race fire (caller supplied
+        # excess slots / matched_prefix advanced)?
         self._insert_count = 0
         self._race_count = 0
         self._unused_slot_total = 0
         self._race_log_interval = 50
 
-    # ---------- Mempool view (compatibility shims for CacheEngineAccel API) ----------
+    # ---------- Mempool view (compatibility shims) ----------
 
     @property
-    def mempool(self) -> "_MempoolView":
+    def mempool(self) -> _MempoolView:
         return _MempoolView(self._tree)
 
     # ---------- Lifecycle ----------
 
     def reset(self) -> None:
-        # radixshmem has no public reset; closest is removing all entries one
-        # by one. For now, we only support reset by destroying and re-creating
-        # the shm region. Used in tests; not exercised in production.
         flexkv_logger.warning(
             "CacheEngineRadixShmem.reset(): radixshmem has no in-place reset; "
             "tear down and recreate the shm region instead."
@@ -169,59 +196,67 @@ class CacheEngineRadixShmem:
     def close(self) -> None:
         self._tree = None
 
+    # ---------- Hash-path ref helpers (matched nodes) ----------
+
+    def _inc_ref_node(self, node: ShmRadixNode) -> None:
+        if node.hashes is not None and node.length > 0:
+            self._tree.inc_ref(node.hashes, node.start, node.length)
+
+    def _dec_ref_node(self, node: ShmRadixNode) -> None:
+        if node.hashes is not None and node.length > 0:
+            self._tree.dec_ref(node.hashes, node.start, node.length)
+
     # ---------- Match / insert / lock ----------
 
     def match(self, sequence_meta: SequenceMeta) -> MatchResultAccel:
         sequence_meta.gen_hashes()
-        # SequenceMeta.block_hashes is int64; radixshmem expects uint64. They
-        # share the same byte width, so view-cast is safe.
-        hashes = sequence_meta.block_hashes.view(np.uint64)
+        # SequenceMeta.block_hashes is int64; radixshmem expects uint64. Same
+        # byte width → view-cast is safe. Keep a contiguous copy on the handles
+        # so later inc_ref/dec_ref/set_ready re-walks stay valid independent of
+        # the SequenceMeta lifetime.
+        hashes = np.ascontiguousarray(sequence_meta.block_hashes).view(np.uint64)
 
-        # `lock=True` inc_refs `last_ready_node_id` atomically under the
-        # read_lock, preventing another process from auto-evicting the matched
-        # nodes (and recycling our slot ids) between `match()` and the H2D
-        # that consumes the slots. By the radixshmem tree invariant, locking
-        # the deepest ready node also protects every ancestor on the ready
-        # prefix. cache_engine.py's `_transfer_callback` calls
-        # `unlock(last_ready_node)` to release this ref.
-        detail = self._tree.query_detail(hashes, lock=True)
+        # lock=True atomically inc_refs the ready prefix under the read_lock,
+        # preventing another process from auto-evicting the matched slots (and
+        # recycling our slot ids) between match() and the consuming transfer.
+        qr = self._tree.query(hashes, local_only=True, lock=True, update_meta=True)
 
-        # Build MatchResultAccel mirroring CacheEngineAccel.match().
-        last_node_id = detail.last_node_id
-        last_ready_id = detail.last_ready_node_id
+        ready_len = int(qr.ready_prefix_len)
+        matched_len = int(qr.total_hit_length)
 
-        if last_node_id != INVALID_NODE_ID and last_node_id != 0:
-            # last_node carries the entire node it represents (or its full size
-            # if we descended into it via match-then-stop). For the unified
-            # cache_engine code we expose `.size()` = matched length within node.
-            last_node = ShmRadixNode(node_id=int(last_node_id),
-                                      num_blocks=int(detail.last_node_matched_blocks))
-        else:
-            last_node = None
-
-        if last_ready_id != INVALID_NODE_ID and last_ready_id != 0:
-            # FlexKV uses last_ready_node primarily to lock the path against
-            # eviction. The exact size attached to it is informational; cap by
-            # ready_prefix_len.
-            last_ready_node = ShmRadixNode(node_id=int(last_ready_id),
-                                            num_blocks=int(detail.ready_prefix_len))
+        # last_ready_node: protects [0, ready_len). Same object is reused as
+        # pre_locked_node so the cache_engine hand-off (lock_node → release
+        # pre-lock → callback unlock) accounts against one handle.
+        if ready_len > 0:
+            last_ready_node = ShmRadixNode(
+                num_blocks=ready_len, hashes=hashes, start=0, length=ready_len)
         else:
             last_ready_node = None
 
-        physical = np.asarray(detail.slots, dtype=np.int64)
+        # last_node: governs the full matched range [0, matched_len). Used as
+        # `protected_node` in take(); never carries an insert finalize.
+        if matched_len > 0:
+            last_node = ShmRadixNode(
+                num_blocks=int(qr.local_hit_length) or matched_len,
+                hashes=hashes, start=0, length=matched_len)
+        else:
+            last_node = None
+
+        physical = np.asarray(qr.ready_prefix_slots, dtype=np.int64)
 
         return MatchResultAccel(
-            num_ready_matched_blocks=int(detail.ready_prefix_len),
-            num_matched_blocks=int(detail.matched_blocks),
+            num_ready_matched_blocks=ready_len,
+            num_matched_blocks=matched_len,
             last_ready_node=last_ready_node,
             last_node=last_node,
-            last_node_matched_length=int(detail.last_node_matched_blocks),
+            last_node_matched_length=matched_len,
             physical_blocks=physical,
             block_node_ids=None,
             matched_pos="local",
-            # `query_detail(lock=True)` atomically inc_ref'd last_ready_node_id
-            # — the cache_engine layer owns releasing this exactly once.
-            pre_locked_node=last_ready_node if last_ready_node is not None else None,
+            # query(lock=True) atomically inc_ref'd [0, ready_len); the
+            # cache_engine layer releases this exactly once (via unlock →
+            # hash-path dec_ref on the same handle).
+            pre_locked_node=last_ready_node,
         )
 
     def insert(self,
@@ -230,23 +265,23 @@ class CacheEngineRadixShmem:
                num_insert_blocks: int = -1,
                is_ready: bool = True,
                match_result: Optional[MatchResultAccel] = None
-               ) -> "tuple[Optional[ShmRadixNode], np.ndarray]":
+               ) -> tuple[Optional[ShmRadixNode], np.ndarray]:
         """Attach `physical_block_ids` as a suffix in the shared radix tree.
 
         Returns (node, unused_slots) where:
-          - `node` is the inserted leaf (or None if nothing got attached).
+          - `node` is the inserted leaf handle (or None if nothing attached).
+            When inserted with is_ready=False it carries the armed finalize
+            (= set_ready + dec_ref) — released later via `unlock(node)`.
           - `unused_slots` (int64) is the subset of `physical_block_ids` that
-            radixshmem did NOT attach — either because the matched_prefix at
-            insert time has advanced (another process won the race for the
-            same prefix) or because the caller supplied excess slots. The
-            caller MUST recycle these AFTER any in-flight transfer that
-            references them has completed (typically via `buffer_to_free` in
-            `_transfer_callback`). Returning them straight to the mempool
-            here would race with the caller's pipelined transfer and let
-            another process reuse the slot mid-write, corrupting data.
+            shmradix did NOT attach (matched_prefix advanced, or the caller
+            supplied excess slots). The current shmradix `insert_with_slots`
+            consumes the supplied pool front-first and inserts exactly
+            `inserted_count` of them, so unused = slots[inserted_count:]. The
+            caller MUST recycle these only AFTER any in-flight transfer that
+            references them has completed.
         """
         sequence_meta.gen_hashes()
-        hashes = sequence_meta.block_hashes.view(np.uint64)
+        hashes = np.ascontiguousarray(sequence_meta.block_hashes).view(np.uint64)
 
         suffix_slots = np.asarray(physical_block_ids, dtype=np.int32)
 
@@ -254,16 +289,22 @@ class CacheEngineRadixShmem:
             target_hashes = hashes[:num_insert_blocks]
         else:
             target_hashes = hashes
+        target_hashes = np.ascontiguousarray(target_hashes)
 
         result = self._tree.insert_with_slots(
-            target_hashes, suffix_slots, is_ready, auto_recycle=False
+            target_hashes, suffix_slots, is_ready=is_ready
         )
 
-        # Diagnostics: count how often the insert race fires (matched_prefix
-        # grew between caller's match() and this insert, OR caller supplied
-        # excess slots, so radixshmem couldn't attach them all).
+        inserted = int(result.inserted_count)
+        matched_prefix = int(result.matched_prefix)
+
+        # unused = supplied slots beyond what was actually attached.
+        unused_slots = suffix_slots[inserted:]
+        unused_slots_i64 = np.asarray(unused_slots, dtype=np.int64)
+
+        # Diagnostics.
         self._insert_count += 1
-        num_unused = len(result.unused_slots)
+        num_unused = len(unused_slots_i64)
         if num_unused > 0:
             self._race_count += 1
             self._unused_slot_total += num_unused
@@ -275,9 +316,9 @@ class CacheEngineRadixShmem:
                 f"({race_pct:.2f}%) cumulative_unused_slots={self._unused_slot_total}"
             )
 
-        if self.event_collector is not None and result.inserted_count > 0:
+        if self.event_collector is not None and inserted > 0:
             attached_hashes = sequence_meta.block_hashes[
-                result.matched_prefix : result.matched_prefix + result.inserted_count
+                matched_prefix : matched_prefix + inserted
             ]
             self.event_collector.publish_stored(
                 block_hashes=attached_hashes,
@@ -285,32 +326,56 @@ class CacheEngineRadixShmem:
                 medium=_DEVICE_TYPE_NAMES[self.device_type]
             )
 
-        unused_slots_i64 = np.asarray(result.unused_slots, dtype=np.int64)
-
-        if result.last_node_id == INVALID_NODE_ID or result.inserted_count <= 0:
+        if inserted <= 0:
+            # Nothing attached → drop any armed finalize (no protection taken).
             return None, unused_slots_i64
-        node = ShmRadixNode(node_id=int(result.last_node_id),
-                            num_blocks=int(result.inserted_count))
+
+        # Build the inserted-node handle. For is_ready=False the finalize is
+        # armed (set_ready + dec_ref over [matched_prefix, matched_prefix+
+        # inserted)); for is_ready=True insert takes no ref and finalize is a
+        # no-op, so the handle is hash-path only.
+        fin = result.finalize if (result.finalize and bool(result.finalize)) else None
+        node = ShmRadixNode(
+            num_blocks=inserted,
+            hashes=hashes,
+            start=matched_prefix,
+            length=inserted,
+            finalize=fin,
+        )
         return node, unused_slots_i64
 
     def lock_node(self, node: ShmRadixNode) -> None:
         if node is None or not node.is_valid():
             return
-        self._tree.inc_ref_node(node.node_id)
+        # Inserted nodes are already protected by their armed finalize — taking
+        # another ref here would leak it. Matched nodes take an independent
+        # hash-path ref (the cache_engine hand-off then drops the match's
+        # pre-lock).
+        if node.is_inserted:
+            return
+        self._inc_ref_node(node)
 
     def unlock(self, node: ShmRadixNode) -> None:
         if node is None or not node.is_valid():
             return
-        self._tree.dec_ref_node(node.node_id)
+        if node.is_inserted:
+            # One-shot: set_ready + dec_ref. Idempotent.
+            node.run_finalize()
+        else:
+            self._dec_ref_node(node)
 
     def set_ready(self, node: ShmRadixNode, ready: bool, ready_length: int) -> None:
-        # radixshmem ready flag is at node granularity (the whole node is
-        # either ready or not). `ready_length` is accepted for API parity
-        # with CacheEngineAccel but ignored — partial-within-node ready is
-        # not expressible in radixshmem.
         if node is None or not node.is_valid():
             return
-        self._tree.set_ready_node(int(node.node_id), bool(ready))
+        if node.is_inserted:
+            # Handled atomically by the armed finalize in unlock(); the
+            # callback always calls set_ready THEN unlock, so flipping ready
+            # here would be redundant (and finalize only fires ready=True).
+            return
+        # Matched node: already ready, but honour an explicit request via the
+        # hash path (idempotent, split-invariant).
+        if node.hashes is not None and node.length > 0:
+            self._tree.set_ready(node.hashes, node.start, node.length, bool(ready))
 
     def set_ready_path(self,
                        sequence_meta: SequenceMeta,
@@ -319,7 +384,7 @@ class CacheEngineRadixShmem:
                        ready: bool) -> None:
         """Path-based set_ready that walks a SequenceMeta hash path."""
         sequence_meta.gen_hashes()
-        hashes = sequence_meta.block_hashes.view(np.uint64)
+        hashes = np.ascontiguousarray(sequence_meta.block_hashes).view(np.uint64)
         self._tree.set_ready(hashes, start, length, ready)
 
     # ---------- Mempool ops (take/recycle) ----------
@@ -330,23 +395,22 @@ class CacheEngineRadixShmem:
              strict: bool = True) -> np.ndarray:
         """Allocate `num_required_blocks` slots from radixshmem's mempool.
 
-        radixshmem's `allocate_slots` will auto-evict LRU entries to satisfy
-        the request. `protected_node` is locked across the call to prevent it
-        from being evicted; we wrap inc_ref/dec_ref around the call.
+        radixshmem's `allocate_slots` auto-evicts LRU entries to satisfy the
+        request. `protected_node` is held across the call (hash-path inc_ref /
+        dec_ref) so it is not evicted mid-allocation.
         """
-        if protected_node is not None and protected_node.is_valid():
-            self._tree.inc_ref_node(protected_node.node_id)
+        protect = protected_node is not None and protected_node.is_valid()
+        if protect:
+            self._inc_ref_node(protected_node)
         try:
             slots_i32 = self._tree.allocate_slots(num_required_blocks)
         finally:
-            if protected_node is not None and protected_node.is_valid():
-                self._tree.dec_ref_node(protected_node.node_id)
+            if protect:
+                self._dec_ref_node(protected_node)
 
         slots = np.asarray(slots_i32, dtype=np.int64)
 
         if strict and len(slots) < num_required_blocks:
-            # Caller will recycle whatever we returned; mirror CacheEngineAccel
-            # by raising on shortfall.
             self._tree.recycle_slots(np.asarray(slots, dtype=np.int32))
             raise RuntimeError(
                 f"radixshmem: not enough free blocks to take, required: "
@@ -377,13 +441,12 @@ class CacheEngineRadixShmem:
 
     @property
     def total_nodes(self) -> int:
-        return int(self._tree.total_nodes())
+        return int(self._tree.total_radix_nodes())
 
 
 @dataclass
 class _MempoolView:
-    """Read-only mempool view that lets `cache_engine.py` query free/used
-    counts via `engine.mempool.num_free_blocks` etc."""
+    """Read-only mempool view for `engine.mempool.num_free_blocks` etc."""
     _tree: object
 
     @property

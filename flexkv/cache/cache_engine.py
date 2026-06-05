@@ -81,7 +81,7 @@ class CacheEngineAccel:
         self.num_total_blocks = num_total_blocks
         self.evict_ratio = evict_ratio
         self.evict_start_threshold = evict_start_threshold
-        
+
         self.event_collector = event_collector
         self._metrics_collector = metrics_collector
 
@@ -168,25 +168,25 @@ class CacheEngineAccel:
              strict: bool = True) -> np.ndarray:
         # Calculate current utilization
         utilization = (self.mempool.num_total_blocks - self.mempool.num_free_blocks) / self.mempool.num_total_blocks if self.mempool.num_total_blocks > 0 else 0
-        
+
         # Proactive eviction: trigger when utilization exceeds threshold OR when blocks are needed
         should_evict = (utilization >= self.evict_start_threshold) or (num_required_blocks > self.mempool.num_free_blocks)
-        
+
         if should_evict:
             if protected_node is not None:
                 self.index.lock(protected_node)
-            
+
             # Calculate how many blocks to evict
             # Goal: maintain free blocks above (1 - evict_start_threshold) ratio
             target_free_blocks = int(self.mempool.num_total_blocks * (1.0 - self.evict_start_threshold))
             evict_to_reach_target = max(0, target_free_blocks - self.mempool.num_free_blocks)
-            
+
             evict_block_num = max(
                 num_required_blocks - self.mempool.num_free_blocks,  # At least meet current demand
                 evict_to_reach_target,                               # Or reach target free ratio
                 int(self.mempool.num_total_blocks * self.evict_ratio) if self.evict_ratio > 0 else 0  # Or minimum evict_ratio
             )
-            
+
             if evict_block_num > 0:
                 target_blocks = torch.zeros(evict_block_num, dtype=torch.int64)
                 evicted_block_hashes = torch.zeros(evict_block_num, dtype=torch.int64)
@@ -208,18 +208,18 @@ class CacheEngineAccel:
                     )
             if protected_node is not None:
                 self.index.unlock(protected_node)
-        
+
         if strict and num_required_blocks > self.mempool.num_free_blocks:
             raise RuntimeError(f"Not enough free blocks to take, "
                                f"required: {num_required_blocks}, "
                                f"available: {self.mempool.num_free_blocks}")
         num_allocated_blocks = min(num_required_blocks, self.mempool.num_free_blocks)
         allocated_blocks = self.mempool.allocate_blocks(num_allocated_blocks)
-        
+
         # Record allocation metrics
         if self._metrics_collector is not None and num_allocated_blocks > 0:
             self._metrics_collector.record_allocation(DEVICE_TYPE[self.device_type].lower(), num_allocated_blocks)
-        
+
         return allocated_blocks
 
     def recycle(self, physical_blocks: np.ndarray) -> None:
@@ -314,19 +314,19 @@ class CacheEngine:
              strict: bool = True) -> np.ndarray:
         # Calculate current utilization
         utilization = (self.mempool.num_total_blocks - self.mempool.num_free_blocks) / self.mempool.num_total_blocks if self.mempool.num_total_blocks > 0 else 0
-        
+
         # Proactive eviction: trigger when utilization exceeds threshold OR when blocks are needed
         should_evict = (utilization >= self.evict_start_threshold) or (num_required_blocks > self.mempool.num_free_blocks)
-        
+
         if should_evict:
             if protected_node is not None:
                 self.index.lock(protected_node)
-            
+
             # Calculate how many blocks to evict
             # Goal: maintain free blocks above (1 - evict_start_threshold) ratio
             target_free_blocks = int(self.mempool.num_total_blocks * (1.0 - self.evict_start_threshold))
             evict_to_reach_target = max(0, target_free_blocks - self.mempool.num_free_blocks)
-            
+
             evict_block_num = max(
                 num_required_blocks - self.mempool.num_free_blocks,  # At least meet current demand
                 evict_to_reach_target,                               # Or reach target free ratio
@@ -335,28 +335,28 @@ class CacheEngine:
             if evict_block_num > 0:
                 evicted_blocks, evicted_block_hashes = self.index.evict(evict_block_num)
                 self.mempool.recycle_blocks(evicted_blocks)
-                
+
                 # Record eviction metrics
                 if self._metrics_collector is not None and len(evicted_blocks) > 0:
                     self._metrics_collector.record_eviction(DEVICE_TYPE[self.device_type].lower(), len(evicted_blocks))
-                
+
                 if self.event_collector is not None:
                     self.event_collector.publish_removed(block_hashes=evicted_block_hashes,
                                                          medium=DEVICE_TYPE[self.device_type])
             if protected_node is not None:
                 self.index.unlock(protected_node)
-        
+
         if strict and num_required_blocks > self.mempool.num_free_blocks:
             raise RuntimeError("Not enough free blocks to take, ",
                                f"required: {num_required_blocks}, "
                                f"available: {self.mempool.num_free_blocks}")
         num_allocated_blocks = min(num_required_blocks, self.mempool.num_free_blocks)
         allocated_blocks = self.mempool.allocate_blocks(num_allocated_blocks)
-        
+
         # Record allocation metrics
         if self._metrics_collector is not None and num_allocated_blocks > 0:
             self._metrics_collector.record_allocation(DEVICE_TYPE[self.device_type].lower(), num_allocated_blocks)
-        
+
         return allocated_blocks
 
     def recycle(self, physical_blocks: np.ndarray) -> None:
@@ -566,7 +566,7 @@ class GlobalCacheEngine:
                 continue
             engine.unlock(node)
             result.pre_locked_node = None
-        
+
         # Update initial mempool stats
         self._update_mempool_metrics()
 
@@ -574,9 +574,9 @@ class GlobalCacheEngine:
                                    device_type: DeviceType,
                                    num_blocks: int,
                                    event_collector) -> "object":
-        """Attach to a pre-created radixshmem region as a TreeClient.
+        """Attach to a pre-created radixshmem region as a RadixClient.
 
-        The shm region itself (TreeServer) is owned by the KVManager bootstrap
+        The shm region itself (RadixServer) is owned by the KVManager bootstrap
         process via `flexkv.server.shm_radix_bootstrap.create_shm_radix_regions`.
         Non-bootstrap procs poll for region availability before reaching this
         point, so the attach is unconditional here.
@@ -626,7 +626,7 @@ class GlobalCacheEngine:
                     engine.mempool.num_total_blocks,
                     engine.mempool.num_free_blocks
                 )
-    
+
     def get(self,
             request_id: int,
             token_ids: np.ndarray,
@@ -730,7 +730,7 @@ class GlobalCacheEngine:
         # Update mempool metrics after GET operation
         if self._metrics_collector is not None:
             self._update_mempool_metrics()
-        
+
         return transfer_graph, return_mask, callback, op_callback_dict, task_end_op_id
 
     def _get_impl_global(self,
@@ -1534,11 +1534,11 @@ class GlobalCacheEngine:
             :cpu_matched_result.num_matched_blocks][block_mask_start:block_mask_end]
         ssd_matched_blocks = ssd_matched_result.physical_blocks[
             :ssd_matched_result.num_matched_blocks][block_mask_start:block_mask_end]
-        
+
         #if len(cpu_matched_blocks) > len(ssd_matched_blocks):
         #    print(f"[PUT_LOCAL] CPU matched blocks are greater than SSD matched blocks, skipping")
         #    return self._empty_put_return(request_id)
-        
+
 
         num_skipped_blocks = len(cpu_matched_blocks)
         fragment12_num_blocks = len(gpu_block_ids) - num_skipped_blocks
@@ -1659,13 +1659,14 @@ class GlobalCacheEngine:
                            node_to_unlock: Dict[DeviceType, Tuple[RadixNode, int]],
                            buffer_to_free: Optional[Dict[DeviceType, np.ndarray]] = None,
                            is_put: bool = False) -> None:
-        # Order matters: under shmradix, the cache index is in shared memory
-        # and another DP's auto_evict could pick up this node the moment its
-        # ref drops to 0. If we unlock first, by the time we call
-        # `set_ready_node(id)` the slab slot for this node_id may already
-        # have been recycled into an unrelated node — and we'd flip
-        # is_ready=True on the wrong node. Set ready FIRST (while still
-        # ref-protected), then release the lock.
+        # Order matters: under shmradix the cache index is in shared memory and
+        # another DP's auto-evict could pick up this node the moment its ref
+        # drops to 0. We call set_ready THEN unlock. For inserted nodes the
+        # shmradix engine fuses both into one armed `finalize` (set_ready +
+        # dec_ref) fired by unlock(), so set_ready() is a no-op and unlock()
+        # does the atomic flip-then-release — closing the race by construction.
+        # For matched nodes set_ready is an idempotent hash-path no-op and
+        # unlock drops the hash-path ref.
         if DeviceType.CPU in node_to_unlock:
             assert self.cpu_cache_engine is not None
             cpu_node = node_to_unlock[DeviceType.CPU][0]

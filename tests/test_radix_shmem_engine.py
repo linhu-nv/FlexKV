@@ -68,7 +68,7 @@ class FakeSeq:
 
 def _make_engine(name: str, blocks: int = 10000, tokens_per_block: int = 4):
     cfg = shmradix.ShmConfig(max_nodes=blocks * 4, max_blocks=blocks)
-    server = shmradix.TreeServer(name, cfg)
+    server = shmradix.RadixServer(name, cfg)
     engine = CacheEngineRadixShmem(
         device_type=DeviceType.CPU,
         num_total_blocks=blocks,
@@ -95,9 +95,10 @@ def test_take_insert_match_recycle():
     # take 4 slots and insert.
     slots = engine.take(num_required_blocks=4)
     assert len(slots) == 4
-    node = engine.insert(seq, slots, num_insert_blocks=4, is_ready=True)
+    node, unused = engine.insert(seq, slots, num_insert_blocks=4, is_ready=True)
     assert node is not None
     assert node.size() == 4
+    assert len(unused) == 0  # all 4 supplied slots consumed
 
     # Match should now hit all 4 blocks.
     r2 = engine.match(seq)
@@ -105,10 +106,12 @@ def test_take_insert_match_recycle():
     assert r2.num_ready_matched_blocks == 4
     np.testing.assert_array_equal(np.sort(r2.physical_blocks), np.sort(slots))
 
-    # last_node and last_ready_node populated.
+    # last_node and last_ready_node populated (hash-path handles, no node_id).
     assert r2.last_node is not None
     assert r2.last_ready_node is not None
-    assert r2.last_ready_node.node_id == r2.last_node.node_id
+    assert r2.last_ready_node.size() == 4
+    # Release the match's atomic pre-lock so it doesn't leak.
+    engine.unlock(r2.pre_locked_node)
 
     # Recycle a fresh allocation; tree-attached slots are not affected.
     free_slots = engine.take(num_required_blocks=2, strict=False)
@@ -120,7 +123,8 @@ def test_match_unready_prefix():
 
     seq = FakeSeq(block_hashes=_hashes(seed=2, num=6))
     slots = engine.take(num_required_blocks=6)
-    engine.insert(seq, slots, is_ready=False)
+    node, _unused = engine.insert(seq, slots, is_ready=False)
+    assert node is not None
 
     r = engine.match(seq)
     assert r.num_matched_blocks == 6
@@ -130,6 +134,15 @@ def test_match_unready_prefix():
     assert r.last_ready_node is None
     # last_node still set to the unready node.
     assert r.last_node is not None
+    # No ready prefix → no pre-lock taken.
+    assert r.pre_locked_node is None
+
+    # Flip ready via the inserted node's armed finalize (set_ready + dec_ref).
+    engine.set_ready(node, True, node.size())
+    engine.unlock(node)
+    r2 = engine.match(seq)
+    assert r2.num_ready_matched_blocks == 6
+    engine.unlock(r2.pre_locked_node)
 
 
 def test_lock_prevents_eviction():
@@ -139,7 +152,7 @@ def test_lock_prevents_eviction():
 
     seq = FakeSeq(block_hashes=_hashes(seed=3, num=10))
     slots = engine.take(num_required_blocks=10)
-    node = engine.insert(seq, slots, is_ready=True)
+    node, _unused = engine.insert(seq, slots, is_ready=True)
     assert node is not None
     engine.lock_node(node)
 
@@ -152,6 +165,7 @@ def test_lock_prevents_eviction():
     r = engine.match(seq)
     assert r.num_matched_blocks == 10
     assert r.num_ready_matched_blocks == 10
+    engine.unlock(r.pre_locked_node)
 
     engine.unlock(node)
     engine.recycle(drained)
@@ -162,13 +176,40 @@ def test_eviction_reclaims_unlocked():
 
     seq = FakeSeq(block_hashes=_hashes(seed=4, num=1500))
     s1 = engine.take(num_required_blocks=1500)
-    engine.insert(seq, s1, is_ready=True)
+    node, _unused = engine.insert(seq, s1, is_ready=True)
+    assert node is not None
     # Don't lock. Allocate enough new blocks that eviction is forced (need >
     # current free 500).
     s2 = engine.take(num_required_blocks=1500, strict=False)
     # On the same shm region, eviction reclaimed the unlocked LRU sequence
     # so we got more than the initial free count.
     assert len(s2) > 500
+
+
+def test_prefix_match_returns_unused_slots():
+    """Insert sharing a prefix consumes only the new suffix; excess supplied
+    slots come back as `unused` for the caller to recycle."""
+    engine, _server = _make_engine("/cers_unused")
+
+    seq1 = FakeSeq(block_hashes=_hashes(seed=5, num=4))
+    s1 = engine.take(num_required_blocks=4)
+    node1, unused1 = engine.insert(seq1, s1, is_ready=True)
+    assert node1.size() == 4 and len(unused1) == 0
+
+    # Second sequence shares the first 2 blocks of seq1.
+    shared = np.concatenate([seq1.block_hashes[:2], _hashes(seed=6, num=2)])
+    seq2 = FakeSeq(block_hashes=shared)
+    s2 = engine.take(num_required_blocks=4)  # supply 4, only 2 new needed
+    node2, unused2 = engine.insert(seq2, s2, is_ready=True)
+    assert node2.size() == 2          # only the 2 new suffix blocks attached
+    assert len(unused2) == 2          # the other 2 supplied slots are unused
+    np.testing.assert_array_equal(np.sort(unused2), np.sort(s2[2:]))
+    engine.recycle(unused2)
+
+    # seq2 fully matches now.
+    r = engine.match(seq2)
+    assert r.num_ready_matched_blocks == 4
+    engine.unlock(r.pre_locked_node)
 
 
 if __name__ == "__main__":
@@ -180,3 +221,5 @@ if __name__ == "__main__":
     print("PASS test_lock_prevents_eviction")
     test_eviction_reclaims_unlocked()
     print("PASS test_eviction_reclaims_unlocked")
+    test_prefix_match_returns_unused_slots()
+    print("PASS test_prefix_match_returns_unused_slots")
