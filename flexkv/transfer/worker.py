@@ -461,19 +461,6 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                 layer_id,
                 layer_granularity,
             )
-            # `_transfer_impl` only QUEUES the memcpy on a CUDA stream; it
-            # returns before the data has actually landed in CPU RAM (D2H) or
-            # in the GPU KV cache (H2D). Without a device-level sync, the
-            # worker would put the op_id into `finished_ops_queue` while the
-            # copy is still in flight; the scheduler would flip
-            # `set_ready_node` true on the destination node, and a peer DP
-            # doing a subsequent get would read the still-empty slot — that
-            # manifests as 3-4% empty/garbled outputs in multi-DP high-QPS
-            # tests. We use device-level synchronize (not just
-            # `transfer_stream.synchronize()`) because `transfer_kv_blocks` is
-            # a C++ function and may queue on its own internal streams not
-            # captured by the torch stream context manager.
-            torch.cuda.synchronize()
             end_time = time.time()
 
             kv_dim = 2 if not self.is_mla else 1
