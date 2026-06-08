@@ -1110,7 +1110,11 @@ class GlobalCacheEngine:
                 cpu_matched_result.num_ready_matched_blocks == cpu_matched_result.num_matched_blocks):
                 cpu_node_to_unlock, cpu_unused = self.cpu_cache_engine.insert(
                     sequence_meta, fragment1_cpu_blocks_local, is_ready=False)
-                op_node_to_ready[op_peerh2h.op_id] = (DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
+                # insert() returns None when nothing was attached (suffix already
+                # present in the shared tree) — no unready node to flip ready.
+                if cpu_node_to_unlock is not None:
+                    op_node_to_ready[op_peerh2h.op_id] = (
+                        DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
                 if cpu_unused.size > 0:
                     cpu_blocks_to_free = np.concatenate([cpu_blocks_to_free, cpu_unused])
             else:
@@ -1159,7 +1163,9 @@ class GlobalCacheEngine:
                         num_insert_blocks=fragment12_num_blocks + block_mask_start,
                         is_ready=False,
                         match_result=cpu_matched_result)
-                    op_node_to_ready[op_disk2h.op_id] = (DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
+                    if cpu_node_to_unlock is not None:
+                        op_node_to_ready[op_disk2h.op_id] = (
+                            DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
                     if cpu_unused.size > 0:
                         cpu_blocks_to_free = np.concatenate([cpu_blocks_to_free, cpu_unused])
                 else:
@@ -1624,7 +1630,11 @@ class GlobalCacheEngine:
         cpu_node_to_unlock, cpu_unused = self.cpu_cache_engine.insert(
             sequence_meta, fragment12_cpu_blocks,
             is_ready=False, match_result=cpu_matched_result)
-        op_node_to_ready[op_d2h.op_id] = (DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
+        # insert() returns None when nothing was attached (the whole suffix was
+        # already present in the shared tree) — then there is no unready node to
+        # flip ready after the transfer, so skip the ready-callback bookkeeping.
+        if cpu_node_to_unlock is not None:
+            op_node_to_ready[op_d2h.op_id] = (DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
         if cpu_unused.size > 0:
             buffer_to_free[DeviceType.CPU] = cpu_unused
         ssd_node_to_unlock = None
@@ -1632,7 +1642,8 @@ class GlobalCacheEngine:
             ssd_node_to_unlock, ssd_unused = self.ssd_cache_engine.insert(
                 sequence_meta, fragment2_ssd_blocks,
                 is_ready=False, match_result=ssd_matched_result)
-            op_node_to_ready[op_h2disk.op_id] = (DeviceType.SSD, ssd_node_to_unlock, ssd_node_to_unlock.size())
+            if ssd_node_to_unlock is not None:
+                op_node_to_ready[op_h2disk.op_id] = (DeviceType.SSD, ssd_node_to_unlock, ssd_node_to_unlock.size())
             if ssd_unused.size > 0:
                 buffer_to_free[DeviceType.SSD] = ssd_unused
         node_to_unlock = {}
