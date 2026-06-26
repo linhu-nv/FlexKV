@@ -7,7 +7,7 @@ from typing import Callable
 import multiprocessing as mp
 import copy
 import os
-from expiring_dict import ExpiringDict
+from cachetools import TTLCache
 import nvtx
 import torch
 import numpy as np
@@ -181,10 +181,16 @@ class KVTaskManager:
             ))
             self.transfer_handles[-1]._handle.send_config_to_remotes()
 
-        self.tasks: ExpiringDict[int, KVTask] = ExpiringDict(max_age_seconds=1800, max_len=100000) # 30 minutes
+        # NOTE: was previously expiring_dict.ExpiringDict; switched to cachetools.TTLCache
+        # because the former had a logic bug where its internal "oldest" tracking did not
+        # stay consistent with external pop()/__delitem__ calls, eventually causing
+        # `KeyError` from `__setitem__` when the max_len eviction path read a stale key.
+        # TTLCache's bookkeeping is part of the underlying MutableMapping itself, so
+        # external mutations stay in sync. Same TTL (1800s) and capacity (100000) semantics.
+        self.tasks: TTLCache[int, KVTask] = TTLCache(maxsize=100000, ttl=1800)
 
         # hash(token_ids) -> task_id
-        self.prefetch_tasks: ExpiringDict[int, int] = ExpiringDict(max_age_seconds=1800, max_len=100000) # 30 minutes
+        self.prefetch_tasks: TTLCache[int, int] = TTLCache(maxsize=100000, ttl=1800)
         self._gen_prefetch_key = lambda token_ids, namespace: hash_token(token_ids, namespace)
 
         self.graph_to_task: Dict[int, int] = {}

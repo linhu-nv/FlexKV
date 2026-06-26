@@ -332,7 +332,7 @@ info "Step 4.5: Installing Python runtime dependencies"
 info "============================================"
 
 # Core runtime dependencies (always needed)
-RUNTIME_DEPS="numpy pyzmq psutil nvtx pyyaml expiring-dict"
+RUNTIME_DEPS="numpy pyzmq psutil nvtx pyyaml cachetools"
 
 # Additional dependencies for P2P/distributed mode
 if [ "$ENABLE_P2P" -eq 1 ]; then

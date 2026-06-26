@@ -8,5 +8,5 @@ pyyaml>=5.4.0
 Cython>=3.0.10
 pytest>=6.0.0
 pytest-benchmark>=3.0.0
-expiring-dict==1.1.2
+cachetools>=5.0.0
 redis>=4.0.0

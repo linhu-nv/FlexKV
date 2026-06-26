@@ -130,8 +130,9 @@ def test_batched_put_and_get_lifecycle(running_kvmanager, cache_config):
     _assert_batch_lifecycle(kvmanager, get_ids, launched_get, NUM_REQUESTS)
 
     # ---- global no-leak guard: every task and graph mapping reclaimed ----
-    # engine.tasks is an ExpiringDict whose keys() also exposes internal
-    # attributes (max_age_seconds / max_len), so only count real (int) task ids.
+    # engine.tasks is a cachetools.TTLCache; its keys() may also surface
+    # internal sentinels for already-expired entries, so only count real
+    # (int) task ids — matches the pre-existing ExpiringDict-era guard.
     leaked_tasks = [k for k in engine.tasks.keys() if isinstance(k, int)]
     assert leaked_tasks == [], f"leaked tasks: {leaked_tasks}"
     assert len(engine.graph_to_task) == 0, f"leaked graphs: {engine.graph_to_task}"
