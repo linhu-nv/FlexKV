@@ -938,12 +938,22 @@ class TransferManagerShmTEProcess:
         if self.process is not None and self.process.is_alive():
             return
         from flexkv.transfer.shm_channel_handle import te_shm_main
-        # CRITICAL: clear CUDA_VISIBLE_DEVICES in the TE subprocess. The
-        # parent (scheduler) may have it restricted to a single GPU (its DP
-        # rank's device), but the TE needs to cudaIpcOpenMemHandle from ALL
-        # DPs' GPUs. mp.Process(spawn) inherits env from parent unless we
-        # override. Save+restore around .start().
-        _saved_cuda = os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        # CRITICAL: clear CUDA_VISIBLE_DEVICES in the TE subprocess so it can
+        # cudaIpcOpenMemHandle from ALL DPs' GPUs (the parent scheduler may have
+        # it restricted to its own DP rank's device). mp.Process(spawn) inherits
+        # env from parent unless we override. Save+restore around .start().
+        #
+        # BUT: only do this when there is genuinely more than one GPU to span
+        # (multi-DP or multi-TP). For a single-GPU deployment (dp*tp == 1, e.g.
+        # vLLM serve on one restricted GPU), clearing CVD renumbers devices in
+        # the TE subprocess so it no longer matches the device ordinal the
+        # worker recorded in its TensorSharedHandle — cudaIpcOpenMemHandle then
+        # fails with "device >= 0 && device < num_gpus". Leave CVD untouched so
+        # the TE and the registering worker agree on device numbering.
+        total_gpus = self.model_config.dp_size * self.model_config.tp_size
+        clear_cvd = total_gpus > 1
+        _saved_cuda = (os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+                       if clear_cvd else None)
         try:
             self.process = self.mp_ctx.Process(
                 target=te_shm_main,
