@@ -68,19 +68,166 @@ except ImportError:
 
 cudart = ctypes.CDLL('libcudart.so')
 
+# Per-call size limit for cudaHostRegister / cudaHostUnregister.
+#
+# CUDA driver 595.x has a known bug where the size argument to cudaHostRegister
+# is treated as a signed int32, which silently corrupts requests > 2 GiB. We
+# therefore split large pinned regions into chunks <= 2 GiB. This is also the
+# reason we cannot use torch's `pin_memory=True` for the cpu_blocks tensor.
+#
+# Override knob (env var):
+#   FLEXKV_CUDAHOST_CHUNK_SIZE_GB=<float>  (e.g. 1, 1.5, 2, 4)
+#   FLEXKV_CUDAHOST_CHUNK_SIZE_GB=0        disable chunking, single call
+#
+_FLEXKV_CUDAHOST_REGISTER_PORTABLE = 1  # cudaHostRegisterPortable
+_FLEXKV_CUDAHOST_CHUNK_SAFETY_MARGIN_BYTES = 4 * 1024  # 4 KiB cushion for CUDA internal alignment
+
+
+def _get_cudahost_chunk_bytes() -> int:
+    """Resolve the chunk size (in bytes) for cudaHostRegister/Unregister.
+
+    Reads FLEXKV_CUDAHOST_CHUNK_SIZE_GB at call time (so users can change it
+    between runs), defaults to 2 GiB minus a safety margin to stay strictly
+    below the signed int32 boundary. Result is rounded down to a 4 KiB page
+    boundary so every chunk start ptr is page-aligned (cudaHostRegister
+    rejects unaligned ptr/size combinations).
+    """
+    chunk_gb = float(os.getenv("FLEXKV_CUDAHOST_CHUNK_SIZE_GB", "2"))
+    if chunk_gb <= 0:
+        return 0  # caller treats 0 as "no chunking"
+    chunk = int(chunk_gb * (1024 ** 3)) - _FLEXKV_CUDAHOST_CHUNK_SAFETY_MARGIN_BYTES
+    # Round down to 4 KiB page boundary
+    return chunk & ~0xFFF
+
+
+_cuda_context_initialized = False
+
+
+def _ensure_cuda_context() -> None:
+    """Force-initialize the CUDA primary context in the current process.
+
+    cudaHostRegister fails (cudaErrorInvalidValue=1) when called from a worker
+    subprocess that has not touched CUDA yet. The compiled worker.so has
+    C-level lazy init handled transparently; the .py fallback needs to do it
+    explicitly. Idempotent — only runs once per process. Uses both torch and
+    cudart paths so we cover any code path where torch's primary context
+    creation gets short-circuited.
+    """
+    global _cuda_context_initialized
+    if _cuda_context_initialized:
+        return
+    # 1) torch primary context init
+    try:
+        torch.cuda.init()
+        if torch.cuda.is_available():
+            torch.cuda.set_device(0)
+            _ = torch.empty(1, device='cuda')
+            torch.cuda.synchronize()
+    except Exception as e:
+        flexkv_logger.warning(f"_ensure_cuda_context torch path failed: {e}")
+    # 2) cudart-level fallback (in case torch was bypassed somehow)
+    try:
+        cudart.cudaSetDevice(ctypes.c_int(0))
+        cudart.cudaDeviceSynchronize()
+        # Force runtime to actually create a primary context by calling
+        # cudaFree(0) — a documented no-op that creates ctx if absent.
+        cudart.cudaFree(ctypes.c_void_p(0))
+    except Exception as e:
+        flexkv_logger.warning(f"_ensure_cuda_context cudart path failed: {e}")
+    _cuda_context_initialized = True
+
+
 def cudaHostRegister(tensor: torch.Tensor) -> None:
-    """Register a CPU tensor with CUDA for pinned memory access"""
-    ptr = tensor.data_ptr()
-    size = tensor.numel() * tensor.element_size()
-    ret = cudart.cudaHostRegister(ctypes.c_void_p(ptr), ctypes.c_size_t(size), 1) # 1 means cudaHostRegisterPortable
-    if ret != 0:
-        raise RuntimeError(f"cudaHostRegister failed with error code {ret}")
+    """Register a CPU tensor with CUDA for pinned memory access.
+
+    Chunks the registration into <= FLEXKV_CUDAHOST_CHUNK_SIZE_GB pieces to
+    work around a driver 595.x signed-int32 bug on sizes > 2 GiB. Calling-side
+    semantics are unchanged: pass a tensor, the whole tensor is page-locked
+    on success; on failure all already-registered chunks are rolled back and
+    the original error is raised.
+
+    Tensor pages are touched (zeroed) before register because cudaHostRegister
+    requires physical pages to already be resident — lazy-allocated mmap
+    pages return cudaErrorInvalidValue otherwise.
+    """
+    _ensure_cuda_context()
+    # Force-commit lazy-allocated pages by writing every page. This is
+    # essential for large tensors backed by mmap-anonymous (the default for
+    # numpy/torch CPU tensors) — without it cudaHostRegister returns
+    # cudaErrorInvalidValue=1 because the pages aren't physically present yet.
+    # We use zero_() which is in-place (no extra alloc) and triggers a write
+    # to every page.
+    try:
+        tensor.zero_()
+    except Exception as e:
+        flexkv_logger.warning(f"tensor.zero_() failed (continuing): {e}")
+    ptr_base = tensor.data_ptr()
+    total_size = tensor.numel() * tensor.element_size()
+    chunk_size = _get_cudahost_chunk_bytes()
+
+    # Fast path: fit in one chunk (or chunking disabled).
+    if chunk_size == 0 or total_size <= chunk_size:
+        ret = cudart.cudaHostRegister(
+            ctypes.c_void_p(ptr_base),
+            ctypes.c_size_t(total_size),
+            _FLEXKV_CUDAHOST_REGISTER_PORTABLE,
+        )
+        if ret != 0:
+            raise RuntimeError(f"cudaHostRegister failed with error code {ret}")
+        return
+
+    t_start = time.time()
+    registered_offsets: List[int] = []
+    try:
+        for offset in range(0, total_size, chunk_size):
+            this_size = min(chunk_size, total_size - offset)
+            ret = cudart.cudaHostRegister(
+                ctypes.c_void_p(ptr_base + offset),
+                ctypes.c_size_t(this_size),
+                _FLEXKV_CUDAHOST_REGISTER_PORTABLE,
+            )
+            if ret != 0:
+                raise RuntimeError(
+                    f"cudaHostRegister failed at offset={offset} bytes "
+                    f"(chunk_size={this_size} bytes, total={total_size} bytes), "
+                    f"error code {ret}"
+                )
+            registered_offsets.append(offset)
+    except Exception:
+        for offset in registered_offsets:
+            rb_ret = cudart.cudaHostUnregister(ctypes.c_void_p(ptr_base + offset))
+            if rb_ret != 0:
+                flexkv_logger.warning(
+                    f"cudaHostUnregister rollback failed at offset={offset}, "
+                    f"error code {rb_ret} (ignored)"
+                )
+        raise
+
+    num_chunks = len(registered_offsets)
+    flexkv_logger.info(
+        f"cudaHostRegister: pinned {total_size / (1024 ** 3):.2f} GiB "
+        f"in {num_chunks} chunk(s) (chunk_size={chunk_size / (1024 ** 3):.2f} GiB) "
+        f"in {time.time() - t_start:.3f}s"
+    )
+
 
 def cudaHostUnregister(tensor: torch.Tensor) -> None:
-    """Unregister a CPU tensor from CUDA for pinned memory access"""
-    ptr = tensor.data_ptr()
-    size = tensor.numel() * tensor.element_size()
-    ret = cudart.cudaHostUnregister(ctypes.c_void_p(ptr))
+    """Unregister a CPU tensor from CUDA, matching the chunked register layout."""
+    ptr_base = tensor.data_ptr()
+    total_size = tensor.numel() * tensor.element_size()
+    chunk_size = _get_cudahost_chunk_bytes()
+
+    if chunk_size == 0 or total_size <= chunk_size:
+        cudart.cudaHostUnregister(ctypes.c_void_p(ptr_base))
+        return
+
+    for offset in range(0, total_size, chunk_size):
+        ret = cudart.cudaHostUnregister(ctypes.c_void_p(ptr_base + offset))
+        if ret != 0:
+            flexkv_logger.warning(
+                f"cudaHostUnregister failed at offset={offset} bytes, "
+                f"error code {ret} (ignored)"
+            )
 
 @dataclass
 class WorkerTransferOp:
