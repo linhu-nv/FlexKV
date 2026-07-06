@@ -137,6 +137,8 @@ class CacheEngineRadixShmem:
                  num_total_blocks: int,
                  tokens_per_block: int,
                  shm_name: str,
+                 # tokens_per_block=-1 means "recover it from the region" via
+                 # RadixClient.block_size() (written by the owner on create).
                  evict_ratio: float = 0.05,
                  evict_start_threshold: float = 1.0,
                  hit_reward_seconds: int = 0,
@@ -160,7 +162,6 @@ class CacheEngineRadixShmem:
             )
 
         self.device_type = device_type
-        self.tokens_per_block = tokens_per_block
         self.num_total_blocks = num_total_blocks
         self.evict_ratio = evict_ratio
         self.evict_start_threshold = evict_start_threshold
@@ -171,6 +172,11 @@ class CacheEngineRadixShmem:
 
         # RadixClient always; the RadixServer is owned by the bootstrap process.
         self._tree = shmradix.RadixClient(shm_name)
+
+        # -1 => recover tokens_per_block from the region itself.
+        if tokens_per_block is None or tokens_per_block < 0:
+            tokens_per_block = int(self._tree.block_size())
+        self.tokens_per_block = tokens_per_block
 
         # Diagnostics: how often does the insert race fire (caller supplied
         # excess slots / matched_prefix advanced)?
