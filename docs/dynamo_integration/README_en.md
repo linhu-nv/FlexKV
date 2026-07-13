@@ -44,9 +44,8 @@ git clone https://github.com/taco-project/FlexKV
 ### Install FlexKV
 
 ```bash
-apt update && apt install liburing-dev
-
-cd FlexKV && ./build.sh
+# CMake auto-resolves the native C++ deps (liburing, xxHash, ...) — no manual apt install needed.
+cd FlexKV && FLEXKV_DEBUG=1 pip install -e . --no-build-isolation
 ```
 
 - Refer to GPUDirect Storage (GDS) [README](../gds/README_en.md) to enable GDS.

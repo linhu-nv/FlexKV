@@ -50,20 +50,26 @@ FlexKV 采用 **Apache-2.0 开源协议**，详细信息请参见 [LICENSE](LICE
 
 ## 如何使用
 
-### 安装依赖
+### 安装
+
+FlexKV 会自动解析它的 native C++ 依赖——CMake 会先在本机查找已安装的副本
+（xxHash、liburing，以及在启用相应功能时的 hiredis / prometheus-cpp），找不到则
+从源码 fetch 并编译。**无需手动 `apt install` 任何 `-dev` 包**。你只需事先准备好：
+C/C++ 工具链、CMake（>= 3.18）、CUDA 和 PyTorch。
 
 ```bash
-apt install liburing-dev
-apt install libxxhash-dev
-apt install libhiredis-dev
+# 可编辑 / 开发安装（不含 Cython）：
+FLEXKV_DEBUG=1 pip install -e . --no-build-isolation
+
+# 正式安装（含 Cython 编译）：
+pip install . --no-build-isolation
 ```
 
-### 编译 FlexKV
-
-```bash
-./build.sh
-#./build.sh --release for cython package
-```
+之所以需要 `--no-build-isolation`，是因为构建时会 import 已安装的 PyTorch。启用可选
+功能时会自动 fetch 对应的额外 native 依赖：`FLEXKV_ENABLE_P2P=1`（分布式/Redis——额外
+需要 hiredis，以及 `redis`、`mooncake-transfer-engine` 两个 Python 包）、
+`FLEXKV_ENABLE_METRICS=1`（Prometheus）、`FLEXKV_ENABLE_GDS=1`（GDS/cuFile）、
+`FLEXKV_ENABLE_CFS=1`（CFS）。
 
 ### 在 vLLM 中使用 FlexKV
 

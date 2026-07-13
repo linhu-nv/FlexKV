@@ -3,7 +3,12 @@ requires = [
     #"setuptools>=61",
     #"torch==2.3.0"
     "setuptools>=40.0.0",
-    "torch>=1.10.0"
+    "torch>=1.10.0",
+    # CMake drives native C++ dependency resolution (discover-or-fetch) at build
+    # time; setup.py invokes it. Builds run with --no-build-isolation (the build
+    # imports the already-installed torch), so cmake must also be present on the
+    # host or in the active environment — a distro `cmake` or `pip install cmake`.
+    "cmake>=3.18"
 ]
 build-backend = "setuptools.build_meta"
 

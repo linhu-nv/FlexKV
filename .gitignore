@@ -5,6 +5,9 @@ __pycache__/
 
 # C extensions
 *.so
+# Versioned shared objects, incl. self-built deps bundled next to the extension
+# at build time (e.g. flexkv/lib/liburing.so.2 from a fetched liburing).
+*.so.*
 
 # Distribution / packaging
 .Python

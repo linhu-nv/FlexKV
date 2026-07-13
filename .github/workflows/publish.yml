@@ -55,7 +55,8 @@ jobs:
           TORCH_CUDA_ARCH_LIST: "8.9 9.0+PTX"
           MAX_JOBS: 4
         run: |
-          ./build.sh --release
+          pip install --upgrade setuptools wheel "Cython>=3.0.10"
+          FLEXKV_DEBUG=0 python setup.py bdist_wheel -v
 
       - name: Get Date and Time
         run: |

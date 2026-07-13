@@ -62,7 +62,7 @@ pip install vllm>=0.17.2
 
 2. Install FlexKV
 ```bash
-pip install flexkv  # or build from source: ./build.sh
+pip install flexkv  # or build from source: pip install -e . --no-build-isolation
 ```
 
 3. offline test

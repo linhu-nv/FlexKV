@@ -99,25 +99,39 @@ DP scheduler 进程 0   ...   DP scheduler 进程 N-1
 ```bash
 git clone -b dev ssh://git@gitlab-master.nvidia.com:12051/zhuofanl/radixshmem.git
 cd radixshmem
-# 系统依赖：libxxhash-dev、liburing-dev、cmake、pybind11
-#   - libxxhash-dev / liburing-dev 没有就从 host 拷 header，或用 mooncake_transfer_engine.libs 里 ship 的 liburing.so.2
-#   - cmake、pybind11 可以 pip install
-# 主仓库构建
-mkdir build && cd build && cmake .. && make -j
-# Python binding（产物：python/shmradix/_core.cpython-3xx-x86_64-linux-gnu.so）
-cd ../python && pip install -e . --no-build-isolation
+# C++ 依赖分两类：
+#   - xxHash：CMake 自动 discover-or-fetch（本机没有就 fetch v0.8.2 编译），无需手动装
+#   - RDMA（libibverbs/libmlx5）：CMake **只 discover，系统上找不到就直接 FATAL_ERROR 终止**
+#     （不 fetch rdma-core——它从源码构建会拖出 pkg-config/libudev，且和驱动/硬件强耦合）。
+#     所以必须先装系统 RDMA 栈：
+#       apt-get install -y libibverbs-dev ibverbs-providers      # 或安装 NVIDIA MOFED
+#   - pthread/rt 由 libc 提供；pybind11 由 pip 的 build 隔离自动拉取
+# 一键构建（C++ 库 + Python binding）：
+bash build.sh
+# 产物：python/shmradix/_core.cpython-3xx-x86_64-linux-gnu.so
 ```
 
 容器场景下需要把构建产物 `python/shmradix/_core.cpython-<py>-x86_64-linux-gnu.so` 放到 `PYTHONPATH=/work/radixshmem/python` 能看到的位置（bind-mount 整个仓库即可）。Python 3.12 + torch 2.10 + glibc 2.35 已验证。
 
 ### 3.2 FlexKV
 
+FlexKV 的 native C++ 依赖（xxHash、liburing，以及按需的 hiredis / prometheus-cpp）现在
+由 **CMake 自动发现或 fetch 编译**，`setup.py` 在构建时驱动 CMake —— **不再有 `build.sh` /
+`install.sh`，也不再需要手动 `apt install liburing-dev / libxxhash-dev / libhiredis-dev`。**
+（注意：与 radixshmem 不同，FlexKV 的 c_ext 不链接 RDMA，所以 FlexKV 侧无 libibverbs 依赖。）
+
 ```bash
 cd FlexKV
-pip install -e . --no-build-isolation
+# 可编辑 / 开发安装（不含 Cython）：
+FLEXKV_DEBUG=1 pip install -e . --no-build-isolation
+# 或正式安装（含 Cython 编译）：
+pip install . --no-build-isolation
 ```
 
-依赖：Cython（构建时）、torch、numpy、xxhash、liburing、expiring_dict、zmq、redis 等。详见 `requirements.txt`。
+事先需要：C/C++ 工具链、CMake（>= 3.18）、CUDA、torch。可选功能用 env 开关按需拉取额外
+native 依赖：`FLEXKV_ENABLE_P2P=1`（hiredis + `redis`/`mooncake-transfer-engine` Python 包）、
+`FLEXKV_ENABLE_METRICS=1`（prometheus-cpp）、`FLEXKV_ENABLE_GDS=1`、`FLEXKV_ENABLE_CFS=1`。
+Python 依赖（Cython、torch、numpy、zmq、redis 等）详见 `requirements.txt`。
 
 ### 3.3 容器化部署（vllm/vllm-openai 镜像）
 
@@ -143,7 +157,7 @@ docker exec dp-shm-test bash /path/to/setup_container.sh
 ```
 
 **setup_container.sh 做的事**：
-1. 从 `mooncake_transfer_engine.libs/liburing-*.so.2` 软链接到 `/usr/lib/x86_64-linux-gnu/liburing.so.2`（FlexKV c_ext 在这找）
+1. ~~从 `mooncake_transfer_engine.libs/liburing-*.so.2` 软链接到 `/usr/lib/x86_64-linux-gnu/liburing.so.2`~~ —— **构建重构后已不需要**：FlexKV 的 CMake 会自己发现 liburing，找不到就 fetch 编译并把 `liburing.so.2` bundle 进 `flexkv/lib`，c_ext 通过 `$ORIGIN` RPATH + 包内 `LD_LIBRARY_PATH` 找到它。（RDMA 则相反：需系统预装 `libibverbs-dev ibverbs-providers`，否则 radixshmem 构建直接终止。）
 2. `pip install expiring_dict`
 3. `python3 -c "import flexkv; import shmradix"` 验证
 

@@ -51,20 +51,28 @@ For more details, see [CHANGELOG](CHANGELOG.md)
 
 ## How to Use
 
-### Install Dependencies
+### Install
+
+FlexKV resolves its native C++ dependencies automatically — CMake discovers an
+installed copy of each (xxHash, liburing, and, when the corresponding feature is
+enabled, hiredis / prometheus-cpp) or fetches and compiles it from source. No
+manual `apt install` of `-dev` packages is required. Prerequisites you must have
+in place first: a C/C++ toolchain, CMake (>= 3.18), CUDA, and PyTorch.
 
 ```bash
-apt install liburing-dev
-apt install libxxhash-dev
-apt install libhiredis-dev
+# Editable / dev install (no Cython):
+FLEXKV_DEBUG=1 pip install -e . --no-build-isolation
+
+# Release install (Cython-compiled modules):
+pip install . --no-build-isolation
 ```
 
-### Build FlexKV
-
-```bash
-./build.sh
-#./build.sh --release for cython package
-```
+`--no-build-isolation` is required because the build imports the
+already-installed PyTorch. Optional features fetch their extra native deps
+automatically when turned on: `FLEXKV_ENABLE_P2P=1` (distributed/Redis — adds
+hiredis; also needs the `redis` and `mooncake-transfer-engine` Python packages),
+`FLEXKV_ENABLE_METRICS=1` (Prometheus), `FLEXKV_ENABLE_GDS=1` (GDS/cuFile),
+`FLEXKV_ENABLE_CFS=1` (CFS).
 
 ### Use FlexKV with vLLM
 
