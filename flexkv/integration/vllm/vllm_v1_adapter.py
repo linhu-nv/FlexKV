@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 from flexkv.kvmanager import KVManager
+from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
 from flexkv.server.client import KVTPClient
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.request import KVResponseStatus
@@ -362,6 +363,10 @@ class FlexKVSchedulerConnector:
             token_ids=np_token_ids,
             token_mask=np_token_mask,
             dp_id=self.flexkv_manager.dp_client_id,
+            # When an external prefetch controller warms SSD->CPU ahead of us,
+            # the engine GET only needs CPU hits (cpu_only=True) and skips the
+            # slow SSD/DISK2H path itself. Gated by FLEXKV_PREFETCH_ENABLED.
+            cpu_only=GLOBAL_CONFIG_FROM_ENV.prefetch_enabled,
             namespace=namespace,
         )
         # `count_nonzero` on a bool ndarray returns a Python int and is ~2x
