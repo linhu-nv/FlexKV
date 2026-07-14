@@ -178,13 +178,6 @@ class CacheEngineRadixShmem:
             tokens_per_block = int(self._tree.block_size())
         self.tokens_per_block = tokens_per_block
 
-        # Diagnostics: how often does the insert race fire (caller supplied
-        # excess slots / matched_prefix advanced)?
-        self._insert_count = 0
-        self._race_count = 0
-        self._unused_slot_total = 0
-        self._race_log_interval = 50
-
     # ---------- Mempool view (compatibility shims) ----------
 
     @property
@@ -307,20 +300,6 @@ class CacheEngineRadixShmem:
         # unused = supplied slots beyond what was actually attached.
         unused_slots = suffix_slots[inserted:]
         unused_slots_i64 = np.asarray(unused_slots, dtype=np.int64)
-
-        # Diagnostics.
-        self._insert_count += 1
-        num_unused = len(unused_slots_i64)
-        if num_unused > 0:
-            self._race_count += 1
-            self._unused_slot_total += num_unused
-        if self._insert_count % self._race_log_interval == 0:
-            race_pct = 100.0 * self._race_count / max(1, self._insert_count)
-            flexkv_logger.info(
-                f"[shmradix race-counter device={_DEVICE_TYPE_NAMES[self.device_type]}] "
-                f"inserts={self._insert_count} race_hits={self._race_count} "
-                f"({race_pct:.2f}%) cumulative_unused_slots={self._unused_slot_total}"
-            )
 
         if self.event_collector is not None and inserted > 0:
             attached_hashes = sequence_meta.block_hashes[
