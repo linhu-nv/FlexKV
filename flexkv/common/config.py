@@ -39,12 +39,12 @@ class CacheConfig:
     enable_nixl: bool = False
     # Optional plugin dict for NixlAgentSession (see nixl README); only used if enable_nixl.
     nixl_extra_config: Optional[Dict[str, Any]] = None
-    enable_remote: bool = False # used for indicating whether the 3rd-party remote storage is enabled
+    enable_lake: bool = False # used for indicating whether the 3rd-party lake storage is enabled
                                 # has nothing to do with whether the p2p_cpu and p2p_ssd are supported
-    enable_kv_sharing: bool = False # pcfs_sharing or p2p_cpu or p2p_ssd or p2p_3rd_remote
+    enable_kv_sharing: bool = False # pcfs_sharing or p2p_cpu or p2p_ssd or p2p_3rd_lake
     enable_p2p_cpu: bool = False
     enable_p2p_ssd: bool = False
-    enable_3rd_remote: bool = False
+    enable_3rd_lake: bool = False
 
     distributed_node_id: int = -1 # only used when distributed cpu/ssd and only can be set when redis_meta_client initialized
     num_tmp_cpu_blocks: int = 500 # only used when distributed ssd p2p, it controls the number blocks of temp cpu buffer which used for copy data from ssd to cpu
@@ -53,20 +53,20 @@ class CacheConfig:
     # mempool capacity configs
     num_cpu_blocks: int = 1000000
     num_ssd_blocks: int = 10000000
-    num_remote_blocks: Optional[int] = None
+    num_lake_blocks: Optional[int] = None
     num_local_blocks: int = 1000000
 
     # ssd cache configs
     ssd_cache_dir: Optional[Union[str, List[str]]] = None
 
-    # remote cache configs for cfs
+    # lake cache configs for cfs
     # todo: remove this in the future
-    remote_cache_size_mode: str = "file_size"  # file_size or block_num
-    remote_file_size: Optional[int] = None
-    remote_file_num: Optional[int] = None
-    remote_file_prefix: Optional[str] = None
-    remote_cache_path: Optional[Union[str, List[str]]] = None
-    remote_config_custom: Optional[Dict[str, Any]] = None
+    lake_cache_size_mode: str = "file_size"  # file_size or block_num
+    lake_file_size: Optional[int] = None
+    lake_file_num: Optional[int] = None
+    lake_file_prefix: Optional[str] = None
+    lake_cache_path: Optional[Union[str, List[str]]] = None
+    lake_config_custom: Optional[Dict[str, Any]] = None
 
     # distributed zmq configs
     local_zmq_ip: str = "127.0.0.1"
@@ -85,8 +85,8 @@ class CacheConfig:
 
     def __post_init__(self):
         self.enable_kv_sharing = self.enable_p2p_cpu or \
-            self.enable_p2p_ssd or self.enable_3rd_remote
-        self.enable_remote = self.enable_3rd_remote
+            self.enable_p2p_ssd or self.enable_3rd_lake
+        self.enable_lake = self.enable_3rd_lake
 
 GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     # Multi-instance configuration
@@ -121,7 +121,7 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     index_accel=bool(int(os.getenv('FLEXKV_INDEX_ACCEL', 1))),
     cpu_layout_type=KVCacheLayoutType(os.getenv('FLEXKV_CPU_LAYOUT', 'BLOCKFIRST').upper()),
     ssd_layout_type=KVCacheLayoutType(os.getenv('FLEXKV_SSD_LAYOUT', 'BLOCKFIRST').upper()),
-    remote_layout_type=KVCacheLayoutType(os.getenv('FLEXKV_REMOTE_LAYOUT', 'BLOCKFIRST').upper()),
+    lake_layout_type=KVCacheLayoutType(os.getenv('FLEXKV_LAKE_LAYOUT', 'BLOCKFIRST').upper()),
     gds_layout_type=KVCacheLayoutType(os.getenv('FLEXKV_GDS_LAYOUT', 'BLOCKFIRST').upper()),
 
     use_ce_transfer_h2d=bool(int(os.getenv('FLEXKV_USE_CE_TRANSFER_H2D', 0))),
@@ -166,7 +166,7 @@ class UserConfig:
     enable_nixl: bool = False
     enable_p2p_cpu: bool = False
     enable_p2p_ssd: bool = False
-    enable_3rd_remote: bool = False
+    enable_3rd_lake: bool = False
 
     # distributed zmq configs
     local_zmq_ip: Optional[str] = None
@@ -251,13 +251,13 @@ def update_default_config_from_user_config(model_config: ModelConfig,
     cache_config.enable_nixl = user_config.enable_nixl
     cache_config.enable_p2p_cpu = user_config.enable_p2p_cpu
     cache_config.enable_p2p_ssd = user_config.enable_p2p_ssd
-    cache_config.enable_3rd_remote = user_config.enable_3rd_remote
+    cache_config.enable_3rd_lake = user_config.enable_3rd_lake
 
-    # Update derived flags after setting p2p and remote configs
+    # Update derived flags after setting p2p and lake configs
     cache_config.enable_kv_sharing = (cache_config.enable_p2p_cpu or
                                       cache_config.enable_p2p_ssd or
-                                      cache_config.enable_3rd_remote)
-    cache_config.enable_remote = cache_config.enable_3rd_remote
+                                      cache_config.enable_3rd_lake)
+    cache_config.enable_lake = cache_config.enable_3rd_lake
 
     if cache_config.num_ssd_blocks % len(cache_config.ssd_cache_dir) != 0:
         cache_config.num_ssd_blocks = \

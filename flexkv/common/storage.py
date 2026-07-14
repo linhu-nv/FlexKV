@@ -15,7 +15,7 @@ class AccessHandleType(Enum):
     GDS_MANAGER = auto()
 
 # NOTE: currently, we assume that the layout type of GPU should always be LAYERFIRST
-# and the layout type of CPU, SSD, remote should be the same, either laywise or BLOCKFIRST
+# and the layout type of CPU, SSD, lake should be the same, either laywise or BLOCKFIRST
 class KVCacheLayoutType(Enum):
     LAYERFIRST = "LAYERFIRST"
     BLOCKFIRST = "BLOCKFIRST"
@@ -171,7 +171,7 @@ class StorageHandle:
     # Optional metadata
     num_blocks_per_file: Optional[int] = None
     gpu_device_id: Optional[int] = None
-    remote_config_custom: Optional[Dict[str, Any]] = None
+    lake_config_custom: Optional[Dict[str, Any]] = None
 
     def get_tensor_list(self) -> List[torch.Tensor]:
         assert isinstance(self.data, list) and \

@@ -73,7 +73,7 @@ else:
     _SHMRADIX_IMPORT_ERROR = None
 
 
-_DEVICE_TYPE_NAMES = ['CPU', 'GPU', 'SSD', 'REMOTE']
+_DEVICE_TYPE_NAMES = ['CPU', 'GPU', 'SSD', 'LAKE']
 
 
 @dataclass
@@ -126,7 +126,7 @@ def _ensure_shmradix():
 
 
 class CacheEngineRadixShmem:
-    """Radixshmem-backed cache engine for one device (CPU / SSD / REMOTE).
+    """Radixshmem-backed cache engine for one device (CPU / SSD / LAKE).
 
     Multiple instances (one per DP scheduler process) attach to the same shm
     region by name and concurrently query / insert.

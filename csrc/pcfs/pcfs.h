@@ -74,11 +74,11 @@ void transfer_kv_blocks_cfs_mmap_multi_thread(
     int64_t cfs_layer_stride_in_bytes, int64_t cfs_block_stride_in_bytes,
     int64_t cfs_kv_stride_in_bytes, int64_t block_size_in_bytes,
     int64_t total_layers, bool is_read, int partition_block_type,
-    int round_robin, int64_t num_remote_blocks_per_file, bool use_mmap = false,
+    int round_robin, int64_t num_lake_blocks_per_file, bool use_mmap = false,
     int num_threads_per_file = 8, bool is_mla = false);
 
 // New function for shared PCFS read operations
-void shared_transfer_kv_blocks_remote_read(
+void shared_transfer_kv_blocks_lake_read(
   const std::vector<std::uint64_t> &file_nodeids,
   const std::vector<std::vector<int64_t>> &cfs_blocks_partition,
   const std::vector<std::vector<int64_t>> &cpu_blocks_partition,

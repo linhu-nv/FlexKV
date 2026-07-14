@@ -70,7 +70,7 @@ def load_dist_config(config_path: str):
     """Load config with distributed KVCache support.
 
     Extends the standard load_config to handle distributed-specific fields:
-      enable_p2p_cpu, enable_p2p_ssd, enable_3rd_remote,
+      enable_p2p_cpu, enable_p2p_ssd, enable_3rd_lake,
       redis_host, redis_port, local_ip, redis_password,
       server_client_mode, etc.
     """
@@ -109,8 +109,8 @@ def load_dist_config(config_path: str):
         user_config.enable_p2p_cpu = config["enable_p2p_cpu"]
     if "enable_p2p_ssd" in config:
         user_config.enable_p2p_ssd = config["enable_p2p_ssd"]
-    if "enable_3rd_remote" in config:
-        user_config.enable_3rd_remote = config["enable_3rd_remote"]
+    if "enable_3rd_lake" in config:
+        user_config.enable_3rd_lake = config["enable_3rd_lake"]
 
     # Redis config
     if "redis_host" in config:

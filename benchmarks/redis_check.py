@@ -10,7 +10,7 @@ This script inspects all FlexKV-related keys in Redis including:
   - buffer:<id>:*        (RDMA memory region registrations)
   - CPUB:<nid>:<hash>    (CPU KVCache block metadata - the actual cached data index)
   - SSDB:<nid>:<hash>    (SSD KVCache block metadata)
-  - PCFSB:<nid>:<hash>   (PCFS remote KVCache block metadata)
+  - PCFSB:<nid>:<hash>   (PCFS lake KVCache block metadata)
   - pcfs:<id>            (PCFS file node IDs)
   - mooncake/*           (Mooncake Transfer Engine metadata)
 
@@ -148,7 +148,7 @@ def check_block_metadata(r):
     FlexKV uses different key prefixes for different device types:
       - CPUB:<node_id>:<hash>  — CPU block metadata (P2P CPU sharing)
       - SSDB:<node_id>:<hash>  — SSD block metadata (P2P SSD sharing)
-      - PCFSB:<node_id>:<hash> — PCFS remote block metadata
+      - PCFSB:<node_id>:<hash> — PCFS lake block metadata
     Each key is a Redis hash with fields: ph, pb, nid, hash, lt, state.
     """
     print("\n" + "=" * 60)
@@ -159,7 +159,7 @@ def check_block_metadata(r):
     block_prefixes = {
         "CPUB": "CPU",
         "SSDB": "SSD",
-        "PCFSB": "PCFS (Remote)",
+        "PCFSB": "PCFS (Lake)",
     }
 
     grand_total = 0

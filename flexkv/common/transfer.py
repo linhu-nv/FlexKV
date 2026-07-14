@@ -34,7 +34,11 @@ class DeviceType(IntEnum):
     CPU = 0
     GPU = 1
     SSD = 2
-    REMOTE = 3
+    # LAKE = the 3rd-party remote storage TIER (e.g. PCFS / "data lake"). Named
+    # LAKE (not REMOTE) to disambiguate from the two other "remote" concepts in
+    # the codebase: TransferManagerOnRemote (multi-node TP peer) and the
+    # radixshmem/P2P cross-node remote (remote_slots / DistributedRadixTree).
+    LAKE = 3
     PEERCPU = 4
     PEERSSD = 5
 
@@ -45,8 +49,8 @@ class TransferType(Enum):
     H2DISK = "H2DISK"
     DISK2D = "DISK2D"
     D2DISK = "D2DISK"
-    REMOTE2H = "REMOTE2H"
-    H2REMOTE = "H2REMOTE"
+    LAKE2H = "LAKE2H"
+    H2LAKE = "H2LAKE"
     PEERH2H = "PEERH2H"
     H2PEERH = "H2PEERH"
     PEERSSD2H = "PEERSSD2H"
@@ -383,7 +387,7 @@ def merge_to_batch_graph(batch_id: int, transfer_graphs: List[TransferOpGraph], 
     Supported patterns:
       GET: DISK2H (optional) -> H2D
       PUT: D2H -> H2DISK (optional)
-    For other transfer types (REMOTE, GDS, etc.), raise error.
+    For other transfer types (LAKE, GDS, etc.), raise error.
 
     Args:
         batch_id: ID for the new batch graph

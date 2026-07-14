@@ -148,7 +148,7 @@ class FlexKVMetricsCollector:
         """Initialize Prometheus metrics for cache engine."""
         
         # ========== Cache Engine Metrics ==========
-        # Cache hit/miss counters by device (cpu/ssd/remote)
+        # Cache hit/miss counters by device (cpu/ssd/lake)
         self.cache_hit_blocks_total = Counter(
             name="flexkv_py_cache_hit_blocks_total",
             documentation="Total number of cache hit blocks by device",
@@ -254,7 +254,7 @@ class FlexKVMetricsCollector:
         Record cache hit blocks for a device.
         
         Args:
-            device: Device type ("cpu", "ssd", "remote")
+            device: Device type ("cpu", "ssd", "lake")
             num_blocks: Number of hit blocks
         """
         if not self.enabled or num_blocks <= 0:
@@ -310,7 +310,7 @@ class FlexKVMetricsCollector:
         Update memory pool statistics for a device.
         
         Args:
-            device: Device type ("cpu", "ssd", "remote")
+            device: Device type ("cpu", "ssd", "lake")
             total_blocks: Total blocks in memory pool
             free_blocks: Free blocks in memory pool
         """
@@ -324,7 +324,7 @@ class FlexKVMetricsCollector:
         Record evicted blocks for a device.
         
         Args:
-            device: Device type ("cpu", "ssd", "remote")
+            device: Device type ("cpu", "ssd", "lake")
             num_blocks: Number of evicted blocks
         """
         if not self.enabled or num_blocks <= 0:
@@ -336,7 +336,7 @@ class FlexKVMetricsCollector:
         Record allocated blocks for a device.
         
         Args:
-            device: Device type ("cpu", "ssd", "remote")
+            device: Device type ("cpu", "ssd", "lake")
             num_blocks: Number of allocated blocks
         """
         if not self.enabled or num_blocks <= 0:

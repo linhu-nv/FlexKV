@@ -282,7 +282,7 @@ bool call_pcfs_write(uint64_t file_nodeid, uint64_t offset, const char *buffer,
 static void partition_and_remap_blocks_by_file(
     const int64_t *cpu_block_ids, const int64_t *cfs_block_ids, int num_blocks,
     int num_files, int partition_block_type, int round_robin,
-    int64_t num_remote_blocks_per_file,
+    int64_t num_lake_blocks_per_file,
     std::vector<std::vector<int>> &cpu_blocks_partition,
     std::vector<std::vector<int>> &cfs_blocks_partition) {
 
@@ -291,8 +291,8 @@ static void partition_and_remap_blocks_by_file(
     int64_t cpu_block_id = cpu_block_ids[i];
     int file_id, block_id_in_file;
     if (partition_block_type == 1) { // sequential
-      file_id = cfs_block_id / num_remote_blocks_per_file;
-      block_id_in_file = cfs_block_id % num_remote_blocks_per_file;
+      file_id = cfs_block_id / num_lake_blocks_per_file;
+      block_id_in_file = cfs_block_id % num_lake_blocks_per_file;
     } else { // round_robin
       file_id = (cfs_block_id / round_robin) % num_files;
       block_id_in_file =
@@ -442,7 +442,7 @@ void transfer_kv_blocks_cfs_mmap_multi_thread(
     int64_t cfs_layer_stride_in_bytes, int64_t cfs_block_stride_in_bytes,
     int64_t cfs_kv_stride_in_bytes, int64_t block_size_in_bytes,
     int64_t total_layers, bool is_read, int partition_block_type,
-    int round_robin, int64_t num_remote_blocks_per_file, bool use_mmap,
+    int round_robin, int64_t num_lake_blocks_per_file, bool use_mmap,
     int num_threads_per_file, bool is_mla) {
 
   int num_files = file_nodeids.size();
@@ -460,7 +460,7 @@ void transfer_kv_blocks_cfs_mmap_multi_thread(
                                                      std::vector<int>());
   partition_and_remap_blocks_by_file(
       cpu_block_id_ptr, cfs_block_id_ptr, num_blocks, file_nodeids.size(),
-      partition_block_type, round_robin, num_remote_blocks_per_file,
+      partition_block_type, round_robin, num_lake_blocks_per_file,
       cpu_blocks_partition, cfs_blocks_partition);
 
   // create multiple threads to handle different layers
@@ -532,7 +532,7 @@ void transfer_kv_blocks_cfs_mmap_multi_thread(
   }
 }
 
-void shared_transfer_kv_blocks_remote_read(
+void shared_transfer_kv_blocks_lake_read(
   const std::vector<std::uint64_t> &file_nodeids,
   const std::vector<std::vector<int64_t>> &cfs_blocks_partition,
   const std::vector<std::vector<int64_t>> &cpu_blocks_partition,

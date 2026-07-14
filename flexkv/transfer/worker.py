@@ -58,12 +58,12 @@ from flexkv.transfer.nixlutil import (
 )
 try:
     from flexkv.c_ext import (
-        transfer_kv_blocks_remote,
-        shared_transfer_kv_blocks_remote_read,
+        transfer_kv_blocks_lake,
+        shared_transfer_kv_blocks_lake_read,
     )
 except ImportError:
-    transfer_kv_blocks_remote = None
-    shared_transfer_kv_blocks_remote_read = None
+    transfer_kv_blocks_lake = None
+    shared_transfer_kv_blocks_lake_read = None
 
 
 cudart = ctypes.CDLL('libcudart.so')
@@ -918,43 +918,43 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
 
         return True
 
-class CPURemoteTransferWorker(TransferWorkerBase):
+class CPULakeTransferWorker(TransferWorkerBase):
     def __init__(self,
                  worker_id: int,
                  transfer_conn: Connection,
                  finished_ops_queue: MPQueue,
                  op_buffer_tensor: torch.Tensor,
                  cpu_blocks: List[torch.Tensor],
-                 remote_file: List[str],
+                 lake_file: List[str],
                  cpu_kv_layout: KVCacheLayout,
-                 remote_kv_layout: KVCacheLayout,
+                 lake_kv_layout: KVCacheLayout,
                  dtype: torch.dtype,
-                 remote_config_custom: Dict[str, Any],
+                 lake_config_custom: Dict[str, Any],
                  enable_pcfs_sharing: bool = False):
-        if transfer_kv_blocks_remote is None:
-            raise RuntimeError("transfer_kv_blocks_remote not available, please build with FLEXKV_ENABLE_CFS=1")
+        if transfer_kv_blocks_lake is None:
+            raise RuntimeError("transfer_kv_blocks_lake not available, please build with FLEXKV_ENABLE_CFS=1")
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
 
         self.cpu_layer_ptrs = self._get_layer_ptrs(cpu_blocks)
-        self.remote_files = remote_file
-        self.num_remote_files = len(remote_file)
+        self.lake_files = lake_file
+        self.num_lake_files = len(lake_file)
 
         self.num_layers = cpu_kv_layout.num_layer
         self.num_cpu_blocks = cpu_kv_layout.num_block
-        self.num_remote_blocks = remote_kv_layout.num_block
+        self.num_lake_blocks = lake_kv_layout.num_block
         self.round_robin = 1
         self.enable_pcfs_sharing = enable_pcfs_sharing
 
-        if self.num_remote_blocks % self.num_remote_files != 0:
-            raise ValueError(f"num_remote_blocks {self.num_remote_blocks} "
-                             f"is not divisible by num_remote_files {self.num_remote_blocks}")
-        self.num_remote_blocks_per_file = self.num_remote_blocks // self.num_remote_files
-        if self.num_remote_blocks_per_file % self.round_robin != 0:
-            raise ValueError(f"num_remote_blocks_per_file {self.num_remote_blocks_per_file} "
+        if self.num_lake_blocks % self.num_lake_files != 0:
+            raise ValueError(f"num_lake_blocks {self.num_lake_blocks} "
+                             f"is not divisible by num_lake_files {self.num_lake_blocks}")
+        self.num_lake_blocks_per_file = self.num_lake_blocks // self.num_lake_files
+        if self.num_lake_blocks_per_file % self.round_robin != 0:
+            raise ValueError(f"num_lake_blocks_per_file {self.num_lake_blocks_per_file} "
                              f"is not divisible by round_robin {self.round_robin}")
 
         # For multi-group layouts, get_chunk_size() is not valid.
-        # CPURemoteTransferWorker uses LAYERFIRST which is single-group only,
+        # CPULakeTransferWorker uses LAYERFIRST which is single-group only,
         # but guard for safety.
         if cpu_kv_layout.layer_groups is not None:
             self.block_size = cpu_kv_layout.get_block_stride()
@@ -972,28 +972,28 @@ class CPURemoteTransferWorker(TransferWorkerBase):
         self.cpu_layer_stride_in_bytes = (
             self.num_cpu_blocks * self.block_size * self.dtype.itemsize * kv_dim
         )
-        self.remote_layer_stride_in_bytes = (
-            self.num_remote_blocks * self.block_size * self.dtype.itemsize * kv_dim
+        self.lake_layer_stride_in_bytes = (
+            self.num_lake_blocks * self.block_size * self.dtype.itemsize * kv_dim
         )
-        self.remote_layer_stride_in_bytes_per_file = self.remote_layer_stride_in_bytes // self.num_remote_files
+        self.lake_layer_stride_in_bytes_per_file = self.lake_layer_stride_in_bytes // self.num_lake_files
         self.cpu_kv_stride_in_bytes = (
             self.num_cpu_blocks * self.block_size * self.dtype.itemsize
         )
-        self.remote_kv_stride_in_bytes = (
-            self.num_remote_blocks * self.block_size * self.dtype.itemsize
+        self.lake_kv_stride_in_bytes = (
+            self.num_lake_blocks * self.block_size * self.dtype.itemsize
         )
-        self.remote_kv_stride_in_bytes_per_file = self.remote_kv_stride_in_bytes // self.num_remote_files
-        self.remote_block_stride_in_bytes = self.block_size * self.dtype.itemsize
+        self.lake_kv_stride_in_bytes_per_file = self.lake_kv_stride_in_bytes // self.num_lake_files
+        self.lake_block_stride_in_bytes = self.block_size * self.dtype.itemsize
         self.cpu_block_stride_in_bytes = self.block_size * self.dtype.itemsize
 
         self.chunk_size_in_bytes = self.block_size * self.dtype.itemsize
         # 144115188075855883 only use int not c_types.u_int64
-        if not remote_config_custom:
-            raise RuntimeError("remote_config_custom is not provided")
-        pcfs_fsid = remote_config_custom.get("pcfs_fsid")
-        pcfs_port = remote_config_custom.get("pcfs_port")
-        pcfs_ip = remote_config_custom.get("pcfs_ip")
-        pcfs_parent_nodeid = remote_config_custom.get("pcfs_parent_nodeid")
+        if not lake_config_custom:
+            raise RuntimeError("lake_config_custom is not provided")
+        pcfs_fsid = lake_config_custom.get("pcfs_fsid")
+        pcfs_port = lake_config_custom.get("pcfs_port")
+        pcfs_ip = lake_config_custom.get("pcfs_ip")
+        pcfs_parent_nodeid = lake_config_custom.get("pcfs_parent_nodeid")
         if None in (pcfs_fsid, pcfs_port, pcfs_ip, pcfs_parent_nodeid):
             raise RuntimeError("Some required PCFS config fields are missing")
         self.pcfs = c_ext.Pcfs(pcfs_fsid, pcfs_port, pcfs_ip, False, pcfs_parent_nodeid)
@@ -1001,12 +1001,12 @@ class CPURemoteTransferWorker(TransferWorkerBase):
             raise RuntimeError(f"PCFS init failed: fsid={pcfs_fsid}, ip={pcfs_ip}")
         self.file_nodeid_list = []
         need_create = False
-        for remote_file_single in remote_file:
+        for lake_file_single in lake_file:
             nodeid = self.pcfs.lookup_or_create_file(
-            remote_file_single,
-            (self.remote_layer_stride_in_bytes_per_file * self.num_layers), need_create)
+            lake_file_single,
+            (self.lake_layer_stride_in_bytes_per_file * self.num_layers), need_create)
             if nodeid == 0:
-                raise RuntimeError(f"lookup or create file failed for file: {remote_file_single}")
+                raise RuntimeError(f"lookup or create file failed for file: {lake_file_single}")
             self.file_nodeid_list.append(nodeid)
 
         c_ext.set_pcfs_instance(self.pcfs)
@@ -1029,21 +1029,21 @@ class CPURemoteTransferWorker(TransferWorkerBase):
         if layer_granularity == -1:
             layer_granularity = self.num_layers
 
-        # this means partial read hit cpu and other hit remote
-        # or partial write hit remote and none hit cpu
+        # this means partial read hit cpu and other hit lake
+        # or partial write hit lake and none hit cpu
 
-        if transfer_type == TransferType.H2REMOTE:
-            remote_block_id_list = dst_block_ids
+        if transfer_type == TransferType.H2LAKE:
+            lake_block_id_list = dst_block_ids
             cpu_block_id_list = src_block_ids
-        elif transfer_type == TransferType.REMOTE2H:
-            remote_block_id_list = src_block_ids
+        elif transfer_type == TransferType.LAKE2H:
+            lake_block_id_list = src_block_ids
             cpu_block_id_list = dst_block_ids
         else:
             raise ValueError(f"Invalid transfer type: {transfer_type} for CPUSSDDiskTransferWorker")
 
         layer_id_list = torch.arange(layer_id, layer_id + layer_granularity, dtype=torch.int32)
                 # Use PCFS shared transfer for read operations when PCFS sharing is enabled
-        if self.enable_pcfs_sharing and transfer_type == TransferType.REMOTE2H:
+        if self.enable_pcfs_sharing and transfer_type == TransferType.LAKE2H:
             # For PCFS sharing, we need to construct cfs_blocks_partition and cpu_blocks_partition
             # based on the file_nodeids from the transfer operation
             # Optional: per-source-block node ids for remote routing (numpy.ndarray)
@@ -1051,7 +1051,7 @@ class CPURemoteTransferWorker(TransferWorkerBase):
             if src_block_node_ids is not None and not isinstance(src_block_node_ids, np.ndarray):
                 raise TypeError("src_block_node_ids must be a numpy.ndarray if provided")
 
-            assert len(src_block_node_ids) == len(remote_block_id_list)
+            assert len(src_block_node_ids) == len(lake_block_id_list)
 
             # Construct cfs_blocks_partition and cpu_blocks_partition
             # This is a simplified implementation - in practice, you might need more sophisticated logic
@@ -1068,23 +1068,23 @@ class CPURemoteTransferWorker(TransferWorkerBase):
             file2fid_dict = {file_nodeid: fid for fid, file_nodeid in enumerate(file_nodeids_list)}
             #因为每个flexkv的文件数量是相同的，所以total_file_num是相同的，后面用全局block_id计算block_id_in_file时，需要除以total_file_num
             total_file_num = len(self.file_nodeid_list)
-            for i in range(len(remote_block_id_list)):
+            for i in range(len(lake_block_id_list)):
                 file_nodeid = src_block_node_ids[i]
                 fid = file2fid_dict[file_nodeid]
 
                 # Calculate block_id_in_file using the same logic as C++
                 # This should match the C++ implementation in pcfs.cpp
                 block_id_in_file = int(
-                    ((remote_block_id_list[i] / self.round_robin) / total_file_num)
+                    ((lake_block_id_list[i] / self.round_robin) / total_file_num)
                     * self.round_robin
-                    + (remote_block_id_list[i] % self.round_robin)
+                    + (lake_block_id_list[i] % self.round_robin)
                 )
 
                 cfs_blocks_partition[fid].append(block_id_in_file)
                 cpu_blocks_partition[fid].append(cpu_block_id_list[i].item())
 
             # Use the new shared transfer function
-            shared_transfer_kv_blocks_remote_read(
+            shared_transfer_kv_blocks_lake_read(
                 file_nodeid_list=file_nodeids_list,
                 cfs_blocks_partition_list=cfs_blocks_partition,
                 cpu_blocks_partition_list=cpu_blocks_partition,
@@ -1092,32 +1092,32 @@ class CPURemoteTransferWorker(TransferWorkerBase):
                 cpu_tensor_ptr=self.cpu_layer_ptrs[0].item(),
                 cpu_layer_stride_in_bytes=self.cpu_layer_stride_in_bytes,
                 cpu_kv_stride_in_bytes=self.cpu_kv_stride_in_bytes,
-                cfs_layer_stride_in_bytes=self.remote_layer_stride_in_bytes_per_file,
-                cfs_block_stride_in_bytes=self.remote_block_stride_in_bytes,
-                cfs_kv_stride_in_bytes=self.remote_kv_stride_in_bytes_per_file,
+                cfs_layer_stride_in_bytes=self.lake_layer_stride_in_bytes_per_file,
+                cfs_block_stride_in_bytes=self.lake_block_stride_in_bytes,
+                cfs_kv_stride_in_bytes=self.lake_kv_stride_in_bytes_per_file,
                 block_size_in_bytes=self.chunk_size_in_bytes,
                 total_layers=self.num_layers,
                 is_mla=self.is_mla,
                 num_threads_per_file=32,
             )
         else:
-            transfer_kv_blocks_remote(
+            transfer_kv_blocks_lake(
                 file_nodeid_list=self.file_nodeid_list,
                 cpu_layer_id_list=layer_id_list,
                 cpu_tensor_ptr=self.cpu_layer_ptrs[0].item(),
-                remote_block_ids=remote_block_id_list,
+                lake_block_ids=lake_block_id_list,
                 cpu_block_ids=cpu_block_id_list,
                 cpu_layer_stride_in_bytes=self.cpu_layer_stride_in_bytes,
                 cpu_kv_stride_in_bytes=self.cpu_kv_stride_in_bytes,
-                remote_layer_stride_in_bytes=self.remote_layer_stride_in_bytes_per_file,
-                remote_block_stride_in_bytes=self.remote_block_stride_in_bytes,
-                remote_kv_stride_in_bytes=self.remote_kv_stride_in_bytes_per_file,
+                lake_layer_stride_in_bytes=self.lake_layer_stride_in_bytes_per_file,
+                lake_block_stride_in_bytes=self.lake_block_stride_in_bytes,
+                lake_kv_stride_in_bytes=self.lake_kv_stride_in_bytes_per_file,
                 block_size_in_bytes=self.chunk_size_in_bytes,
                 total_layers=self.num_layers,
-                is_read=(transfer_type == TransferType.REMOTE2H),
+                is_read=(transfer_type == TransferType.LAKE2H),
                 partition_block_type=PartitionBlockType.SEQUENTIAL.value, # use sequential
                 round_robin=self.round_robin,
-                num_remote_blocks_per_file=self.num_remote_blocks_per_file,
+                num_lake_blocks_per_file=self.num_lake_blocks_per_file,
                 use_mmap=False,  # TODO: fix bug when use mmap
                 num_threads_per_file=32,
                 is_mla=self.is_mla,

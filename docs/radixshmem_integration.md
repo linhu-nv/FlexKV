@@ -63,7 +63,7 @@ DP scheduler 进程 0   ...   DP scheduler 进程 N-1
         ▼                                  ▼
   /dev/shm/<id>_cpu (radixshmem)   ── 所有 CE 直接读写
   /dev/shm/<id>_ssd  (radixshmem)
-  /dev/shm/<id>_remote (radixshmem)
+  /dev/shm/<id>_lake (radixshmem)
         │                                  │
         ▼ ShmChannel × N (SPSC ring + futex)
   ┌──────────────────────────────────────────┐
@@ -183,7 +183,7 @@ export FLEXKV_DP_SIZE=8                    # 必须跟 vllm --data-parallel-size
 export FLEXKV_CPU_CACHE_GB=200             # CPU cache 大小，见 §6.1
 ```
 
-`FLEXKV_RADIX_SHMEM=1` 时 `KVManager` 走 `use_radix_shmem=True` 分支，每个 DP 进程内部构造 `KVTaskEngine`，绕过 `KVServer.create_server()`。Bootstrap DP（`instance_id=0 && dp_client_id=0`）顺带创建 shm radix regions（CPU/SSD/REMOTE 三段，按需）；其它 DP attach。
+`FLEXKV_RADIX_SHMEM=1` 时 `KVManager` 走 `use_radix_shmem=True` 分支，每个 DP 进程内部构造 `KVTaskEngine`，绕过 `KVServer.create_server()`。Bootstrap DP（`instance_id=0 && dp_client_id=0`）顺带创建 shm radix regions（CPU/SSD/LAKE 三段，按需）；其它 DP attach。
 
 ### 4.2 vllm 启动参数
 

@@ -2,12 +2,12 @@
 """
 Bootstrap for radixshmem-backed CacheEngine.
 
-Per-device-type RadixTree (CPU / SSD / REMOTE) lives in its own POSIX shm
+Per-device-type RadixTree (CPU / SSD / LAKE) lives in its own POSIX shm
 region. The first DP process (instance 0, dp_client_id 0) creates the regions
 via `shmradix.RadixServer`; all others attach via `shmradix.RadixClient`.
 
 Naming convention:
-    /flexkv_radix_{server_id}_{cpu|ssd|remote}
+    /flexkv_radix_{server_id}_{cpu|ssd|lake}
 
 `server_id` defaults to a fixed token but is overridable so multiple FlexKV
 instances on the same host don't collide.
@@ -31,7 +31,7 @@ except ImportError:  # pragma: no cover
 _DEVICE_KIND_NAMES = {
     DeviceType.CPU: "cpu",
     DeviceType.SSD: "ssd",
-    DeviceType.REMOTE: "remote",
+    DeviceType.LAKE: "lake",
 }
 
 
@@ -47,8 +47,8 @@ def device_blocks_from_config(device_type: DeviceType,
         return cache_config.num_cpu_blocks
     if device_type == DeviceType.SSD:
         return cache_config.num_ssd_blocks
-    if device_type == DeviceType.REMOTE:
-        return cache_config.num_remote_blocks or 0
+    if device_type == DeviceType.LAKE:
+        return cache_config.num_lake_blocks or 0
     return 0
 
 
@@ -58,8 +58,8 @@ def enabled_devices(cache_config: CacheConfig) -> Tuple[DeviceType, ...]:
         out.append(DeviceType.CPU)
     if cache_config.enable_ssd:
         out.append(DeviceType.SSD)
-    if cache_config.enable_remote:
-        out.append(DeviceType.REMOTE)
+    if cache_config.enable_lake:
+        out.append(DeviceType.LAKE)
     return tuple(out)
 
 

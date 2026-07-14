@@ -110,8 +110,8 @@ class KVTaskManager:
                  ):
         if not cache_config.enable_cpu:
             raise ValueError("enable_cpu must be True")
-        if cache_config.enable_remote and not cache_config.enable_ssd:
-            raise ValueError("enable_ssd must be True if enable_remote is True")
+        if cache_config.enable_lake and not cache_config.enable_ssd:
+            raise ValueError("enable_ssd must be True if enable_lake is True")
         if not cache_config.enable_cpu and not cache_config.enable_gds:
             raise ValueError("enable_gds must be True if enable_cpu is False")
         if cache_config.enable_gds and not cache_config.enable_ssd:
@@ -500,26 +500,26 @@ class KVTaskManager:
         return results
 
     def _check_config(self, model_config: ModelConfig, cache_config: CacheConfig) -> None:
-        if cache_config.enable_remote:
-            if cache_config.remote_cache_path is None:
+        if cache_config.enable_lake:
+            if cache_config.lake_cache_path is None:
 
-                if cache_config.remote_file_prefix is None:
-                    raise ValueError("remote_file_prefix must be provided when remote_cache_path is None")
+                if cache_config.lake_file_prefix is None:
+                    raise ValueError("lake_file_prefix must be provided when lake_cache_path is None")
 
-                if cache_config.remote_file_num is None or cache_config.remote_file_num <= 0:
-                    raise ValueError("remote_file_num must be a positive integer")
+                if cache_config.lake_file_num is None or cache_config.lake_file_num <= 0:
+                    raise ValueError("lake_file_num must be a positive integer")
 
-                cache_config.remote_cache_path = [
-                    f"{cache_config.remote_file_prefix}_{i}"
-                    for i in range(cache_config.remote_file_num)
+                cache_config.lake_cache_path = [
+                    f"{cache_config.lake_file_prefix}_{i}"
+                    for i in range(cache_config.lake_file_num)
                 ]
 
-            if cache_config.remote_cache_size_mode == "block_num":
-                if cache_config.num_remote_blocks is None:
-                    raise ValueError("num_remote_blocks must not None if use block_num model")
-            elif cache_config.remote_cache_size_mode == "file_size":
-                if cache_config.remote_file_size is None:
-                    raise ValueError("remote_file_size must not None if use file_size model")
+            if cache_config.lake_cache_size_mode == "block_num":
+                if cache_config.num_lake_blocks is None:
+                    raise ValueError("num_lake_blocks must not None if use block_num model")
+            elif cache_config.lake_cache_size_mode == "file_size":
+                if cache_config.lake_file_size is None:
+                    raise ValueError("lake_file_size must not None if use file_size model")
                 if model_config.use_mla:
                     kv_size = (
                         model_config.num_layers
@@ -537,10 +537,10 @@ class KVTaskManager:
                         * model_config.head_size
                         * model_config.dtype.itemsize
                     )
-                cache_config.num_remote_blocks = cache_config.remote_file_size // kv_size * cache_config.remote_file_num
+                cache_config.num_lake_blocks = cache_config.lake_file_size // kv_size * cache_config.lake_file_num
 
             else:
-                raise ValueError("remote_cache_size_mode must block_num or file_size model")
+                raise ValueError("lake_cache_size_mode must block_num or file_size model")
 
 class KVTaskEngine(KVTaskManager):
     def __init__(self,

@@ -9,7 +9,7 @@ from flexkv.common.config import ModelConfig, CacheConfig, GLOBAL_CONFIG_FROM_EN
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import StorageHandle, KVCacheLayout, KVCacheLayoutType
 from flexkv.common.transfer import DeviceType
-from flexkv.storage.allocator import CPUAllocator, GPUAllocator, SSDAllocator, RemoteAllocator
+from flexkv.storage.allocator import CPUAllocator, GPUAllocator, SSDAllocator, LakeAllocator
 
 
 class StorageEngine:
@@ -54,24 +54,24 @@ class StorageEngine:
                 cache_dir=self._cache_config.ssd_cache_dir,
                 max_file_size_gb=GLOBAL_CONFIG_FROM_ENV.max_file_size_gb
             )
-        if self._cache_config.enable_remote:
-            if not GLOBAL_CONFIG_FROM_ENV.remote_layout_type == self._cpu_layout.type:
-                raise ValueError(f"Remote layout type must be the same as CPU layout type: {self._cpu_layout.type}")
-            self._remote_layout: Optional[KVCacheLayout] = KVCacheLayout(
-                type=GLOBAL_CONFIG_FROM_ENV.remote_layout_type,
+        if self._cache_config.enable_lake:
+            if not GLOBAL_CONFIG_FROM_ENV.lake_layout_type == self._cpu_layout.type:
+                raise ValueError(f"Lake layout type must be the same as CPU layout type: {self._cpu_layout.type}")
+            self._lake_layout: Optional[KVCacheLayout] = KVCacheLayout(
+                type=GLOBAL_CONFIG_FROM_ENV.lake_layout_type,
                 num_layer=self._model_config.num_layers,
-                num_block=self._cache_config.num_remote_blocks,
+                num_block=self._cache_config.num_lake_blocks,
                 tokens_per_block=self._cache_config.tokens_per_block,
                 num_head=self._model_config.num_kv_heads,
                 head_size=self._model_config.head_size,
                 is_mla=self._model_config.use_mla
             )
             self.allocate(
-                device_type=DeviceType.REMOTE,
-                layout=self._remote_layout,
+                device_type=DeviceType.LAKE,
+                layout=self._lake_layout,
                 dtype=self._model_config.dtype,
-                file_path=self._cache_config.remote_cache_path,
-                remote_config_custom = self._cache_config.remote_config_custom
+                file_path=self._cache_config.lake_cache_path,
+                lake_config_custom = self._cache_config.lake_config_custom
             )
 
     def register_gpu_blocks(self,
@@ -177,32 +177,32 @@ class StorageEngine:
                     file_prefix=file_prefix,
                     max_file_size_gb=max_file_size_gb
                 )
-        elif device_type == DeviceType.REMOTE:
+        elif device_type == DeviceType.LAKE:
             file_path = kwargs.get('file_path')
-            remote_config_custom = kwargs.get('remote_config_custom')
+            lake_config_custom = kwargs.get('lake_config_custom')
             if raw_data is not None:
                 if (isinstance(raw_data, str) or \
                     (isinstance(raw_data, list) and all(isinstance(x, str) for x in raw_data))):
-                    if not isinstance(remote_config_custom, dict):
-                        raise TypeError("remote_config_custom for RemoteAllocator.from_raw_data must be dict[str, Any]")
-                    storage_handle = RemoteAllocator.from_raw_data(
+                    if not isinstance(lake_config_custom, dict):
+                        raise TypeError("lake_config_custom for LakeAllocator.from_raw_data must be dict[str, Any]")
+                    storage_handle = LakeAllocator.from_raw_data(
                         data=raw_data,  # type: ignore
                         layout=layout,
                         dtype=dtype,
-                        remote_config_custom=remote_config_custom
+                        lake_config_custom=lake_config_custom
                     )
                 else:
-                    raise TypeError("raw_data for RemoteAllocator must be str or List[str]")
+                    raise TypeError("raw_data for LakeAllocator must be str or List[str]")
             else:
                 if not file_path:
-                    raise ValueError("file_path is required for remote allocator")
-                if not isinstance(remote_config_custom, dict):
-                    raise TypeError("remote_config_custom for RemoteAllocator must be dict[str, Any]")
-                storage_handle = RemoteAllocator.allocate(
+                    raise ValueError("file_path is required for lake allocator")
+                if not isinstance(lake_config_custom, dict):
+                    raise TypeError("lake_config_custom for LakeAllocator must be dict[str, Any]")
+                storage_handle = LakeAllocator.allocate(
                     layout=layout,
                     dtype=dtype,
                     file_path=file_path,
-                    remote_config_custom=remote_config_custom
+                    lake_config_custom=lake_config_custom
                 )
         else:
             raise ValueError(f"Unsupported device type: {device_type}")

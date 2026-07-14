@@ -133,9 +133,9 @@ class TransferManager:
             if self.cache_config.enable_cpu else None
         ssd_handle = self.storage_engine.get_storage_handle(DeviceType.SSD) \
             if self.cache_config.enable_ssd else None
-        remote_handle = (
-            self.storage_engine.get_storage_handle(DeviceType.REMOTE) \
-            if self.cache_config.enable_remote \
+        lake_handle = (
+            self.storage_engine.get_storage_handle(DeviceType.LAKE) \
+            if self.cache_config.enable_lake \
             else None
         )
         self.transfer_engine = TransferEngine(gpu_handles=grouped_gpu_handles,
@@ -143,7 +143,7 @@ class TransferManager:
                                               cache_config=self.cache_config,
                                               cpu_handle=cpu_handle,
                                               ssd_handle=ssd_handle,
-                                              remote_handle=remote_handle)
+                                              lake_handle=lake_handle)
         flexkv_logger.info("Initialized TransferEngine successfully")
 
     def submit(self, transfer_graph: TransferOpGraph) -> None:

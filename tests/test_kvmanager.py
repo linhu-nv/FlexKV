@@ -128,7 +128,7 @@ def shutdown_tp_client(tp_client_processes):
     {'enable_cpu': True, 'enable_ssd': True, 'num_cpu_blocks': 256, 'num_ssd_blocks': 2048},
     # GDS test configs
     {'enable_cpu': True, 'enable_gds': True, 'enable_ssd': True, \
-        'enable_remote': False, 'num_cpu_blocks':256, 'num_ssd_blocks': 1024},
+        'enable_lake': False, 'num_cpu_blocks':256, 'num_ssd_blocks': 1024},
 ], indirect=True)
 @pytest.mark.parametrize("test_config", [
     {'num_gpu_blocks': 512, 'requests_per_block': 16, 'initial_write_ratio': 0.4},
@@ -149,7 +149,7 @@ def test_kvmanager(model_config, cache_config, test_config, gpu_layout_type):
 
     enable_cpu = cache_config.enable_cpu
     enable_ssd = cache_config.enable_ssd
-    enable_remote = cache_config.enable_remote
+    enable_lake = cache_config.enable_lake
     enable_gds = cache_config.enable_gds
 
     num_gpu_blocks = test_config["num_gpu_blocks"]
@@ -165,8 +165,8 @@ def test_kvmanager(model_config, cache_config, test_config, gpu_layout_type):
     if enable_gds and os.environ.get("FLEXKV_ENABLE_GDS", "0") == "0":
         pytest.skip("skip because GDS test is not enabled")
 
-    if enable_remote:
-        pytest.skip("skip because enable_remote is not supported")
+    if enable_lake:
+        pytest.skip("skip because enable_lake is not supported")
 
     if dp_size > 1:
          #note that for now only dp_size=1 is supported
@@ -234,7 +234,7 @@ def test_kvmanager(model_config, cache_config, test_config, gpu_layout_type):
         time.sleep(1)
         flexkv_logger.info("waiting for flexkv to be ready")
 
-    num_remote_blocks = cache_config.num_remote_blocks
+    num_lake_blocks = cache_config.num_lake_blocks
     request_pairs = [generate_request_pair(i, block_per_request, num_gpu_blocks, tokens_per_block, dp_size)
                      for i in range(num_requests)]
     initial_write_num = int(num_requests * initial_write_ratio)
@@ -443,7 +443,7 @@ def test_kvmanager(model_config, cache_config, test_config, gpu_layout_type):
 
     if enable_cpu and num_cpu_blocks >= num_gpu_blocks or \
         enable_ssd and num_ssd_blocks >= num_gpu_blocks or \
-        enable_remote and num_remote_blocks >= num_gpu_blocks or \
+        enable_lake and num_lake_blocks >= num_gpu_blocks or \
         enable_gds and num_ssd_blocks >= num_gpu_blocks:
         assert total_cache_miss == 0
     shutdown_tp_client(tp_client_processes)

@@ -34,7 +34,7 @@ from flexkv.transfer.scheduler import TransferScheduler
 from flexkv.transfer.worker import (
     WorkerHandle,
     CPUSSDDiskTransferWorker,
-    CPURemoteTransferWorker,
+    CPULakeTransferWorker,
     GPUCPUTransferWorker,
     tpGPUCPUTransferWorker,
     GDSTransferWorker,
@@ -62,8 +62,8 @@ def register_op_to_buffer(op: TransferOp, pin_buffer: SharedOpPool) -> None:
         TransferType.DISK2H: (3, 2),   # SSD -> CPU
         TransferType.DISK2D: (3, 1),   # SSD -> GPU
         TransferType.D2DISK: (1, 3),   # GPU -> SSD
-        TransferType.H2REMOTE: (2, 4), # CPU -> REMOTE
-        TransferType.REMOTE2H: (4, 2), # REMOTE -> CPU
+        TransferType.H2LAKE: (2, 4), # CPU -> LAKE
+        TransferType.LAKE2H: (4, 2), # LAKE -> CPU
         TransferType.PEERH2H: (5, 2),  # PEER_CPU -> CPU
         TransferType.H2PEERH: (2, 5),  # CPU -> PEER_CPU
         TransferType.PEERSSD2H: (6, 2),# PEER_SSD -> CPU
@@ -88,7 +88,7 @@ class TransferEngine:
         cache_config: CacheConfig,
         cpu_handle: Optional[StorageHandle] = None,
         ssd_handle: Optional[StorageHandle] = None,
-        remote_handle: Optional[StorageHandle] = None):
+        lake_handle: Optional[StorageHandle] = None):
         """
         Initialize transfer engine
 
@@ -96,7 +96,7 @@ class TransferEngine:
             gpu_handles: Dict mapping dp_client_id -> list of GPU handles for that TP group
             cpu_handle: CPU handle
             ssd_handle: Optional SSD handle
-            remote_handle: Optional remote handle
+            lake_handle: Optional lake handle
         """
         self.model_config: ModelConfig = model_config
         self.cache_config: CacheConfig = cache_config
@@ -118,7 +118,7 @@ class TransferEngine:
         self.gpu_handles = gpu_handles
         self._cpu_handle = cpu_handle
         self._ssd_handle = ssd_handle
-        self._remote_handle = remote_handle
+        self._lake_handle = lake_handle
         self._cache_config = cache_config
         self._enable_pcfs_sharing = GLOBAL_CONFIG_FROM_ENV.index_accel and cache_config.enable_kv_sharing # TODO: is this correct?
 
@@ -245,32 +245,32 @@ class TransferEngine:
             )
             self._worker_map[TransferType.H2DISK] = self.cpussd_write_worker
             self._worker_map[TransferType.DISK2H] = self.cpussd_read_worker
-        if self._remote_handle is not None and self._cpu_handle is not None:
-            self.remotecpu_read_worker: WorkerHandle = CPURemoteTransferWorker.create_worker(
+        if self._lake_handle is not None and self._cpu_handle is not None:
+            self.lakecpu_read_worker: WorkerHandle = CPULakeTransferWorker.create_worker(
                 mp_ctx=self.mp_ctx,
                 finished_ops_queue=self.finished_ops_queue,
                 op_buffer_tensor = self.pin_buffer.get_buffer(),
                 cpu_blocks=self._cpu_handle.get_tensor(),
-                remote_file=self._remote_handle.get_file_list(),
+                lake_file=self._lake_handle.get_file_list(),
                 cpu_kv_layout=self._cpu_handle.kv_layout,
-                remote_kv_layout=self._remote_handle.kv_layout,
+                lake_kv_layout=self._lake_handle.kv_layout,
                 dtype=self._cpu_handle.dtype,
-                remote_config_custom=self._remote_handle.remote_config_custom,
+                lake_config_custom=self._lake_handle.lake_config_custom,
                 enable_pcfs_sharing=self._enable_pcfs_sharing,
             )
-            self.remotecpu_write_worker: WorkerHandle = CPURemoteTransferWorker.create_worker(
+            self.lakecpu_write_worker: WorkerHandle = CPULakeTransferWorker.create_worker(
                 mp_ctx=self.mp_ctx,
                 finished_ops_queue=self.finished_ops_queue,
                 op_buffer_tensor = self.pin_buffer.get_buffer(),
                 cpu_blocks=self._cpu_handle.get_tensor(),
-                remote_file=self._remote_handle.get_file_list(),
+                lake_file=self._lake_handle.get_file_list(),
                 cpu_kv_layout=self._cpu_handle.kv_layout,
-                remote_kv_layout=self._remote_handle.kv_layout,
+                lake_kv_layout=self._lake_handle.kv_layout,
                 dtype=self._cpu_handle.dtype,
-                remote_config_custom=self._remote_handle.remote_config_custom,
+                lake_config_custom=self._lake_handle.lake_config_custom,
             )
-            self._worker_map[TransferType.H2REMOTE] = self.remotecpu_write_worker
-            self._worker_map[TransferType.REMOTE2H] = self.remotecpu_read_worker
+            self._worker_map[TransferType.H2LAKE] = self.lakecpu_write_worker
+            self._worker_map[TransferType.LAKE2H] = self.lakecpu_read_worker
         if self.cache_config.enable_gds:
             assert self._ssd_handle is not None
             if self.cache_config.enable_nixl:

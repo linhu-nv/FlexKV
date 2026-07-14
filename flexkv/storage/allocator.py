@@ -213,7 +213,7 @@ class SSDAllocator(BaseStorageAllocator):
         st = os.statvfs(file_path)
         return st.f_frsize * st.f_bavail
 
-class RemoteAllocator(BaseStorageAllocator):
+class LakeAllocator(BaseStorageAllocator):
     @classmethod
     def allocate(cls,
                  layout: KVCacheLayout,
@@ -221,19 +221,19 @@ class RemoteAllocator(BaseStorageAllocator):
                  **kwargs: Any) -> StorageHandle:
         file_path = kwargs.get("file_path")
         if file_path is None:
-            raise ValueError("file_path is required for Remote allocator")
-        remote_config_custom = kwargs.get("remote_config_custom")
-        if remote_config_custom is None:
-            raise ValueError("remote_config_custom is required for Remote allocator")
+            raise ValueError("file_path is required for Lake allocator")
+        lake_config_custom = kwargs.get("lake_config_custom")
+        if lake_config_custom is None:
+            raise ValueError("lake_config_custom is required for Lake allocator")
         if isinstance(file_path, str):
             file_path = [file_path]
 
-        if not remote_config_custom:
-            raise RuntimeError("remote_config_custom is not provided")
-        pcfs_fsid = remote_config_custom.get("pcfs_fsid")
-        pcfs_port = remote_config_custom.get("pcfs_port")
-        pcfs_ip = remote_config_custom.get("pcfs_ip")
-        pcfs_parent_nodeid = remote_config_custom.get("pcfs_parent_nodeid")
+        if not lake_config_custom:
+            raise RuntimeError("lake_config_custom is not provided")
+        pcfs_fsid = lake_config_custom.get("pcfs_fsid")
+        pcfs_port = lake_config_custom.get("pcfs_port")
+        pcfs_ip = lake_config_custom.get("pcfs_ip")
+        pcfs_parent_nodeid = lake_config_custom.get("pcfs_parent_nodeid")
         if None in (pcfs_fsid, pcfs_port, pcfs_ip, pcfs_parent_nodeid):
             raise RuntimeError("Some required PCFS config fields are missing")
         if Pcfs is None:
@@ -259,7 +259,7 @@ class RemoteAllocator(BaseStorageAllocator):
             data=file_path,
             kv_layout=layout,
             dtype=dtype,
-            remote_config_custom = remote_config_custom,
+            lake_config_custom = lake_config_custom,
         )
 
     @classmethod
@@ -272,9 +272,9 @@ class RemoteAllocator(BaseStorageAllocator):
                       layout: KVCacheLayout,
                       dtype: torch.dtype,
                       **kwargs: Any) -> StorageHandle:
-        remote_config_custom = kwargs.get("remote_config_custom")
-        if remote_config_custom is None:
-            raise ValueError("remote_config_custom is required for Remote allocator")
+        lake_config_custom = kwargs.get("lake_config_custom")
+        if lake_config_custom is None:
+            raise ValueError("lake_config_custom is required for Lake allocator")
         if isinstance(data, str):
             data = [data]
 
@@ -283,5 +283,5 @@ class RemoteAllocator(BaseStorageAllocator):
             data=data,
             kv_layout=layout,
             dtype=dtype,
-            remote_config_custom = remote_config_custom,
+            lake_config_custom = lake_config_custom,
         )

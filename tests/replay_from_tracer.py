@@ -95,8 +95,8 @@ class FlexKVReplayEngine:
                 GLOBAL_CONFIG_FROM_ENV.cpu_layout_type = self._parse_layout_type(global_config_data['cpu_layout_type'])
             if 'ssd_layout_type' in global_config_data:
                 GLOBAL_CONFIG_FROM_ENV.ssd_layout_type = self._parse_layout_type(global_config_data['ssd_layout_type'])
-            if 'remote_layout_type' in global_config_data:
-                GLOBAL_CONFIG_FROM_ENV.remote_layout_type = self._parse_layout_type(global_config_data['remote_layout_type'])
+            if 'lake_layout_type' in global_config_data:
+                GLOBAL_CONFIG_FROM_ENV.lake_layout_type = self._parse_layout_type(global_config_data['lake_layout_type'])
             if 'gds_layout_type' in global_config_data:
                 GLOBAL_CONFIG_FROM_ENV.gds_layout_type = self._parse_layout_type(global_config_data['gds_layout_type'])
 
@@ -134,25 +134,24 @@ class FlexKVReplayEngine:
             tokens_per_block=cache_config_data['tokens_per_block'],
             enable_cpu=cache_config_data['enable_cpu'],
             enable_ssd=cache_config_data['enable_ssd'],
-            enable_remote=cache_config_data['enable_remote'],
+            enable_lake=cache_config_data['enable_lake'],
             enable_gds=cache_config_data['enable_gds'],
             gpu_kv_layout_type=self._parse_layout_type(cache_config_data['gpu_kv_layout_type']),
             cpu_kv_layout_type=self._parse_layout_type(cache_config_data['cpu_kv_layout_type']),
             ssd_kv_layout_type=self._parse_layout_type(cache_config_data['ssd_kv_layout_type']),
-            remote_kv_layout_type=self._parse_layout_type(cache_config_data['remote_kv_layout_type']),
-            remote_cache_size_mode=cache_config_data['remote_cache_size_mode'],
+            lake_kv_layout_type=self._parse_layout_type(cache_config_data['lake_kv_layout_type']),
+            lake_cache_size_mode=cache_config_data['lake_cache_size_mode'],
             num_cpu_blocks=cache_config_data['num_cpu_blocks'],
             num_ssd_blocks=cache_config_data['num_ssd_blocks'],
             num_gds_blocks=cache_config_data['num_gds_blocks'],
-            num_remote_blocks=cache_config_data['num_remote_blocks'],
+            num_lake_blocks=cache_config_data['num_lake_blocks'],
             ssd_cache_dir=cache_config_data['ssd_cache_dir'],
             gds_cache_dir=cache_config_data['gds_cache_dir'],
-            remote_cache_size_mode=cache_config_data['remote_cache_size_mode'],
-            remote_file_size=cache_config_data['remote_file_size'],
-            remote_file_num=cache_config_data['remote_file_num'],
-            remote_file_prefix=cache_config_data['remote_file_prefix'],
-            remote_cache_path=cache_config_data['remote_cache_path'],
-            remote_config_custom=cache_config_data['remote_config_custom'],
+            lake_file_size=cache_config_data['lake_file_size'],
+            lake_file_num=cache_config_data['lake_file_num'],
+            lake_file_prefix=cache_config_data['lake_file_prefix'],
+            lake_cache_path=cache_config_data['lake_cache_path'],
+            lake_config_custom=cache_config_data['lake_config_custom'],
         )
 
         # Recreate gpu_layout if available

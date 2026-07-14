@@ -134,18 +134,18 @@ void transfer_kv_blocks_ssd_binding(
 }
 
 #ifdef FLEXKV_ENABLE_CFS
-void transfer_kv_blocks_remote(
+void transfer_kv_blocks_lake(
     const py::list &file_nodeid_list, const torch::Tensor &cpu_layer_id_list,
-    int64_t cpu_tensor_ptr, const torch::Tensor &remote_block_ids,
+    int64_t cpu_tensor_ptr, const torch::Tensor &lake_block_ids,
     const torch::Tensor &cpu_block_ids, int64_t cpu_layer_stride_in_bytes,
-    int64_t cpu_kv_stride_in_bytes, int64_t remote_layer_stride_in_bytes,
-    int64_t remote_block_stride_in_bytes, int64_t remote_kv_stride_in_bytes,
+    int64_t cpu_kv_stride_in_bytes, int64_t lake_layer_stride_in_bytes,
+    int64_t lake_block_stride_in_bytes, int64_t lake_kv_stride_in_bytes,
     int64_t block_size_in_bytes, int64_t total_layers, bool is_read,
     int partition_block_type, int round_robin,
-    int64_t num_remote_blocks_per_file, bool use_mmap = false,
+    int64_t num_lake_blocks_per_file, bool use_mmap = false,
     int num_threads_per_file = 8, bool is_mla = false) {
-  TORCH_CHECK(remote_block_ids.dtype() == torch::kInt64,
-              "remote_block_ids must be int64");
+  TORCH_CHECK(lake_block_ids.dtype() == torch::kInt64,
+              "lake_block_ids must be int64");
   TORCH_CHECK(cpu_block_ids.dtype() == torch::kInt64,
               "cpu_block_ids must be int64");
   std::vector<std::uint64_t> file_nodeids;
@@ -153,15 +153,15 @@ void transfer_kv_blocks_remote(
     file_nodeids.push_back(file_nodeid.cast<std::uint64_t>());
   }
   flexkv::transfer_kv_blocks_cfs_mmap_multi_thread(
-      file_nodeids, cpu_layer_id_list, cpu_tensor_ptr, remote_block_ids,
+      file_nodeids, cpu_layer_id_list, cpu_tensor_ptr, lake_block_ids,
       cpu_block_ids, cpu_layer_stride_in_bytes, cpu_kv_stride_in_bytes,
-      remote_layer_stride_in_bytes, remote_block_stride_in_bytes,
-      remote_kv_stride_in_bytes, block_size_in_bytes, total_layers, is_read,
-      partition_block_type, round_robin, num_remote_blocks_per_file, use_mmap,
+      lake_layer_stride_in_bytes, lake_block_stride_in_bytes,
+      lake_kv_stride_in_bytes, block_size_in_bytes, total_layers, is_read,
+      partition_block_type, round_robin, num_lake_blocks_per_file, use_mmap,
       num_threads_per_file, is_mla);
 }
 
-void shared_transfer_kv_blocks_remote_read_binding(
+void shared_transfer_kv_blocks_lake_read_binding(
     const py::list &file_nodeid_list, const py::list &cfs_blocks_partition_list,
     const py::list &cpu_blocks_partition_list,
     const torch::Tensor &cpu_layer_id_list, int64_t cpu_tensor_ptr,
@@ -197,7 +197,7 @@ void shared_transfer_kv_blocks_remote_read_binding(
   }
 
   // call C++ implementation
-  flexkv::shared_transfer_kv_blocks_remote_read(
+  flexkv::shared_transfer_kv_blocks_lake_read(
       file_nodeids, cfs_blocks_partition, cpu_blocks_partition,
       cpu_layer_id_list, cpu_tensor_ptr, cpu_layer_stride_in_bytes,
       cpu_kv_stride_in_bytes, cfs_layer_stride_in_bytes,
@@ -417,18 +417,18 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("is_mla") = false);
 
 #ifdef FLEXKV_ENABLE_CFS
-  m.def("transfer_kv_blocks_remote", &transfer_kv_blocks_remote,
-        "Transfer KV blocks between remote and CPU memory",
+  m.def("transfer_kv_blocks_lake", &transfer_kv_blocks_lake,
+        "Transfer KV blocks between the lake (3rd-party PCFS) storage tier and CPU memory",
         py::arg("file_nodeid_list"), py::arg("cpu_layer_id_list"),
-        py::arg("cpu_tensor_ptr"), py::arg("remote_block_ids"),
+        py::arg("cpu_tensor_ptr"), py::arg("lake_block_ids"),
         py::arg("cpu_block_ids"), py::arg("cpu_layer_stride_in_bytes"),
         py::arg("cpu_kv_stride_in_bytes"),
-        py::arg("remote_layer_stride_in_bytes"),
-        py::arg("remote_block_stride_in_bytes"),
-        py::arg("remote_kv_stride_in_bytes"), py::arg("block_size_in_bytes"),
+        py::arg("lake_layer_stride_in_bytes"),
+        py::arg("lake_block_stride_in_bytes"),
+        py::arg("lake_kv_stride_in_bytes"), py::arg("block_size_in_bytes"),
         py::arg("total_layers"), py::arg("is_read"),
         py::arg("partition_block_type"), py::arg("round_robin"),
-        py::arg("num_remote_blocks_per_file"), py::arg("use_mmap") = false,
+        py::arg("num_lake_blocks_per_file"), py::arg("use_mmap") = false,
         py::arg("num_threads_per_file") = 16, py::arg("is_mla") = false);
 #endif
 #ifdef FLEXKV_ENABLE_GDS
@@ -571,9 +571,9 @@ PYBIND11_MODULE(c_ext, m) {
         "Call Pcfs::write from C++", py::arg("file_nodeid"), py::arg("offset"),
         py::arg("buffer"), py::arg("size"), py::arg("thread_id"));
 
-  m.def("shared_transfer_kv_blocks_remote_read",
-        &shared_transfer_kv_blocks_remote_read_binding,
-        "Shared transfer KV blocks from remote PCFS to CPU memory",
+  m.def("shared_transfer_kv_blocks_lake_read",
+        &shared_transfer_kv_blocks_lake_read_binding,
+        "Shared transfer KV blocks from the lake (PCFS) storage tier to CPU memory",
         py::arg("file_nodeid_list"), py::arg("cfs_blocks_partition_list"),
         py::arg("cpu_blocks_partition_list"), py::arg("cpu_layer_id_list"),
         py::arg("cpu_tensor_ptr"), py::arg("cpu_layer_stride_in_bytes"),

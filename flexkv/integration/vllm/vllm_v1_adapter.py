@@ -211,7 +211,7 @@ class FlexKVSchedulerConnector:
         # is the source of the duplicate-op_id KeyError under multi-DP. Set
         # FLEXKV_DISABLE_BATCH=1 to keep it off in the launcher script.
         self.enable_batch = (not self.cache_config.enable_kv_sharing
-                             and not self.cache_config.enable_remote
+                             and not self.cache_config.enable_lake
                              and not self.cache_config.enable_gds
                              and os.getenv("FLEXKV_DISABLE_BATCH", "0") != "1")
 

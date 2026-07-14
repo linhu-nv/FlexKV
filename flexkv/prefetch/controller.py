@@ -34,7 +34,7 @@ only needs the server_id):
   * tokens_per_block is recovered from the radix region itself
     (RadixClient.block_size()); no need to pass model KV geometry.
 
-This controller only does prefetch (SSD/Remote -> CPU, `ignore_gpu=True`), so it
+This controller only does prefetch (SSD/Lake -> CPU, `ignore_gpu=True`), so it
 never registers GPU blocks and never touches internal DP GPU memory.
 """
 from __future__ import annotations
@@ -67,7 +67,7 @@ class _PrefetchState:
 
 
 class PrefetchController:
-    """External SSD/Remote -> CPU prefetch driver over FlexKV's radix-shmem.
+    """External SSD/Lake -> CPU prefetch driver over FlexKV's radix-shmem.
 
     Attaches directly to the shared CPU (+ SSD) radix regions as RadixClients and
     hand-builds the DISK2H graph, submitting it to the shared TransferEngine over
@@ -300,7 +300,7 @@ class PrefetchController:
     def prefetch(self,
                  token_ids: np.ndarray,
                  namespace: Optional[List[str]] = None) -> int:
-        """Warm the KV for `token_ids` from SSD/Remote into CPU (ready state).
+        """Warm the KV for `token_ids` from SSD/Lake into CPU (ready state).
 
         Returns the task id. If nothing needs to be transferred (full CPU hit or
         no matched blocks to move), the task completes immediately and its id is

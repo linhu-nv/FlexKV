@@ -49,7 +49,7 @@ class HierarchyLRCacheEngine:
         self._meta: Optional[RedisMeta] = meta # todo: define storage type in meta
 
 
-        # belows are only for 3rd-party remote storage (like pcfs)
+        # belows are only for 3rd-party lake storage (like pcfs)
         # Mapping: node_id -> list of PCFS file_nodeids
         self.nid_to_file_nodeids: Dict[int, List[int]] = {}
         # Partition parameter used for mapping block_id to file index
@@ -102,7 +102,7 @@ class HierarchyLRCacheEngine:
         if self._meta is None:
             raise ValueError("RedisMeta is not provided; ensure from_cache_config stores it or pass it to start().")
         #TODO can we use like this to distinguish the different tree pairs?
-        if self.device_type == DeviceType.REMOTE:
+        if self.device_type == DeviceType.LAKE:
             local_ch_block_key = "PCFSB"
             remote_ch_block_key = "PCFSB"
         elif self.device_type == DeviceType.CPU:
@@ -116,7 +116,7 @@ class HierarchyLRCacheEngine:
         self.remote_ch = self._meta.get_redis_meta_channel(remote_ch_block_key)
         self.local_ch = self._meta.get_redis_meta_channel(local_ch_block_key)
                 # Load and store mapping of node_id -> file_nodeids from Redis
-        if self.device_type == DeviceType.REMOTE:
+        if self.device_type == DeviceType.LAKE:
             try:
                 self.nid_to_file_nodeids = self._meta.load_pcfs_file_nodeids()
             except Exception:
@@ -216,7 +216,7 @@ class HierarchyLRCacheEngine:
             if isinstance(nids, torch.Tensor) and nids.numel() > 0:
                 # For P2P mode (CPU/SSD), no PCFS conversion is needed
                 # Only convert to PCFS file_nodeids if device_type is REMOTE
-                if self.device_type == DeviceType.REMOTE:
+                if self.device_type == DeviceType.LAKE:
                     bnids_np = self.nodeids_to_file_nodeids(nids.cpu().numpy(), nps.cpu().numpy())
                     if bnids_np is None:
                         chosen = mr_local
@@ -286,11 +286,11 @@ class HierarchyLRCacheEngine:
             #check if file list is empty
             if not file_list:
                 return None
-            remote_file_num = len(file_list)
-            if remote_file_num <= 0:
+            lake_file_num = len(file_list)
+            if lake_file_num <= 0:
                 return None
             block_id = int(phys_np[i])
-            f_idx = (block_id // rr) % remote_file_num
+            f_idx = (block_id // rr) % lake_file_num
             out[i] = np.uint32(file_list[f_idx])
         return out
     #match local will only be called for put
@@ -453,16 +453,16 @@ class HierarchyLRCacheEngine:
     def pcfs_ce_from_cache_config(cls, cache_config: "CacheConfig", node_id: int, meta: Optional[RedisMeta] = None) -> "HierarchyLRCacheEngine":
         """Create a PCFSCacheEngine from CacheConfig.
 
-        This replaces RemotePCFSCacheEngine. It wires both local and remote
+        This replaces LakePCFSCacheEngine. It wires both local and remote
         radix trees using parameters from CacheConfig and the provided node_id.
         """
-        num_blocks = int(cache_config.num_remote_blocks or 0)
+        num_blocks = int(cache_config.num_lake_blocks or 0)
 
-        # 1) Generate unique remote_file_prefix using uuid and build remote_cache_path
-        if cache_config.remote_file_prefix is None:
-            raise ValueError("remote_file_prefix must be provided in CacheConfig when enable_remote is True")
-        if cache_config.remote_file_num is None or cache_config.remote_file_num <= 0:
-            raise ValueError("remote_file_num must be a positive integer in CacheConfig when enable_remote is True")
+        # 1) Generate unique lake_file_prefix using uuid and build lake_cache_path
+        if cache_config.lake_file_prefix is None:
+            raise ValueError("lake_file_prefix must be provided in CacheConfig when enable_lake is True")
+        if cache_config.lake_file_num is None or cache_config.lake_file_num <= 0:
+            raise ValueError("lake_file_num must be a positive integer in CacheConfig when enable_lake is True")
 
         # Prefer uuid from RedisMeta to ensure cluster-wide uniqueness, fallback to Python uuid if meta is None
         try:
@@ -470,18 +470,18 @@ class HierarchyLRCacheEngine:
         except Exception:
             unique_suffix = __import__("uuid").uuid4().hex
 
-        new_prefix = f"{cache_config.remote_file_prefix}_{unique_suffix}"
-        cache_config.remote_file_prefix = new_prefix
-        cache_config.remote_cache_path = [
-            f"{cache_config.remote_file_prefix}_{i}" for i in range(cache_config.remote_file_num)
+        new_prefix = f"{cache_config.lake_file_prefix}_{unique_suffix}"
+        cache_config.lake_file_prefix = new_prefix
+        cache_config.lake_cache_path = [
+            f"{cache_config.lake_file_prefix}_{i}" for i in range(cache_config.lake_file_num)
         ]
 
         # 2) Create PCFS instance and lookup/create files to collect nodeids
-        remote_cfg = cache_config.remote_config_custom or {}
-        pcfs_fsid = remote_cfg.get("pcfs_fsid")
-        pcfs_port = remote_cfg.get("pcfs_port")
-        pcfs_ip = remote_cfg.get("pcfs_ip")
-        pcfs_parent_nodeid = remote_cfg.get("pcfs_parent_nodeid")
+        lake_cfg = cache_config.lake_config_custom or {}
+        pcfs_fsid = lake_cfg.get("pcfs_fsid")
+        pcfs_port = lake_cfg.get("pcfs_port")
+        pcfs_ip = lake_cfg.get("pcfs_ip")
+        pcfs_parent_nodeid = lake_cfg.get("pcfs_parent_nodeid")
         if None in (pcfs_fsid, pcfs_port, pcfs_ip, pcfs_parent_nodeid):
             raise ValueError("Some required PCFS config fields are missing: pcfs_fsid, pcfs_port, pcfs_ip, pcfs_parent_nodeid")
 
@@ -493,20 +493,20 @@ class HierarchyLRCacheEngine:
         # Derive file size if available; otherwise, use 0 when not provided (only lookup or create placeholder)
         # Prefer explicit file_size mode
         file_size = 0
-        if getattr(cache_config, "remote_cache_size_mode", "file_size") == "file_size":
-            file_size = int(cache_config.remote_file_size or 0)
+        if getattr(cache_config, "lake_cache_size_mode", "file_size") == "file_size":
+            file_size = int(cache_config.lake_file_size or 0)
 
-        for remote_path in cache_config.remote_cache_path:
-            nodeid = pcfs.lookup_or_create_file(remote_path, file_size, True)
+        for lake_path in cache_config.lake_cache_path:
+            nodeid = pcfs.lookup_or_create_file(lake_path, file_size, True)
             if nodeid == 0:
-                raise ValueError(f"lookup or create file failed for file: {remote_path}")
+                raise ValueError(f"lookup or create file failed for file: {lake_path}")
             node_ids.append(int(nodeid))
 
         # 3) Register nodeids into Redis for discovery
         if meta is not None:
             meta.add_node_ids(node_ids)
 
-        # Set global pcfs instance for subsequent C++ remote transfers
+        # Set global pcfs instance for subsequent C++ lake transfers
         try:
             c_ext.set_pcfs_instance(pcfs)
         except Exception:
@@ -516,7 +516,7 @@ class HierarchyLRCacheEngine:
             num_total_blocks=num_blocks,
             tokens_per_block=int(cache_config.tokens_per_block),
             evict_ratio=float(cache_config.evict_ratio),
-            device_type=DeviceType.REMOTE,
+            device_type=DeviceType.LAKE,
             local_lease_ttl_ms=int(GLOBAL_CONFIG_FROM_ENV.lease_ttl_ms),
             local_renew_lease_ms=int(GLOBAL_CONFIG_FROM_ENV.renew_lease_ms),
             local_refresh_batch_size=int(GLOBAL_CONFIG_FROM_ENV.refresh_batch_size),
@@ -535,7 +535,7 @@ class HierarchyLRCacheEngine:
     @classmethod
     def from_cache_config(cls, cache_config: "CacheConfig", node_id: int, device_type: DeviceType, meta: Optional[RedisMeta] = None) -> "HierarchyLRCacheEngine":
 
-        if device_type == DeviceType.REMOTE:
+        if device_type == DeviceType.LAKE:
             return cls.pcfs_ce_from_cache_config(cache_config, node_id, meta)
         else:
             # select correct blocks configuration based on device_type
@@ -558,7 +558,7 @@ class HierarchyLRCacheEngine:
                 local_refresh_batch_size=int(GLOBAL_CONFIG_FROM_ENV.refresh_batch_size),
                 local_idle_sleep_ms=int(GLOBAL_CONFIG_FROM_ENV.idle_sleep_ms),
                 # local_lt_pool_initial_capacity=int(getattr(cache_config, "lt_pool_initial_capacity", 0)),
-                remote_max_num_blocks=int(cache_config.num_remote_blocks or 0),
+                remote_max_num_blocks=int(cache_config.num_lake_blocks or 0),
                 redis_node_id=int(node_id),
                 # remote_node_id=int(node_id),
                 # remote_lt_pool_initial_capacity=int(getattr(cache_config, "lt_pool_initial_capacity", 0)),
