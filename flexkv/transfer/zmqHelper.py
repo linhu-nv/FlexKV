@@ -34,7 +34,7 @@ class NotifyMsg:
 
 
 class SSDZMQServer:
-    def __init__(self, ip: str, port: int, ssd_handle_loop = None):
+    def __init__(self, ip: str, port: int, ssd_handle_loop = None, auto_start: bool = True):
         if ssd_handle_loop is None:
             raise ValueError("ssd_handle_loop must be provided externally")
 
@@ -47,7 +47,11 @@ class SSDZMQServer:
         self.shutdown_event = threading.Event()
         self.ssd_handle_loop = ssd_handle_loop
         self.thread = threading.Thread(target=self.ssd_handle_loop, daemon=True)
-        self.start()
+        # auto_start=False lets the caller finish assigning `self.zmq_server` (which
+        # the handler loop references) BEFORE the handler thread is started, avoiding
+        # an AttributeError race in the loop's first iteration.
+        if auto_start:
+            self.start()
         print(f"[Server] Listening on {self.meta_addr}")
 
     def get_addr(self):

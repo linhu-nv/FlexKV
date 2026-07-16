@@ -120,7 +120,7 @@ class TransferEngine:
         self._ssd_handle = ssd_handle
         self._lake_handle = lake_handle
         self._cache_config = cache_config
-        self._enable_pcfs_sharing = GLOBAL_CONFIG_FROM_ENV.index_accel and cache_config.enable_kv_sharing # TODO: is this correct?
+        self._enable_pcfs_sharing = cache_config.enable_kv_sharing
 
         self.pin_buffer = SharedOpPool(2048, self.cache_config.num_cpu_blocks)
 

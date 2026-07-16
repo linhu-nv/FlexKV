@@ -1,21 +1,23 @@
 import random
 import time
-from typing import Union
+import types
 
 import pytest
 import numpy as np
 
 from flexkv.cache.mempool import Mempool
-from flexkv.cache.cache_engine import CacheEngine, CacheEngineAccel
+from flexkv.cache.cache_engine import CacheEngineAccel, GlobalCacheEngine, DEFAULT_CACHE_STRATEGY
 from flexkv.common.transfer import DeviceType
 from flexkv.common.block import SequenceMeta
+from flexkv.common.config import CacheConfig, UserConfig
+from flexkv.common.type import MatchResultAccel
 
-CacheEngineType = Union[CacheEngine, CacheEngineAccel]
+CacheEngineType = CacheEngineAccel
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-ENGINE_CLASSES = [CacheEngine, CacheEngineAccel]
+ENGINE_CLASSES = [CacheEngineAccel]
 
 DEFAULT_NUM_TOTAL_BLOCKS = 64
 DEFAULT_TOKENS_PER_BLOCK = 4
@@ -283,7 +285,7 @@ def test_take_and_recycle(cache_engine: CacheEngineType):
     token_ids = np.random.randint(0, 10000, (seq_blocks * tokens_per_block,), dtype=np.int64)
     sequence_meta = SequenceMeta(token_ids=token_ids, tokens_per_block=tokens_per_block)
     physical_blocks = cache_engine.take(seq_blocks)
-    radixnode = cache_engine.insert(sequence_meta, physical_blocks, is_ready=True)
+    radixnode, _ = cache_engine.insert(sequence_meta, physical_blocks, is_ready=True)
     assert cache_engine.index.total_cached_blocks() == seq_blocks
 
     # take(0) should return an empty array
@@ -348,7 +350,7 @@ def test_cleanup(cache_engine: CacheEngineType):
 
     # Insert first sequence (all unready)
     num_insert_blocks0 = sequence_meta_list[0].num_blocks
-    radixnode0 = cache_engine.insert(
+    radixnode0, _ = cache_engine.insert(
         sequence_meta_list[0],
         np.arange(num_insert_blocks0, dtype=np.int64),
         is_ready=False,
@@ -359,7 +361,7 @@ def test_cleanup(cache_engine: CacheEngineType):
     # Insert second sequence (shares prefix with first)
     match_result = cache_engine.match(sequence_meta_list[1])
     num_insert_blocks1 = sequence_meta_list[1].num_blocks - match_result.num_matched_blocks
-    radixnode1 = cache_engine.insert(
+    radixnode1, _ = cache_engine.insert(
         sequence_meta_list[1],
         np.arange(num_insert_blocks1, dtype=np.int64),
         match_result=match_result,
@@ -371,7 +373,7 @@ def test_cleanup(cache_engine: CacheEngineType):
     # Insert third sequence (shares prefix with first)
     match_result = cache_engine.match(sequence_meta_list[2])
     num_insert_blocks2 = sequence_meta_list[2].num_blocks - match_result.num_matched_blocks
-    radixnode2 = cache_engine.insert(
+    radixnode2, _ = cache_engine.insert(
         sequence_meta_list[2],
         np.arange(num_insert_blocks2, dtype=np.int64),
         match_result=match_result,
@@ -1090,3 +1092,60 @@ def test_slru_all_protected_falls_back_to_lru(engine_cls):
     assert result['C'] == 1, f"C should survive, got result: {result}"
     assert result['D'] == 1, f"D should survive, got result: {result}"
     assert result['E'] == 1, f"E should survive, got result: {result}"
+
+
+# ---------------------------------------------------------------------------
+# Tests – GlobalCacheEngine.match_with_lake local CPU/SSD dispatch
+# ---------------------------------------------------------------------------
+class _RecordingEngine:
+    """Fake device engine recording which match variant was invoked."""
+
+    def __init__(self):
+        self.calls = []
+
+    def match(self, sequence_meta):
+        self.calls.append('match')
+        return MatchResultAccel()
+
+    def match_local(self, sequence_meta):
+        self.calls.append('match_local')
+        return MatchResultAccel()
+
+    def match_all(self, sequence_meta):
+        self.calls.append('match_all')
+        return MatchResultAccel()
+
+
+def _run_match_with_lake(is_get: bool):
+    """Return the CPU/SSD match variants used by the Lake path."""
+    cpu, ssd = _RecordingEngine(), _RecordingEngine()
+    fake = types.SimpleNamespace(
+        cpu_cache_engine=cpu,
+        ssd_cache_engine=ssd,
+        lake_cache_engine=None,
+        enable_kv_sharing=False,
+        cache_config=types.SimpleNamespace(
+            enable_p2p_cpu=False,
+            enable_p2p_ssd=False,
+        ),
+    )
+    GlobalCacheEngine.match_with_lake(
+        fake, None, temp_cache_strategy=DEFAULT_CACHE_STRATEGY, is_put=not is_get)
+    return cpu.calls[0], ssd.calls[0]
+
+
+@pytest.mark.parametrize("is_get", [False, True])
+def test_match_with_lake_uses_local_cpu_and_ssd_engines(is_get):
+    assert _run_match_with_lake(is_get) == ('match', 'match')
+
+
+@pytest.mark.parametrize("p2p_field", ["enable_p2p_cpu", "enable_p2p_ssd"])
+def test_cache_config_rejects_lake_with_p2p(p2p_field):
+    with pytest.raises(ValueError, match="Lake cannot be enabled together with P2P"):
+        CacheConfig(enable_3rd_lake=True, **{p2p_field: True})
+
+
+@pytest.mark.parametrize("p2p_field", ["enable_p2p_cpu", "enable_p2p_ssd"])
+def test_user_config_rejects_lake_with_p2p(p2p_field):
+    with pytest.raises(ValueError, match="Lake cannot be enabled together with P2P"):
+        UserConfig(enable_3rd_lake=True, **{p2p_field: True})

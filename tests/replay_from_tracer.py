@@ -101,7 +101,7 @@ class FlexKVReplayEngine:
                 GLOBAL_CONFIG_FROM_ENV.gds_layout_type = self._parse_layout_type(global_config_data['gds_layout_type'])
 
             # Restore other configs
-            for key in ['server_client_mode', 'index_accel', 'use_ce_transfer_h2d', 'use_ce_transfer_d2h',
+            for key in ['server_client_mode', 'use_ce_transfer_h2d', 'use_ce_transfer_d2h',
                        'transfer_num_cta_h2d', 'transfer_num_cta_d2h', 'iouring_entries', 'iouring_flags',
                        'max_file_size_gb', 'evict_ratio', 'server_recv_port']:
                 if key in global_config_data:

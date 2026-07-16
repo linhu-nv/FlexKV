@@ -1981,7 +1981,12 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             )
 
             ## start the zmq server and client
-            self.zmq_server = SSDZMQServer(cache_config.local_zmq_ip, cache_config.local_zmq_port, self.ssd_handle_loop)
+            # auto_start=False: the handler loop (ssd_handle_loop) references
+            # self.zmq_server, which is only assigned once this constructor call
+            # returns. Start the server thread explicitly at the end of __init__,
+            # after every attribute it touches has been set.
+            self.zmq_server = SSDZMQServer(cache_config.local_zmq_ip, cache_config.local_zmq_port,
+                                           self.ssd_handle_loop, auto_start=False)
             self.zmq_client = SSDZMQClient(cache_config.local_zmq_ip, cache_config.local_zmq_port+1)
 
             ## ssd copy to temp cpu buffer related
@@ -2042,6 +2047,11 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         ## unique task id counter for remote ssd to cpu transfer task
         self.remote_ssd_task_id_counter = 0
         self.task_id_lock = threading.Lock()
+
+        # All attributes the handler loop references are now set; start the zmq
+        # staging server thread (created with auto_start=False to avoid the race).
+        if self.cache_config.enable_p2p_ssd:
+            self.zmq_server.start()
 
     #============================ common part ========================
     def gen_task_id(self) -> int:

@@ -220,9 +220,9 @@ class LocalRadixTree:
     def set_ready(self, node: "CRadixNode", ready: bool = True, ready_length: int = -1) -> None:
         self._c.set_ready(node, bool(ready), int(ready_length))
 
-    def insert(self, physical_block_ids: torch.Tensor, block_hashes: torch.Tensor, 
-               num_blocks: int, num_insert_blocks: int = -1, ready: bool = True, 
-               node: "CRadixNode" = None, num_matched_blocks: int = -1, 
+    def insert(self, physical_block_ids: torch.Tensor, block_hashes: torch.Tensor,
+               num_blocks: int, num_insert_blocks: int = -1, ready: bool = True,
+               node: Optional["CRadixNode"] = None, num_matched_blocks: int = -1,
                last_node_matched_length: int = -1) -> "CRadixNode":
         """Insert blocks into the LocalRadixTree.
         

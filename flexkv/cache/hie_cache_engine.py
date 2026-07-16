@@ -1,13 +1,13 @@
-from typing import Optional, Tuple, TYPE_CHECKING, List, Dict
+from typing import Optional, Tuple, TYPE_CHECKING, List, Dict, Union
 
 import numpy as np
 import torch
+from numpy import ndarray
 
 from flexkv.c_ext import CRadixNode
 from flexkv import c_ext
 from flexkv.cache.mempool import Mempool
 from flexkv.cache.radix_remote import LocalRadixTree, DistributedRadixTree
-from flexkv.cache.redis_meta import RedisMetaChannel as _PyRedisMetaChannel
 from flexkv.cache.redis_meta import RedisMeta
 from flexkv.common.block import SequenceMeta
 #if TYPE_CHECKING:
@@ -316,10 +316,10 @@ class HierarchyLRCacheEngine:
 
     def insert(self,
                sequence_meta: SequenceMeta,
-               physical_block_ids: torch.Tensor,
+               physical_block_ids: Union[np.ndarray, torch.Tensor],
                num_insert_blocks: int = -1,
                is_ready: bool = True,
-               match_result: Optional[MatchResultAccel] = None) -> Optional[CRadixNode]:
+               match_result: Optional[MatchResultAccel] = None) -> Tuple[Optional[CRadixNode], np.ndarray]:
         sequence_meta.gen_hashes()
         phys_t = torch.from_numpy(physical_block_ids).to(torch.int64) if isinstance(physical_block_ids, np.ndarray) else physical_block_ids.to(torch.int64)
         hashes_t = torch.from_numpy(sequence_meta.block_hashes).to(torch.int64)
@@ -329,13 +329,20 @@ class HierarchyLRCacheEngine:
                 phys_t, hashes_t, int(sequence_meta.num_blocks), int(num_insert_blocks), bool(is_ready)
             )
         else:
+            # match_result carries a RadixNodeLike; this engine's tree is a
+            # LocalRadixTree keyed on CRadixNode. A hie match always yields
+            parent = match_result.last_node
+            assert parent is None or isinstance(parent, CRadixNode)
             node = self.local_index.insert(
                 phys_t, hashes_t, int(sequence_meta.num_blocks), int(num_insert_blocks), bool(is_ready),
-                match_result.last_node, int(match_result.num_matched_blocks), int(match_result.last_node_matched_length)
+                parent,
+                int(match_result.num_matched_blocks), int(match_result.last_node_matched_length)
             )
         # NOTE: Do NOT lock the node here, because the caller (put() method) will lock it
         # The node will be unlocked in _transfer_callback after data transfer completes
-        return node
+        # Return (node, unused_slots) for API parity with the other engines; the
+        # in-process index has no cross-process race, so unused_slots is empty.
+        return node, np.array([], dtype=np.int64)
 
     def lock_node(self, node: CRadixNode) -> None:
         if node is None:
@@ -402,7 +409,7 @@ class HierarchyLRCacheEngine:
     def take(self,
              num_required_blocks: int,
              protected_node: Optional[CRadixNode] = None,
-             strict: bool = True) -> torch.Tensor:
+             strict: bool = True) -> ndarray:
         # Calculate current utilization
         utilization = (self.mempool.num_total_blocks - self.mempool.num_free_blocks) / self.mempool.num_total_blocks if self.mempool.num_total_blocks > 0 else 0
         

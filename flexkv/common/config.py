@@ -39,8 +39,7 @@ class CacheConfig:
     enable_nixl: bool = False
     # Optional plugin dict for NixlAgentSession (see nixl README); only used if enable_nixl.
     nixl_extra_config: Optional[Dict[str, Any]] = None
-    enable_lake: bool = False # used for indicating whether the 3rd-party lake storage is enabled
-                                # has nothing to do with whether the p2p_cpu and p2p_ssd are supported
+    enable_lake: bool = False # derived from enable_3rd_lake; mutually exclusive with CPU/SSD P2P
     enable_kv_sharing: bool = False # pcfs_sharing or p2p_cpu or p2p_ssd or p2p_3rd_lake
     enable_p2p_cpu: bool = False
     enable_p2p_ssd: bool = False
@@ -87,6 +86,13 @@ class CacheConfig:
         self.enable_kv_sharing = self.enable_p2p_cpu or \
             self.enable_p2p_ssd or self.enable_3rd_lake
         self.enable_lake = self.enable_3rd_lake
+        self.validate_lake_p2p_exclusive()
+
+    def validate_lake_p2p_exclusive(self) -> None:
+        if self.enable_lake and (self.enable_p2p_cpu or self.enable_p2p_ssd):
+            raise ValueError(
+                "Lake cannot be enabled together with P2P CPU or P2P SSD"
+            )
 
 GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     # Multi-instance configuration
@@ -118,7 +124,6 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     # the single TE via channel_ids in [total_clients, total_clients + extra).
     num_extra_te_channels=int(os.getenv('FLEXKV_NUM_EXTRA_TE_CHANNELS', 1)),
 
-    index_accel=bool(int(os.getenv('FLEXKV_INDEX_ACCEL', 1))),
     cpu_layout_type=KVCacheLayoutType(os.getenv('FLEXKV_CPU_LAYOUT', 'BLOCKFIRST').upper()),
     ssd_layout_type=KVCacheLayoutType(os.getenv('FLEXKV_SSD_LAYOUT', 'BLOCKFIRST').upper()),
     lake_layout_type=KVCacheLayoutType(os.getenv('FLEXKV_LAKE_LAYOUT', 'BLOCKFIRST').upper()),
@@ -187,6 +192,10 @@ class UserConfig:
         if self.ssd_cache_gb > 0 and self.ssd_cache_gb <= self.cpu_cache_gb:
             raise ValueError(f"Invalid ssd_cache_gb: {self.ssd_cache_gb}, "
                              f"must be greater than cpu_cache_gb: {self.cpu_cache_gb}.")
+        if self.enable_3rd_lake and (self.enable_p2p_cpu or self.enable_p2p_ssd):
+            raise ValueError(
+                "Lake cannot be enabled together with P2P CPU or P2P SSD"
+            )
 
 def parse_path_list(path_str: str) -> List[str]:
     paths = [p.strip() for p in path_str.split(';') if p.strip()]
@@ -258,6 +267,7 @@ def update_default_config_from_user_config(model_config: ModelConfig,
                                       cache_config.enable_p2p_ssd or
                                       cache_config.enable_3rd_lake)
     cache_config.enable_lake = cache_config.enable_3rd_lake
+    cache_config.validate_lake_p2p_exclusive()
 
     if cache_config.num_ssd_blocks % len(cache_config.ssd_cache_dir) != 0:
         cache_config.num_ssd_blocks = \

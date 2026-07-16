@@ -117,7 +117,6 @@ class FlexKVTracer:
             "enable_ssd": cache_config.enable_ssd,
             "enable_lake": cache_config.enable_lake,
             "enable_gds": cache_config.enable_gds,
-            "lake_cache_size_mode": cache_config.lake_cache_size_mode,
             "num_cpu_blocks": cache_config.num_cpu_blocks,
             "num_ssd_blocks": cache_config.num_ssd_blocks,
             "num_gds_blocks": cache_config.num_gds_blocks,
@@ -137,7 +136,6 @@ class FlexKVTracer:
         global_config_dict = {
             "server_client_mode": GLOBAL_CONFIG_FROM_ENV.server_client_mode,
             "server_recv_port": GLOBAL_CONFIG_FROM_ENV.server_recv_port,
-            "index_accel": GLOBAL_CONFIG_FROM_ENV.index_accel,
             "cpu_layout_type": str(GLOBAL_CONFIG_FROM_ENV.cpu_layout_type),
             "ssd_layout_type": str(GLOBAL_CONFIG_FROM_ENV.ssd_layout_type),
             "lake_layout_type": str(GLOBAL_CONFIG_FROM_ENV.lake_layout_type),
