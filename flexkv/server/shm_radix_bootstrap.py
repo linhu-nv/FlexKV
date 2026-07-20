@@ -7,10 +7,12 @@ region. The first DP process (instance 0, dp_client_id 0) creates the regions
 via `shmradix.RadixServer`; all others attach via `shmradix.RadixClient`.
 
 Naming convention:
-    /flexkv_radix_{server_id}_{cpu|ssd|lake}
+    /flexkv_radix_{namespace}_{cpu|ssd|lake}[_{rank}]
 
-`server_id` defaults to a fixed token but is overridable so multiple FlexKV
-instances on the same host don't collide.
+`namespace` is `cluster_id` when set (shared by all peer ranks of a cross-node
+cluster), otherwise `server_id`. `server_id` defaults to a fixed token but is
+overridable so multiple FlexKV instances on the same host don't collide. The
+`_{rank}` suffix is appended only when `world_size > 1`.
 """
 from __future__ import annotations
 
@@ -35,10 +37,27 @@ _DEVICE_KIND_NAMES = {
 }
 
 
-def shm_name_for(device_type: DeviceType, server_id: str) -> str:
+def shm_radix_prefix(device_type: DeviceType,
+                     server_id: str,
+                     cluster_id: str | None = None) -> str:
+    """The shm-name prefix shared by a region's owner and its clients.
+
+    The per-rank ``_{rank}`` suffix (added when ``world_size > 1``) is appended
+    by the caller; ``RadixServer`` appends it to this prefix on the owner side.
+    """
+    namespace = cluster_id if cluster_id is not None else server_id
+    return f"/flexkv_radix_{namespace}_{_DEVICE_KIND_NAMES[device_type]}"
+
+
+def shm_name_for(device_type: DeviceType,
+                 server_id: str,
+                 *,
+                 rank: int = 0,
+                 world_size: int = 1,
+                 cluster_id: str | None = None) -> str:
     """POSIX shm name for the radix region of one device type."""
-    kind = _DEVICE_KIND_NAMES[device_type]
-    return f"/flexkv_radix_{server_id}_{kind}"
+    prefix = shm_radix_prefix(device_type, server_id, cluster_id)
+    return f"{prefix}_{rank}" if world_size > 1 else prefix
 
 
 def device_blocks_from_config(device_type: DeviceType,
@@ -85,6 +104,14 @@ class ShmRadixOwners:
 def create_shm_radix_regions(model_config: ModelConfig,
                              cache_config: CacheConfig,
                              server_id: str,
+                             cluster_id: str | None = None,
+                             rank: int = 0,
+                             world_size: int = 1,
+                             master_addr: str = "127.0.0.1",
+                             master_port: int = 18500,
+                             rdma_dev: str = "",
+                             gid_idx: int = 3,
+                             bootstrap_timeout_sec: int = 120,
                              data_pool_ratio: int = 8,
                              evict_ratio: float = 0.05,
                              background_evict: bool = True) -> ShmRadixOwners:
@@ -111,17 +138,43 @@ def create_shm_radix_regions(model_config: ModelConfig,
             evict_ratio=evict_ratio,
             background_evict=background_evict,
         )
-        name = shm_name_for(dt, server_id)
+        name = shm_name_for(
+            dt, server_id, rank=rank, world_size=world_size,
+            cluster_id=cluster_id,
+        )
         flexkv_logger.info(
             f"creating shm radix region {name} "
             f"(max_nodes={cfg.max_nodes}, max_blocks={cfg.max_blocks})"
         )
-        owners.add(dt, shmradix.RadixServer(name, cfg))
+        if world_size > 1:
+            server_cfg = shmradix.RadixServerConfig()
+            # RadixServer appends _<rank> to this prefix.
+            server_cfg.name = shm_radix_prefix(dt, server_id, cluster_id)
+            server_cfg.shm = cfg
+            server_cfg.rank = rank
+            server_cfg.world_size = world_size
+            server_cfg.master_addr = master_addr
+            # Each tier bootstraps an independent cluster.
+            server_cfg.master_port = master_port + int(dt)
+            server_cfg.rdma_dev = rdma_dev
+            server_cfg.gid_idx = gid_idx
+            server_cfg.bootstrap_timeout_sec = bootstrap_timeout_sec
+            server = shmradix.RadixServer(server_cfg)
+            if not server.bootstrap():
+                raise RuntimeError(
+                    f"radixshmem bootstrap failed for {name}"
+                )
+        else:
+            server = shmradix.RadixServer(name, cfg)
+        owners.add(dt, server)
     return owners
 
 
 def attach_shm_radix_clients(cache_config: CacheConfig,
                              server_id: str,
+                             cluster_id: str | None = None,
+                             rank: int = 0,
+                             world_size: int = 1,
                              wait_timeout_s: float = 60.0):
     """Attach a RadixClient per enabled device type. Polls until the owner
     has created the shm files (since multiple processes may race startup)."""
@@ -134,7 +187,10 @@ def attach_shm_radix_clients(cache_config: CacheConfig,
     while pending and time.monotonic() < deadline:
         next_pending = []
         for dt in pending:
-            name = shm_name_for(dt, server_id)
+            name = shm_name_for(
+                dt, server_id, rank=rank, world_size=world_size,
+                cluster_id=cluster_id,
+            )
             shm_path = f"/dev/shm{name}"
             if not os.path.exists(shm_path):
                 next_pending.append(dt)
@@ -148,7 +204,13 @@ def attach_shm_radix_clients(cache_config: CacheConfig,
         if pending:
             time.sleep(0.01)
     if pending:
-        names = [shm_name_for(dt, server_id) for dt in pending]
+        names = [
+            shm_name_for(
+                dt, server_id, rank=rank, world_size=world_size,
+                cluster_id=cluster_id,
+            )
+            for dt in pending
+        ]
         raise TimeoutError(
             f"Timed out attaching to shm radix regions: {names}"
         )

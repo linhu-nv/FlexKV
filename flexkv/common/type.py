@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Optional, Protocol, TypeVar, TYPE_CHECKING
 import numpy as np
 
@@ -20,8 +21,23 @@ class RadixNodeLike(Protocol):
 NodeT = TypeVar("NodeT", bound=RadixNodeLike)
 
 
+class CacheLocality(str, Enum):
+    LOCAL = "local"
+    PEER = "peer"
+
+
 @dataclass
 class MatchResultAccel:
+    """A single-locality prefix match against one cache tier's index.
+
+    ``physical_blocks[i]`` is the block that serves logical position ``i`` of
+    the queried sequence.  ``block_node_ids[i]`` (when present) names the
+    source that owns block ``i`` — a peer node id for a PEER match, or a PCFS
+    file node id for a Lake match.  A tier match is expressed as a
+    ``MatchResult`` pairing the LOCAL hit with an optional peer (remote) hit
+    that extends it; each side is one of these objects.
+    """
+
     num_ready_matched_blocks: int = 0
     num_matched_blocks: int = 0
     last_ready_node: Optional["RadixNodeLike"] = None
@@ -29,9 +45,6 @@ class MatchResultAccel:
     last_node_matched_length: int = 0
     physical_blocks: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
     block_node_ids: Optional[np.ndarray] = None
-    matched_pos: Optional[str] = None
-    matched_node_ids: Optional[np.ndarray] = None #TODO id or ids? should we allow one req match results on multiple nodes?
-    insert_to_local_cpu_index: bool = True
     # Set by backends whose `match()` performs an atomic inc_ref to protect the
     # matched slots from eviction between the read and the consuming transfer
     # (e.g. CacheEngineRadixShmem with lock=True). The cache_engine layer is
@@ -43,6 +56,28 @@ class MatchResultAccel:
 
     def __post_init__(self) -> None:
         assert self.physical_blocks.ndim == 1
+
+
+@dataclass
+class MatchResult:
+    """Unified result of a tier match: the local prefix hit plus an optional
+    peer (remote) hit that continues it.
+
+    ``remote`` is ``None`` when the tier has no peer index or peer matching was
+    not requested (e.g. PUT).  When present, ``remote`` covers a ready prefix
+    that reaches at least as far as ``local`` and whose ``physical_blocks`` /
+    ``block_node_ids`` describe the peer source for every logical position
+    beyond ``local.num_ready_matched_blocks``.
+    """
+
+    local: MatchResultAccel
+    remote: Optional[MatchResultAccel] = None
+
+    @property
+    def peer_ready(self) -> int:
+        """Ready prefix length reachable once the peer suffix is included."""
+        base = self.local.num_ready_matched_blocks
+        return max(base, self.remote.num_ready_matched_blocks) if self.remote else base
 
 
 class CacheEngineLike(Protocol[NodeT]):
@@ -58,7 +93,11 @@ class CacheEngineLike(Protocol[NodeT]):
     flagging those accesses is expected."""
 
     def reset(self) -> None: ...
-    def match(self, sequence_meta: "SequenceMeta") -> MatchResultAccel: ...
+    def match(self,
+              sequence_meta: "SequenceMeta",
+              *,
+              with_peer: bool = ...,
+              gpu_matched_blocks: int = ...) -> MatchResult: ...
     def insert(self,
                sequence_meta: "SequenceMeta",
                physical_block_ids: np.ndarray,

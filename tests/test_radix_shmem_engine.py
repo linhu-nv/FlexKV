@@ -89,7 +89,7 @@ def test_take_insert_match_recycle():
 
     seq = FakeSeq(block_hashes=_hashes(seed=1, num=4))
     # Initial match: nothing.
-    r = engine.match(seq)
+    r = engine.match(seq).local
     assert r.num_matched_blocks == 0
 
     # take 4 slots and insert.
@@ -101,7 +101,7 @@ def test_take_insert_match_recycle():
     assert len(unused) == 0  # all 4 supplied slots consumed
 
     # Match should now hit all 4 blocks.
-    r2 = engine.match(seq)
+    r2 = engine.match(seq).local
     assert r2.num_matched_blocks == 4
     assert r2.num_ready_matched_blocks == 4
     np.testing.assert_array_equal(np.sort(r2.physical_blocks), np.sort(slots))
@@ -126,7 +126,7 @@ def test_match_unready_prefix():
     node, _unused = engine.insert(seq, slots, is_ready=False)
     assert node is not None
 
-    r = engine.match(seq)
+    r = engine.match(seq).local
     assert r.num_matched_blocks == 6
     # Whole node is unready, so the ready prefix is 0.
     assert r.num_ready_matched_blocks == 0
@@ -140,7 +140,7 @@ def test_match_unready_prefix():
     # Flip ready via the inserted node's armed finalize (set_ready + dec_ref).
     engine.set_ready(node, True, node.size())
     engine.unlock(node)
-    r2 = engine.match(seq)
+    r2 = engine.match(seq).local
     assert r2.num_ready_matched_blocks == 6
     engine.unlock(r2.pre_locked_node)
 
@@ -162,7 +162,7 @@ def test_lock_prevents_eviction():
     assert len(drained) == free_now
 
     # Original sequence still matchable.
-    r = engine.match(seq)
+    r = engine.match(seq).local
     assert r.num_matched_blocks == 10
     assert r.num_ready_matched_blocks == 10
     engine.unlock(r.pre_locked_node)
@@ -207,10 +207,76 @@ def test_prefix_match_returns_unused_slots():
     engine.recycle(unused2)
 
     # seq2 fully matches now.
-    r = engine.match(seq2)
+    r = engine.match(seq2).local
     assert r.num_ready_matched_blocks == 4
     engine.unlock(r.pre_locked_node)
 
+
+def test_distributed_match_combines_local_and_single_peer():
+    class Finalize:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self):
+            self.calls += 1
+
+    class QueryResult:
+        total_hit_length = 4
+        ready_prefix_len = 4
+        local_hit_length = 2
+        ready_prefix_slots = np.array([10, 11], dtype=np.int32)
+        remote_node_id = 1
+        remote_slots = np.array([20, 21], dtype=np.int32)
+
+        def __init__(self):
+            self.finalize = Finalize()
+
+    class Tree:
+        def __init__(self):
+            self.result = QueryResult()
+            self.local_only = None
+
+        def query(self, hashes, *, local_only, lock, update_meta):
+            self.local_only = local_only
+            assert lock and update_meta
+            return self.result
+
+    class RedisMeta:
+        def resolve_radix_rank(self, cluster_id, rank):
+            assert cluster_id == "test-cluster"
+            assert rank == 1
+            return 42
+
+    engine = CacheEngineRadixShmem.__new__(CacheEngineRadixShmem)
+    engine._tree = Tree()
+    engine.peer_enabled = True
+    engine._redis_meta = RedisMeta()
+    engine._radix_cluster_id = "test-cluster"
+    engine._peer_node_ids = {}
+
+    seq = FakeSeq(block_hashes=_hashes(seed=9, num=4))
+    result = engine.match(seq)
+
+    assert engine._tree.local_only is False
+    # LOCAL side is the local prefix; PEER side is the peer-inclusive view whose
+    # [local_ready, ready) tail carries the peer slots and owning node id.
+    np.testing.assert_array_equal(result.local.physical_blocks, [10, 11])
+    assert result.local.num_ready_matched_blocks == 2
+    assert result.remote is not None
+    np.testing.assert_array_equal(
+        result.remote.physical_blocks, [10, 11, 20, 21]
+    )
+    np.testing.assert_array_equal(
+        result.remote.block_node_ids, [-1, -1, 42, 42]
+    )
+    assert result.remote.num_ready_matched_blocks == 4
+    assert engine._tree.result.finalize.calls == 0
+
+    # The single query guard lives on the peer side and owns both local and
+    # remote refs until the graph callback releases it.
+    assert result.remote.pre_locked_node is result.remote.last_ready_node
+    engine.unlock(result.remote.pre_locked_node)
+    assert engine._tree.result.finalize.calls == 1
 
 if __name__ == "__main__":
     test_take_insert_match_recycle()

@@ -110,6 +110,29 @@ cd FlexKV/scripts/multi-nodes
 bash start_multi_node_serving.sh 2 30001
 ```
 
+若需要将远端 CPU/SSD 命中直接传入 GPU，请在 `enable_p2p_cpu` 和/或
+`enable_p2p_ssd` 之外设置 `enable_p2p_gpu: true`。FlexKV 将选择
+`PEER2GPUTransferWorker` 并生成 `PEERH2D`/`PEERSSD2D` OP；关闭该选项时，
+仍使用原有的 `PEER2CPUTransferWorker` 以及 `PEERH2H`/`PEERSSD2H` OP。
+
+GPU 内存可以由 Mooncake 通过 `ibv_reg_dmabuf_mr` 注册，不要求加载
+`nvidia_peermem`。使用 dma-buf 路径时，必须在启动 FlexKV 进程前设置：
+
+```bash
+export WITH_NVIDIA_PEERMEM=0
+```
+
+注意：这要求 Mooncake 所在进程能够从 CUDA allocation 导出 dma-buf FD。
+普通本进程 CUDA allocation 已验证可用；vLLM 将 KV cache 通过 CUDA IPC
+导入独立 TransferWorker 时，导入端不能再次导出 dma-buf，需由 allocation
+所有者导出并通过 Unix FD 传递后再注册。该限制不能仅靠上述环境变量解决。
+
+同时应将 `device_name` 配置为与各 GPU NUMA/PCIe 拓扑相匹配的活动 RDMA
+设备；一个 Worker 管理跨多张卡的 GPU buffer 时，可以使用逗号分隔的设备列表。
+
+`tests/test_peer2gpu_8gpu_rdma.py` 提供了可选的单机双逻辑节点 RDMA 冒烟测试：
+源端使用 GPU 0-3，目标端使用 GPU 4-7。运行所需环境变量见该测试文件。
+
 ### 3. 开始 Serving 服务
 
 向 30001 开始的连续端口的 vLLM instance 发送 benchmark 请求即可。

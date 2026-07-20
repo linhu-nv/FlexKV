@@ -4,13 +4,30 @@ import types
 
 import pytest
 import numpy as np
+import torch
 
 from flexkv.cache.mempool import Mempool
-from flexkv.cache.cache_engine import CacheEngineAccel, GlobalCacheEngine, DEFAULT_CACHE_STRATEGY
-from flexkv.common.transfer import DeviceType
+from flexkv.cache.hie_cache_engine import HierarchyLRCacheEngine
+from flexkv.cache.cache_engine import (
+    CacheEngineAccel,
+    CacheStrategy,
+    GlobalCacheEngine,
+    DEFAULT_CACHE_STRATEGY,
+)
+from flexkv.common.transfer import DeviceType, TransferType
 from flexkv.common.block import SequenceMeta
-from flexkv.common.config import CacheConfig, UserConfig
-from flexkv.common.type import MatchResultAccel
+from flexkv.common.config import CacheConfig, ModelConfig, UserConfig
+
+from flexkv.common.type import (
+    MatchResult,
+    MatchResultAccel,
+)
+
+
+def _bind_get_impl_helpers(fake):
+    """Stub the lock hand-off on a duck-typed fake self (graph build is inlined)."""
+    fake._handoff_locks = lambda *args, **kwargs: None
+    return fake
 
 CacheEngineType = CacheEngineAccel
 
@@ -245,7 +262,7 @@ def test_match_and_insert(cache_engine: CacheEngineType, num_insert: int, seq_le
             token_ids=token_ids,
             tokens_per_block=cache_engine.tokens_per_block,
         )
-        match_result = cache_engine.match(insert_sequence_meta)
+        match_result = cache_engine.match(insert_sequence_meta).local
         assert match_result.num_ready_matched_blocks == num_prefix_blocks
         assert match_result.num_matched_blocks == num_prefix_blocks
         assert match_result.last_ready_node is not None
@@ -263,7 +280,7 @@ def test_match_and_insert(cache_engine: CacheEngineType, num_insert: int, seq_le
         cur_cached_blocks += num_insert_blocks
         assert cache_engine.index.total_cached_blocks() == cur_cached_blocks
 
-        match_result = cache_engine.match(insert_sequence_meta)
+        match_result = cache_engine.match(insert_sequence_meta).local
         assert match_result.num_matched_blocks == insert_sequence_meta.num_blocks
         assert match_result.num_ready_matched_blocks == insert_sequence_meta.num_blocks
 
@@ -359,7 +376,7 @@ def test_cleanup(cache_engine: CacheEngineType):
     radixnode0_size = radixnode0.size()
 
     # Insert second sequence (shares prefix with first)
-    match_result = cache_engine.match(sequence_meta_list[1])
+    match_result = cache_engine.match(sequence_meta_list[1]).local
     num_insert_blocks1 = sequence_meta_list[1].num_blocks - match_result.num_matched_blocks
     radixnode1, _ = cache_engine.insert(
         sequence_meta_list[1],
@@ -371,7 +388,7 @@ def test_cleanup(cache_engine: CacheEngineType):
     radixnode1_size = radixnode1.size()
 
     # Insert third sequence (shares prefix with first)
-    match_result = cache_engine.match(sequence_meta_list[2])
+    match_result = cache_engine.match(sequence_meta_list[2]).local
     num_insert_blocks2 = sequence_meta_list[2].num_blocks - match_result.num_matched_blocks
     radixnode2, _ = cache_engine.insert(
         sequence_meta_list[2],
@@ -467,7 +484,7 @@ def _insert_and_access(engine, seqs, access_pattern):
 
     # 4. Check which sequences survived
     return {
-        labels[i]: engine.match(seqs[i]).num_matched_blocks
+        labels[i]: engine.match(seqs[i]).local.num_matched_blocks
         for i in range(5)
     }
 
@@ -561,7 +578,7 @@ def test_eviction_policy_valid_creation(engine_cls, policy: str):
     engine = _create_engine(engine_cls, policy)
     seqs = _make_seqs(2)
     engine.insert(seqs[0], engine.take(1), is_ready=True)
-    mr = engine.match(seqs[0])
+    mr = engine.match(seqs[0]).local
     assert mr.num_matched_blocks == 1
 
 
@@ -631,7 +648,7 @@ def test_eviction_policy_consecutive(engine_cls):
 
         evicted = set()
         for i, label in enumerate(labels):
-            if engine.match(seqs[i]).num_matched_blocks == 0:
+            if engine.match(seqs[i]).local.num_matched_blocks == 0:
                 evicted.add(label)
         return evicted
 
@@ -714,7 +731,7 @@ def test_eviction_policy_batch(engine_cls):
         engine.insert(seqs[4], engine.take(1), is_ready=True)
 
         result = {
-            labels[i]: engine.match(seqs[i]).num_matched_blocks
+            labels[i]: engine.match(seqs[i]).local.num_matched_blocks
             for i in range(5)
         }
 
@@ -755,7 +772,7 @@ def test_eviction_policy_reinsert_after_eviction(engine_cls):
 
     # Insert E → evicts B (LRU)
     engine.insert(seqs[4], engine.take(1), is_ready=True)
-    assert engine.match(seqs[1]).num_matched_blocks == 0, "B should be evicted"
+    assert engine.match(seqs[1]).local.num_matched_blocks == 0, "B should be evicted"
 
     # Now evict another to make room, then re-insert B
     # Access so that C becomes LRU candidate
@@ -768,11 +785,11 @@ def test_eviction_policy_reinsert_after_eviction(engine_cls):
     engine.insert(seqs[1], engine.take(1), is_ready=True)
 
     # B should now be matchable
-    assert engine.match(seqs[1]).num_matched_blocks == 1, (
+    assert engine.match(seqs[1]).local.num_matched_blocks == 1, (
         "Re-inserted B should be matchable"
     )
     # C should have been evicted
-    assert engine.match(seqs[2]).num_matched_blocks == 0, (
+    assert engine.match(seqs[2]).local.num_matched_blocks == 0, (
         "C should be evicted to make room for re-inserted B"
     )
 
@@ -835,7 +852,7 @@ def test_slru_protected_node_retained(engine_cls):
 
     labels = ['A', 'B', 'C', 'D', 'E']
     result = {
-        labels[i]: engine.match(seqs[i]).num_matched_blocks
+        labels[i]: engine.match(seqs[i]).local.num_matched_blocks
         for i in range(5)
     }
 
@@ -880,7 +897,7 @@ def test_slru_same_segment_lru_order(engine_cls):
 
     labels = ['A', 'B', 'C', 'D', 'E']
     result = {
-        labels[i]: engine.match(seqs[i]).num_matched_blocks
+        labels[i]: engine.match(seqs[i]).local.num_matched_blocks
         for i in range(5)
     }
 
@@ -929,7 +946,7 @@ def test_slru_custom_protected_threshold(engine_cls):
 
     labels = ['A', 'B', 'C', 'D', 'E']
     result = {
-        labels[i]: engine.match(seqs[i]).num_matched_blocks
+        labels[i]: engine.match(seqs[i]).local.num_matched_blocks
         for i in range(5)
     }
 
@@ -983,7 +1000,7 @@ def test_slru_batch_eviction_cross_segment(engine_cls):
 
     labels = ['A', 'B', 'C', 'D', 'E']
     result = {
-        labels[i]: engine.match(seqs[i]).num_matched_blocks
+        labels[i]: engine.match(seqs[i]).local.num_matched_blocks
         for i in range(5)
     }
 
@@ -1029,7 +1046,7 @@ def test_slru_threshold_one_promotes_on_first_hit(engine_cls):
 
     labels = ['A', 'B', 'C', 'D', 'E']
     result = {
-        labels[i]: engine.match(seqs[i]).num_matched_blocks
+        labels[i]: engine.match(seqs[i]).local.num_matched_blocks
         for i in range(5)
     }
 
@@ -1081,7 +1098,7 @@ def test_slru_all_protected_falls_back_to_lru(engine_cls):
 
     labels = ['A', 'B', 'C', 'D', 'E']
     result = {
-        labels[i]: engine.match(seqs[i]).num_matched_blocks
+        labels[i]: engine.match(seqs[i]).local.num_matched_blocks
         for i in range(5)
     }
 
@@ -1098,26 +1115,18 @@ def test_slru_all_protected_falls_back_to_lru(engine_cls):
 # Tests – GlobalCacheEngine.match_with_lake local CPU/SSD dispatch
 # ---------------------------------------------------------------------------
 class _RecordingEngine:
-    """Fake device engine recording which match variant was invoked."""
+    """Fake device engine recording how match() was invoked."""
 
     def __init__(self):
         self.calls = []
 
-    def match(self, sequence_meta):
-        self.calls.append('match')
-        return MatchResultAccel()
-
-    def match_local(self, sequence_meta):
-        self.calls.append('match_local')
-        return MatchResultAccel()
-
-    def match_all(self, sequence_meta):
-        self.calls.append('match_all')
-        return MatchResultAccel()
+    def match(self, sequence_meta, *, with_peer=True, gpu_matched_blocks=0):
+        self.calls.append(('match', with_peer, gpu_matched_blocks))
+        return MatchResult(local=MatchResultAccel())
 
 
 def _run_match_with_lake(is_get: bool):
-    """Return the CPU/SSD match variants used by the Lake path."""
+    """Return the CPU/SSD match calls the Lake path makes."""
     cpu, ssd = _RecordingEngine(), _RecordingEngine()
     fake = types.SimpleNamespace(
         cpu_cache_engine=cpu,
@@ -1129,14 +1138,416 @@ def _run_match_with_lake(is_get: bool):
             enable_p2p_ssd=False,
         ),
     )
-    GlobalCacheEngine.match_with_lake(
+    GlobalCacheEngine.match_all(
         fake, None, temp_cache_strategy=DEFAULT_CACHE_STRATEGY, is_put=not is_get)
     return cpu.calls[0], ssd.calls[0]
 
 
 @pytest.mark.parametrize("is_get", [False, True])
 def test_match_with_lake_uses_local_cpu_and_ssd_engines(is_get):
-    assert _run_match_with_lake(is_get) == ('match', 'match')
+    # GET queries peers (with_peer=True); PUT is local-only (with_peer=False).
+    expected = ('match', is_get, 0)
+    assert _run_match_with_lake(is_get) == (expected, expected)
+
+
+def test_match_with_lake_honors_ignore_ssd():
+    cpu, ssd = _RecordingEngine(), _RecordingEngine()
+    fake = types.SimpleNamespace(
+        cpu_cache_engine=cpu,
+        ssd_cache_engine=ssd,
+        lake_cache_engine=None,
+    )
+    GlobalCacheEngine.match_all(
+        fake,
+        None,
+        temp_cache_strategy=CacheStrategy(ignore_ssd=True),
+        is_put=False,
+    )
+    assert cpu.calls == [('match', True, 0)]
+    assert ssd.calls == []
+
+
+def test_global_cache_rejects_radixshmem_with_lake(monkeypatch):
+    monkeypatch.setattr(
+        "flexkv.cache.cache_engine.GLOBAL_CONFIG_FROM_ENV.radix_shmem",
+        True,
+    )
+    with pytest.raises(
+        ValueError,
+        match="radixshmem and Lake cannot be enabled at the same time",
+    ):
+        GlobalCacheEngine(
+            CacheConfig(enable_3rd_lake=True),
+            ModelConfig(),
+        )
+
+
+class _FakeNode:
+    def __init__(self, blocks):
+        self.blocks = blocks
+
+    def size(self):
+        return self.blocks
+
+
+class _FakePutStorage:
+    def __init__(self, allocated):
+        self.allocated = np.asarray(allocated, dtype=np.int64)
+
+    def take(self, num_required_blocks, **kwargs):
+        return self.allocated[:num_required_blocks]
+
+    def recycle(self, blocks):
+        pass
+
+    def insert(self, sequence_meta, blocks, **kwargs):
+        return _FakeNode(len(blocks)), np.array([], dtype=np.int64)
+
+    def lock_node(self, node):
+        pass
+
+
+class _LifecycleStorage(_FakePutStorage):
+    def __init__(self, allocated):
+        super().__init__(allocated)
+        self.events = []
+        self.inserted_node = None
+
+    def insert(self, sequence_meta, blocks, **kwargs):
+        self.inserted_node = _FakeNode(len(blocks))
+        return self.inserted_node, np.array([], dtype=np.int64)
+
+    def lock_node(self, node):
+        self.events.append(("lock", node))
+
+    def set_ready(self, node, ready, ready_length):
+        self.events.append(("ready", node, ready_length))
+
+    def unlock(self, node):
+        self.events.append(("unlock", node))
+
+    def recycle(self, blocks):
+        self.events.append(("recycle", tuple(blocks)))
+
+
+def _local_match(blocks):
+    blocks = np.asarray(blocks, dtype=np.int64)
+    return MatchResult(local=MatchResultAccel(
+        num_ready_matched_blocks=len(blocks),
+        num_matched_blocks=len(blocks),
+        physical_blocks=blocks,
+    ))
+
+
+def test_local_cpu_prefix_and_ssd_suffix_use_inserted_descendant_handle():
+    cpu_store = _LifecycleStorage([90, 91])
+    ssd_store = _LifecycleStorage([])
+    cpu_prefix = _FakeNode(1)
+    ssd_prefix = _FakeNode(3)
+    cpu_match = _local_match([10])
+    cpu_match.local.last_ready_node = cpu_prefix
+    cpu_match.local.last_node = cpu_prefix
+    ssd_match = _local_match([20, 21, 22])
+    ssd_match.local.last_ready_node = ssd_prefix
+    ssd_match.local.last_node = ssd_prefix
+    empty_lake = MatchResult(local=MatchResultAccel())
+    fake = types.SimpleNamespace(
+        cache_config=types.SimpleNamespace(
+            enable_cpu=True,
+            enable_ssd=True,
+            enable_lake=False,
+            enable_gds=False,
+            enable_p2p_gpu=False,
+            enable_p2p_cpu=False,
+            enable_p2p_ssd=False,
+        ),
+        cpu_cache_engine=cpu_store,
+        ssd_cache_engine=ssd_store,
+        lake_cache_engine=None,
+        cache_engines={
+            DeviceType.CPU: cpu_store,
+            DeviceType.SSD: ssd_store,
+        },
+        _metrics_collector=None,
+        match_all=lambda *args, **kwargs: (cpu_match, ssd_match, empty_lake),
+        _release_match_pre_locks=lambda **kwargs: None,
+        _empty_get_return=lambda request_id: None,
+    )
+    _bind_get_impl_helpers(fake)
+
+    _, _, node_to_unlock, _, buffer_to_free, _ = (
+        GlobalCacheEngine._get_impl_without_lake(
+            fake,
+            request_id=1,
+            sequence_meta=types.SimpleNamespace(),
+            block_mask_start=0,
+            block_mask_end=3,
+            gpu_block_ids=np.arange(3, dtype=np.int64),
+            layer_num=2,
+            temp_cache_strategy=DEFAULT_CACHE_STRATEGY,
+        )
+    )
+
+    # The staged SSD suffix is promoted into a purely-local CPU prefix, so the
+    # inserted descendant REPLACES the matched prefix as the flat completion node.
+    assert node_to_unlock[DeviceType.CPU] == [cpu_store.inserted_node]
+
+    GlobalCacheEngine._transfer_callback(
+        fake,
+        node_to_unlock=node_to_unlock,
+        buffer_to_free=buffer_to_free,
+    )
+    assert ("ready", cpu_store.inserted_node, 2) in cpu_store.events
+    assert ("unlock", cpu_store.inserted_node) in cpu_store.events
+    assert all(event[1] is not cpu_prefix for event in cpu_store.events)
+
+
+def test_transfer_callback_is_two_pass_over_flat_node_list():
+    store = _LifecycleStorage([])
+    first = _FakeNode(1)
+    second = _FakeNode(2)
+    fake = types.SimpleNamespace(
+        cache_config=types.SimpleNamespace(enable_p2p_cpu=False),
+        cache_engines={DeviceType.CPU: store},
+    )
+
+    GlobalCacheEngine._transfer_callback(
+        fake,
+        node_to_unlock={DeviceType.CPU: [first, second]},
+    )
+
+    # set_ready EVERY node, THEN unlock EVERY node (an inserted node's unlock
+    # fires its set_ready+dec_ref finalize, so all must be ready first).
+    assert store.events == [
+        ("ready", first, 1),
+        ("ready", second, 2),
+        ("unlock", first),
+        ("unlock", second),
+    ]
+
+
+class _LockEngine:
+    """Records lock_node / unlock so the hand-off protocol can be asserted."""
+
+    def __init__(self):
+        self.locked = []
+        self.unlocked = []
+
+    def lock_node(self, node):
+        self.locked.append(node)
+
+    def unlock(self, node):
+        self.unlocked.append(node)
+
+
+def test_handoff_locks_adopts_guard_and_releases_unused():
+    cpu_eng = _LockEngine()
+    ssd_eng = _LockEngine()
+    guard = _FakeNode(2)      # cpu query guard, IS a completion node -> adopted
+    inserted = _FakeNode(3)   # promoted node, non-guard completion -> locked
+    ssd_guard = _FakeNode(1)  # ssd guard, NOT a completion node -> released now
+
+    cpu_match = MatchResult(local=MatchResultAccel(pre_locked_node=guard))
+    ssd_match = MatchResult(local=MatchResultAccel(pre_locked_node=ssd_guard))
+    fake = types.SimpleNamespace(
+        cache_engines={DeviceType.CPU: cpu_eng, DeviceType.SSD: ssd_eng},
+        cpu_cache_engine=cpu_eng,
+        ssd_cache_engine=ssd_eng,
+        lake_cache_engine=None,
+        _update_mempool_metrics=lambda: None,
+    )
+
+    GlobalCacheEngine._handoff_locks(
+        fake,
+        {DeviceType.CPU: [guard, inserted]},
+        cpu_result=cpu_match,
+        ssd_result=ssd_match,
+    )
+
+    # Adopted guard: never re-locked, never released early, disarmed for callback.
+    assert guard not in cpu_eng.locked
+    assert guard not in cpu_eng.unlocked
+    assert cpu_match.local.pre_locked_node is None
+    # Non-guard completion node is locked.
+    assert cpu_eng.locked == [inserted]
+    # Unadopted guard on an unused tier is released now (no leak).
+    assert ssd_eng.unlocked == [ssd_guard]
+    assert ssd_match.local.pre_locked_node is None
+
+
+def test_get_with_lake_uses_three_tier_planner():
+    cpu_store = _FakePutStorage([90, 91, 92, 93])
+    ssd_store = _FakePutStorage([80, 81])
+    lake_store = _FakePutStorage([])
+    cpu_match = _local_match([10])
+    ssd_match = _local_match([20, 21, 22])
+    lake_match = _local_match([30, 31, 32, 33, 34])
+    lake_match.local.block_node_ids = np.array(
+        [100, 101, 102, 103, 104], dtype=np.int64
+    )
+    fake = types.SimpleNamespace(
+        cache_config=types.SimpleNamespace(
+            enable_cpu=True,
+            enable_ssd=True,
+            enable_lake=True,
+            enable_gds=False,
+            enable_p2p_gpu=False,
+        ),
+        cpu_cache_engine=cpu_store,
+        ssd_cache_engine=ssd_store,
+        lake_cache_engine=lake_store,
+        cache_engines={
+            DeviceType.CPU: cpu_store,
+            DeviceType.SSD: ssd_store,
+            DeviceType.LAKE: lake_store,
+        },
+        _metrics_collector=None,
+        match_all=lambda *args, **kwargs: (
+            cpu_match, ssd_match, lake_match
+        ),
+        _release_match_pre_locks=lambda **kwargs: None,
+        _empty_get_return=lambda request_id: None,
+    )
+    _bind_get_impl_helpers(fake)
+
+    graph, finished, *_ = GlobalCacheEngine._get_impl_with_lake(
+        fake,
+        request_id=1,
+        sequence_meta=types.SimpleNamespace(),
+        block_mask_start=0,
+        block_mask_end=5,
+        gpu_block_ids=np.arange(5, dtype=np.int64),
+        layer_num=2,
+        temp_cache_strategy=DEFAULT_CACHE_STRATEGY,
+    )
+    transfer_types = [op.transfer_type for op in graph._op_map.values()]
+    assert TransferType.DISK2H in transfer_types
+    assert TransferType.LAKE2H in transfer_types
+    assert TransferType.H2D in transfer_types
+    assert TransferType.H2DISK in transfer_types
+    lake_op = next(
+        op for op in graph._op_map.values()
+        if op.transfer_type == TransferType.LAKE2H
+    )
+    np.testing.assert_array_equal(lake_op.src_block_ids, [33, 34])
+    np.testing.assert_array_equal(lake_op.src_block_node_ids, [103, 104])
+    h2disk_op = next(
+        op for op in graph._op_map.values()
+        if op.transfer_type == TransferType.H2DISK
+    )
+    assert h2disk_op.op_id in finished
+    assert lake_op.op_id in h2disk_op.predecessors
+
+
+def test_put_with_lake_preserves_logical_cpu_block_order():
+    cpu = _FakePutStorage([20, 21, 22])
+    lake = _FakePutStorage([30, 31, 32, 33, 34])
+    cpu_match = MatchResult(local=MatchResultAccel(
+        num_ready_matched_blocks=2,
+        num_matched_blocks=2,
+        physical_blocks=np.array([10, 11], dtype=np.int64),
+    ))
+    empty = MatchResult(local=MatchResultAccel())
+    fake = types.SimpleNamespace(
+        cache_config=types.SimpleNamespace(
+            enable_cpu=True,
+            enable_ssd=False,
+            enable_lake=True,
+        ),
+        cpu_cache_engine=cpu,
+        ssd_cache_engine=None,
+        lake_cache_engine=lake,
+        cache_engines={DeviceType.CPU: cpu, DeviceType.LAKE: lake},
+        _metrics_collector=None,
+        match_all=lambda *args, **kwargs: (cpu_match, empty, empty),
+        _release_match_pre_locks=lambda **kwargs: None,
+        _handoff_locks=lambda *args, **kwargs: None,
+    )
+    sequence = types.SimpleNamespace()
+
+    graph, finished, *_ = GlobalCacheEngine._put_impl_with_lake(
+        fake,
+        request_id=1,
+        sequence_meta=sequence,
+        block_mask_start=0,
+        block_mask_end=5,
+        gpu_block_ids=np.arange(5, dtype=np.int64),
+        layer_num=2,
+    )
+    lake_op = next(
+        op for op in graph._op_map.values()
+        if op.transfer_type == TransferType.H2LAKE
+    )
+    np.testing.assert_array_equal(
+        lake_op.src_block_ids,
+        [10, 11, 20, 21, 22],
+    )
+    assert lake_op.op_id in finished
+
+
+class _FakeRadixMatch:
+    def __init__(self, blocks, ready, node_ids=None):
+        self.physical_blocks = torch.tensor(blocks, dtype=torch.int64)
+        self.block_node_ids = (
+            torch.tensor(node_ids, dtype=torch.int64)
+            if node_ids is not None else torch.tensor([], dtype=torch.int64)
+        )
+        self.num_ready_matched_blocks = ready
+        self.num_matched_blocks = ready
+        self.last_ready_node = None
+        self.last_node = None
+        self.last_node_matched_length = 0
+
+
+class _FakeRadixIndex:
+    def __init__(self, result):
+        self.result = result
+
+    def match_prefix(self, *args, **kwargs):
+        return self.result
+
+
+def test_lake_combined_match_maps_local_and_peer_file_node_ids():
+    engine = HierarchyLRCacheEngine.__new__(HierarchyLRCacheEngine)
+    engine.device_type = DeviceType.LAKE
+    engine.redis_node_id = 7
+    engine.tokens_per_block = 1
+    engine.local_index = _FakeRadixIndex(
+        _FakeRadixMatch([10, 11], ready=2)
+    )
+    engine.remote_index = _FakeRadixIndex(
+        _FakeRadixMatch([30, 31, 32, 33], ready=4,
+                        node_ids=[8, 8, 8, 8])
+    )
+    engine.nodeids_to_file_nodeids = lambda nodes, blocks: (
+        np.asarray(nodes, dtype=np.int64) * 100 +
+        np.asarray(blocks, dtype=np.int64)
+    )
+    engine._stats_total_queried_tokens = 0
+    engine._stats_gpu_matched_tokens = 0
+    engine._stats_local_matched_tokens = 0
+    engine._stats_distributed_matched_tokens = 0
+    engine._stats_match_count = 0
+    sequence = types.SimpleNamespace(
+        gen_hashes=lambda: None,
+        block_hashes=np.arange(4, dtype=np.int64),
+        num_blocks=4,
+    )
+
+    match = engine.match(sequence)
+
+    # LOCAL side maps its blocks to this node's file ids; the planner will use
+    # its [0, 2) prefix.
+    np.testing.assert_array_equal(match.local.physical_blocks, [10, 11])
+    np.testing.assert_array_equal(match.local.block_node_ids, [710, 711])
+    # PEER side is the peer index prefix with peer file ids; the planner slices
+    # its [2, 4) tail ([32, 33] -> [832, 833]) after the local prefix.
+    assert match.remote is not None
+    np.testing.assert_array_equal(match.remote.physical_blocks, [30, 31, 32, 33])
+    np.testing.assert_array_equal(
+        match.remote.block_node_ids, [830, 831, 832, 833]
+    )
+    assert match.remote.num_ready_matched_blocks == 4
 
 
 @pytest.mark.parametrize("p2p_field", ["enable_p2p_cpu", "enable_p2p_ssd"])

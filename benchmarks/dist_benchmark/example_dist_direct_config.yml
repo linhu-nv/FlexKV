@@ -19,6 +19,8 @@ ssd_cache_gb: 0
 
 # Distributed KVCache config
 enable_p2p_cpu: true
+# Select PEER2GPUTransferWorker and generate PEERH2D/PEERSSD2D for remote hits.
+enable_p2p_gpu: false
 
 # Redis config (for KV sharing metadata)
 redis_host: "10.135.1.175"

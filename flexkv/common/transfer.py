@@ -55,6 +55,8 @@ class TransferType(Enum):
     H2PEERH = "H2PEERH"
     PEERSSD2H = "PEERSSD2H"
     H2PEERSSD = "H2PEERSSD"
+    PEERH2D = "PEERH2D"
+    PEERSSD2D = "PEERSSD2D"
 
     # if we need to return a results when trasnfer op 1 and op 2 are completed
     # we can add a virtual transfer op 3 that depends on op 1 and op 2
@@ -113,6 +115,11 @@ class TransferOp:
     remote_node_ids: Optional[np.ndarray] = None
     # used for distributed cpu and ssd
     src_block_node_ids: Optional[np.ndarray] = None
+    # Exact logical offset into the rebound GPU block list.  The legacy
+    # prefix/suffix rules remain in effect when this is None.  Combined
+    # LOCAL+PEER matches need an exact offset because a direct peer route can
+    # occupy the middle of the ready prefix.
+    gpu_block_offset: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.transfer_type != TransferType.VIRTUAL and \
@@ -196,7 +203,9 @@ class TransferOpGraph:
         if op.transfer_type == TransferType.H2D or \
             op.transfer_type == TransferType.D2H or \
             op.transfer_type == TransferType.D2DISK or \
-            op.transfer_type == TransferType.DISK2D:
+            op.transfer_type == TransferType.DISK2D or \
+            op.transfer_type == TransferType.PEERH2D or \
+            op.transfer_type == TransferType.PEERSSD2D:
             self._gpu_transfer_op_id.append(op.op_id)
         self._ready_ops.add(op.op_id)
 
@@ -250,10 +259,16 @@ class TransferOpGraph:
             transfer_type = self._op_map[op_id].transfer_type
             op = self._op_map[op_id]
             if transfer_type.name.endswith("2D"):
-                if transfer_type == TransferType.DISK2D:
-                    op.dst_block_ids = gpu_blocks[-op.dst_block_ids.size:]
-                else:
-                    op.dst_block_ids = gpu_blocks[:op.dst_block_ids.size]
+                # build_transfer_graph sets gpu_block_offset on every into-GPU
+                # op.  The head/tail-slice heuristics this replaced mis-placed a
+                # direct route that split the ready prefix, so fail fast rather
+                # than silently fall back to them.
+                assert op.gpu_block_offset is not None, (
+                    f"{transfer_type.name} op missing gpu_block_offset; "
+                    "build_transfer_graph must set it on every into-GPU op"
+                )
+                start = op.gpu_block_offset
+                op.dst_block_ids = gpu_blocks[start:start + op.dst_block_ids.size]
             else:
                 if transfer_type == TransferType.D2DISK:
                     op.src_block_ids = gpu_blocks[-op.src_block_ids.size:]

@@ -43,6 +43,9 @@ class CacheConfig:
     enable_kv_sharing: bool = False # pcfs_sharing or p2p_cpu or p2p_ssd or p2p_3rd_lake
     enable_p2p_cpu: bool = False
     enable_p2p_ssd: bool = False
+    # Transfer peer CPU/SSD hits directly into GPU memory through Mooncake.
+    # The peer CPU/SSD flags still control which remote tiers are searchable.
+    enable_p2p_gpu: bool = False
     enable_3rd_lake: bool = False
 
     distributed_node_id: int = -1 # only used when distributed cpu/ssd and only can be set when redis_meta_client initialized
@@ -83,10 +86,17 @@ class CacheConfig:
     mooncake_config_path: Optional[str] = None
 
     def __post_init__(self):
+        self.validate_p2p_gpu_requires_tier()
         self.enable_kv_sharing = self.enable_p2p_cpu or \
             self.enable_p2p_ssd or self.enable_3rd_lake
         self.enable_lake = self.enable_3rd_lake
         self.validate_lake_p2p_exclusive()
+
+    def validate_p2p_gpu_requires_tier(self) -> None:
+        if self.enable_p2p_gpu and not (self.enable_p2p_cpu or self.enable_p2p_ssd):
+            raise ValueError(
+                "enable_p2p_gpu requires enable_p2p_cpu or enable_p2p_ssd"
+            )
 
     def validate_lake_p2p_exclusive(self) -> None:
         if self.enable_lake and (self.enable_p2p_cpu or self.enable_p2p_ssd):
@@ -118,6 +128,18 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     # Identifier used to name radix shm regions and TE shm channels. Lets
     # multiple FlexKV instances coexist on a host.
     shm_radix_server_id=os.getenv('FLEXKV_SHM_RADIX_ID', 'default'),
+    # Cross-node radixshmem cluster.  ``shm_radix_server_id`` remains the
+    # local TE/shm channel namespace; cluster_id is shared by all peer ranks.
+    radix_cluster_id=os.getenv('FLEXKV_RADIX_CLUSTER_ID', 'default'),
+    radix_rank=int(os.getenv('FLEXKV_RADIX_RANK', 0)),
+    radix_world_size=int(os.getenv('FLEXKV_RADIX_WORLD_SIZE', 1)),
+    radix_master_addr=os.getenv('FLEXKV_RADIX_MASTER_ADDR', '127.0.0.1'),
+    radix_master_port=int(os.getenv('FLEXKV_RADIX_MASTER_PORT', 18500)),
+    radix_rdma_dev=os.getenv('FLEXKV_RADIX_RDMA_DEV', ''),
+    radix_gid_idx=int(os.getenv('FLEXKV_RADIX_GID_IDX', 3)),
+    radix_bootstrap_timeout_sec=int(os.getenv(
+        'FLEXKV_RADIX_BOOTSTRAP_TIMEOUT_SEC', 120
+    )),
     # Extra shm TE channels reserved beyond the internal DP clients
     # (total_clients = instance_num * dp_size). External processes (e.g. a
     # prefetch controller attaching to the shared radix index) submit graphs to
@@ -171,6 +193,7 @@ class UserConfig:
     enable_nixl: bool = False
     enable_p2p_cpu: bool = False
     enable_p2p_ssd: bool = False
+    enable_p2p_gpu: bool = False
     enable_3rd_lake: bool = False
 
     # distributed zmq configs
@@ -260,7 +283,10 @@ def update_default_config_from_user_config(model_config: ModelConfig,
     cache_config.enable_nixl = user_config.enable_nixl
     cache_config.enable_p2p_cpu = user_config.enable_p2p_cpu
     cache_config.enable_p2p_ssd = user_config.enable_p2p_ssd
+    cache_config.enable_p2p_gpu = user_config.enable_p2p_gpu
     cache_config.enable_3rd_lake = user_config.enable_3rd_lake
+
+    cache_config.validate_p2p_gpu_requires_tier()
 
     # Update derived flags after setting p2p and lake configs
     cache_config.enable_kv_sharing = (cache_config.enable_p2p_cpu or

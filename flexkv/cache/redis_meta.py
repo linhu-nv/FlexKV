@@ -645,6 +645,29 @@ class RedisMeta:
         if self._node_id is None:
             raise RuntimeError("node_id is not registered yet. Call init_meta() first.")
         return int(self._node_id)
+
+    def register_radix_rank(self, cluster_id: str, rank: int) -> None:
+        """Map a radixshmem rank to this node's Mooncake/FlexKV node id.
+
+        The active ``node:<id>`` key remains the source of liveness.  A stale
+        rank mapping is therefore harmless: resolution rejects it when the
+        referenced node key has expired, and a restarted rank overwrites it.
+        """
+        node_id = self.get_node_id()
+        client = self._client()
+        key = f"radix_peer:{cluster_id}:{int(rank)}"
+        client.set(key, node_id)
+
+    def resolve_radix_rank(self, cluster_id: str, rank: int) -> Optional[int]:
+        """Resolve a radixshmem rank to an active Mooncake/FlexKV node id."""
+        client = self._client()
+        value = client.get(f"radix_peer:{cluster_id}:{int(rank)}")
+        if value is None:
+            return None
+        node_id = int(value)
+        if not client.exists(f"node:{node_id}"):
+            return None
+        return node_id
     
     def is_initialized(self) -> bool:
         """Check if RedisMeta has been initialized.

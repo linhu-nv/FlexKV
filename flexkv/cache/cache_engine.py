@@ -26,6 +26,11 @@ from flexkv.cache.hie_cache_engine import HierarchyLRCacheEngine
 from flexkv.cache.redis_meta import RedisMeta, dist_available
 
 from flexkv.cache.mempool import Mempool
+from flexkv.cache.get_planner import (
+    build_transfer_graph,
+    get_media_list,
+    plan_routes,
+)
 from flexkv.cache.transfer_pattern import add_virtal_op_for_mutiple_finished_ops
 from flexkv.common.block import SequenceMeta
 from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
@@ -34,7 +39,8 @@ from flexkv.common.transfer import (
 )
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.type import (
-    MatchResultAccel, RadixNodeLike, CacheEngineLike
+    CacheLocality, MatchResult, MatchResultAccel, RadixNodeLike,
+    CacheEngineLike,
 )
 from flexkv.integration.dynamo.collector import KVEventCollector
 from flexkv.metrics import init_global_collector, get_global_collector
@@ -90,7 +96,13 @@ class CacheEngineAccel:
         self.index.reset()
         self.mempool.reset()
 
-    def match(self, sequence_meta: SequenceMeta) -> MatchResultAccel:
+    def match(self,
+              sequence_meta: SequenceMeta,
+              *,
+              with_peer: bool = True,
+              gpu_matched_blocks: int = 0) -> MatchResult:
+        # A single in-process index is purely local; there is never a peer hit,
+        # so `with_peer` is a no-op and `MatchResult.remote` is always None.
         sequence_meta.gen_hashes()
         match_result = self.index.match_prefix(torch.from_numpy(sequence_meta.block_hashes).to(torch.int64),
                                               sequence_meta.num_blocks, True)
@@ -105,7 +117,7 @@ class CacheEngineAccel:
                 bnids_np = None
         except Exception:
             bnids_np = None
-        return MatchResultAccel(
+        local = MatchResultAccel(
             num_ready_matched_blocks=match_result.num_ready_matched_blocks,
             num_matched_blocks=match_result.num_matched_blocks,
             last_ready_node=match_result.last_ready_node,
@@ -113,8 +125,8 @@ class CacheEngineAccel:
             last_node_matched_length=match_result.last_node_matched_length,
             physical_blocks=phys,
             block_node_ids=bnids_np,
-            matched_pos="remote" if self.device_type == DeviceType.LAKE else "local",
         )
+        return MatchResult(local=local)
 
     def insert(self,
                sequence_meta: SequenceMeta,
@@ -242,7 +254,7 @@ DEFAULT_CACHE_STRATEGY = CacheStrategy()
 CPUONLY_CACHE_STRATEGY = CacheStrategy(ignore_gpu=False, ignore_ssd=True, ignore_lake=True, ignore_gds=True)
 
 class GlobalCacheEngine:
-    def __init__(self, cache_config: CacheConfig, model_config: ModelConfig, redis_meta: RedisMeta = None,
+    def __init__(self, cache_config: CacheConfig, model_config: ModelConfig, redis_meta: Optional[RedisMeta] = None,
                  event_collector: Optional[KVEventCollector] = None):
         cache_config.validate_lake_p2p_exclusive()
         self.cache_config = cache_config
@@ -256,6 +268,10 @@ class GlobalCacheEngine:
         # When True, replace the per-device CacheEngineAccel with the radixshmem-
         # backed engine so multiple DP processes share a single index in shm.
         self.use_radix_shmem = bool(getattr(GLOBAL_CONFIG_FROM_ENV, "radix_shmem", False))
+        if self.use_radix_shmem and cache_config.enable_lake:
+            raise ValueError(
+                "radixshmem and Lake cannot be enabled at the same time"
+            )
         self._shm_radix_server_id = getattr(
             GLOBAL_CONFIG_FROM_ENV, "shm_radix_server_id", "default"
         )
@@ -266,7 +282,8 @@ class GlobalCacheEngine:
             self.enable_kv_sharing = True
         else:
             self.enable_kv_sharing = False
-        self.cache_engines: Dict[DeviceType, Optional[CacheEngineLike[Any]]] = {}
+        # Only concrete (non-None) engines are ever inserted, one per enabled tier.
+        self.cache_engines: Dict[DeviceType, CacheEngineLike[Any]] = {}
 
         self.evict_ratio = GLOBAL_CONFIG_FROM_ENV.evict_ratio
         self.evict_start_threshold = GLOBAL_CONFIG_FROM_ENV.evict_start_threshold
@@ -292,12 +309,12 @@ class GlobalCacheEngine:
             )
 
         if cache_config.enable_cpu:
-            if cache_config.enable_p2p_cpu:
-                self.cpu_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.CPU, meta=self.redis_meta) #TODO
-            elif self.use_radix_shmem:
+            if self.use_radix_shmem:
                 self.cpu_cache_engine = self._build_radix_shmem_engine(
                     DeviceType.CPU, cache_config.num_cpu_blocks, event_collector
                 )
+            elif cache_config.enable_p2p_cpu:
+                self.cpu_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.CPU, meta=self.redis_meta)
             else:
                 self.cpu_cache_engine = CacheEngineAccel(
                     device_type=DeviceType.CPU,
@@ -313,12 +330,12 @@ class GlobalCacheEngine:
                 )
             self.cache_engines[DeviceType.CPU] = self.cpu_cache_engine
         if cache_config.enable_ssd:
-            if cache_config.enable_p2p_ssd:
-                self.ssd_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.SSD, meta=self.redis_meta) #TODO
-            elif self.use_radix_shmem:
+            if self.use_radix_shmem:
                 self.ssd_cache_engine = self._build_radix_shmem_engine(
                     DeviceType.SSD, cache_config.num_ssd_blocks, event_collector
                 )
+            elif cache_config.enable_p2p_ssd:
+                self.ssd_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.SSD, meta=self.redis_meta)
             else:
                 self.ssd_cache_engine = CacheEngineAccel(
                     device_type=DeviceType.SSD,
@@ -334,13 +351,15 @@ class GlobalCacheEngine:
                 )
             self.cache_engines[DeviceType.SSD] = self.ssd_cache_engine
         if cache_config.enable_lake:
-            if cache_config.enable_kv_sharing:
-                # Build PCFSCacheEngine from CacheConfig directly (replacing LakePCFSCacheEngine) TODO
-                self.lake_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.LAKE, meta=self.redis_meta)
-            elif self.use_radix_shmem:
+            assert cache_config.num_lake_blocks is not None, \
+                "num_lake_blocks must be set when enable_lake is True"
+            if self.use_radix_shmem:
                 self.lake_cache_engine = self._build_radix_shmem_engine(
                     DeviceType.LAKE, cache_config.num_lake_blocks, None
                 )
+            elif cache_config.enable_kv_sharing:
+                # Build PCFSCacheEngine from CacheConfig directly (replacing LakePCFSCacheEngine) TODO
+                self.lake_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.LAKE, meta=self.redis_meta)
             else:
                 self.lake_cache_engine = CacheEngineAccel(
                     device_type=DeviceType.LAKE,
@@ -370,13 +389,14 @@ class GlobalCacheEngine:
                                   lake_result=None) -> None:
         """Release the atomic match-time inc_refs (radixshmem `lock=True`).
 
-        Backends that don't pre-lock leave `pre_locked_node=None`, so this is
-        a no-op for them. Called both on the success path (right after the
-        explicit lock_node loop has taken over protection) and on every
-        early-return path so we never leak a match-acquired ref.
+        A tier match is a `MatchResult`; either side (local or remote) may hold
+        the single query guard (``pre_locked_node``).  Backends that don't
+        pre-lock leave every ``pre_locked_node=None``, so this is a no-op for
+        them.  Called on every early-return path, so a match-acquired ref is
+        never leaked.  (The success path releases inline in :meth:`_handoff_locks`.)
 
-        Idempotent: clears `pre_locked_node` after release so accidental
-        double-call cannot dec_ref twice.
+        Idempotent: clears ``pre_locked_node`` after release so a double-call
+        cannot dec_ref twice.
         """
         pairs = (
             (self.cpu_cache_engine, cpu_result),
@@ -386,13 +406,65 @@ class GlobalCacheEngine:
         for engine, result in pairs:
             if engine is None or result is None:
                 continue
-            node = getattr(result, "pre_locked_node", None)
-            if node is None:
-                continue
-            engine.unlock(node)
-            result.pre_locked_node = None
+            # The local/remote sides of this match that still hold a pre-lock.
+            for side in (result.local, result.remote):
+                if side is not None and side.pre_locked_node is not None:
+                    engine.unlock(side.pre_locked_node)
+                    side.pre_locked_node = None
 
-        # Update initial mempool stats
+        # Update mempool stats after releasing any match-only protection.
+        self._update_mempool_metrics()
+
+    def _handoff_locks(self,
+                       node_to_unlock: Dict[DeviceType, List[RadixNodeLike]],
+                       cpu_result=None,
+                       ssd_result=None,
+                       lake_result=None) -> None:
+        """Take over match-time protection with the graph completion callback.
+
+        Per tier, in one pass: acquire independent protection via ``lock_node``
+        (an inc_ref for a plain radix node; a no-op for a radixshmem query-guard
+        / inserted node, which already self-protects) for every completion node
+        that is NOT the tier's own match guard; then, for each match guard,
+        either ADOPT it (the guard is itself a completion node — leave its
+        pre-lock ref armed so the callback's ``unlock`` runs the finalize exactly
+        once) or RELEASE it now (the guard is unused — drop the match ref so it
+        is never leaked).
+
+        Covers every tier carrying a match result, not just those with
+        completion nodes: a tier that matched but contributed no completion node
+        has all its guards released here.
+        """
+        tiers = (
+            (DeviceType.CPU, self.cpu_cache_engine, cpu_result),
+            (DeviceType.SSD, self.ssd_cache_engine, ssd_result),
+            (DeviceType.LAKE, self.lake_cache_engine, lake_result),
+        )
+        for _device_type, engine, result in tiers:
+            if engine is None:
+                continue
+            nodes = node_to_unlock.get(_device_type, [])
+            node_ids = {id(node) for node in nodes}
+            # The local/remote sides of this match that still hold a pre-lock.
+            prelocked_sides = [
+                side for side in (result.local, result.remote)
+                if side is not None and side.pre_locked_node is not None
+            ] if result is not None else []
+            guard_ids = {id(side.pre_locked_node) for side in prelocked_sides}
+            for node in nodes:
+                if id(node) in guard_ids:
+                    continue  # the match guard already protects these slots
+                engine.lock_node(node)
+            for side in prelocked_sides:
+                if id(side.pre_locked_node) in node_ids:
+                    # Adopted: keep the guard armed for the callback's unlock.
+                    side.pre_locked_node = None
+                else:
+                    # Unused match guard: release its match-time ref now.
+                    engine.unlock(side.pre_locked_node)
+                    side.pre_locked_node = None
+
+        # Update mempool stats after handing off / releasing match protection.
         self._update_mempool_metrics()
 
     def _build_radix_shmem_engine(self,
@@ -413,7 +485,19 @@ class GlobalCacheEngine:
             device_type=device_type,
             num_total_blocks=num_blocks,
             tokens_per_block=self.cache_config.tokens_per_block,
-            shm_name=shm_name_for(device_type, self._shm_radix_server_id),
+            shm_name=shm_name_for(
+                device_type,
+                self._shm_radix_server_id,
+                rank=getattr(GLOBAL_CONFIG_FROM_ENV, "radix_rank", 0),
+                world_size=getattr(
+                    GLOBAL_CONFIG_FROM_ENV, "radix_world_size", 1
+                ),
+                cluster_id=getattr(
+                    GLOBAL_CONFIG_FROM_ENV,
+                    "radix_cluster_id",
+                    self._shm_radix_server_id,
+                ),
+            ),
             evict_ratio=self.evict_ratio,
             evict_start_threshold=self.evict_start_threshold,
             hit_reward_seconds=self.hit_reward_seconds,
@@ -421,6 +505,18 @@ class GlobalCacheEngine:
             event_collector=event_collector,
             metrics_collector=self._metrics_collector,
             protected_threshold=self.protected_threshold,
+            peer_enabled=(
+                self.cache_config.enable_p2p_cpu
+                if device_type == DeviceType.CPU else
+                self.cache_config.enable_p2p_ssd
+                if device_type == DeviceType.SSD else False
+            ),
+            redis_meta=getattr(self, "redis_meta", None),
+            radix_cluster_id=getattr(
+                GLOBAL_CONFIG_FROM_ENV,
+                "radix_cluster_id",
+                self._shm_radix_server_id,
+            ),
         )
 
     def start(self) -> None:
@@ -499,8 +595,10 @@ class GlobalCacheEngine:
                                      tokens_per_block=self.cache_config.tokens_per_block,
                                      namespace=namespace)
 
+        # LAKE and P2P are mutually exclusive (validated at config), so each
+        # impl owns exactly one extended plan: peer reuse / GDS direct routes
+        # without lake, or lake staging without any peer.  Mirrors PUT's split.
         if not self.cache_config.enable_lake or temp_cache_strategy.ignore_lake:
-            # from this entrance, we will also handle the case of peer_cpu and peer_ssd
             (transfer_graph, finished_ops_ids, node_to_unlock,
              op_node_to_ready, buffer_to_free, num_gpu_blocks_to_transfer) = \
                 self._get_impl_without_lake(
@@ -513,7 +611,6 @@ class GlobalCacheEngine:
                     temp_cache_strategy
                 )
         else:
-            #TODO pcfs will be supported later
             (transfer_graph, finished_ops_ids, node_to_unlock,
              op_node_to_ready, buffer_to_free, num_gpu_blocks_to_transfer) = \
                 self._get_impl_with_lake(
@@ -535,11 +632,6 @@ class GlobalCacheEngine:
         return_mask[block_start_idx* self.tokens_per_block:
                     (block_start_idx + num_gpu_blocks_to_transfer) * self.tokens_per_block] = True
 
-        # if layer_num // layer_granularity != 1:
-        #     transfer_graph, finished_ops_ids = convert_read_graph_to_layer_wise_graph(transfer_graph=transfer_graph,
-        #                                                                         finished_ops_ids=finished_ops_ids,
-        #                                                                         layer_num=layer_num,
-        #                                                                         layer_granularity=layer_granularity)
         transfer_graph.bind_to_dp_group(dp_id)
 
         # lock_node + match pre-lock release happens inside the _impl methods
@@ -550,17 +642,78 @@ class GlobalCacheEngine:
                            buffer_to_free=buffer_to_free)
 
         op_callback_dict = {} # dict, op_id -> callback
-        for op_id in op_node_to_ready:
+        for op_id, (device_type, nodes) in op_node_to_ready.items():
             op_callback_dict[op_id] = partial(self._op_callback,
-                                              device_type=op_node_to_ready[op_id][0],
-                                              node_to_ready=op_node_to_ready[op_id][1],
-                                              ready_length=op_node_to_ready[op_id][2])
+                                              device_type=device_type,
+                                              nodes=nodes)
 
         # Update mempool metrics after GET operation
         if self._metrics_collector is not None:
             self._update_mempool_metrics()
 
         return transfer_graph, return_mask, callback, op_callback_dict, task_end_op_id
+
+    @staticmethod
+    def _completion_nodes(match: MatchResult, localities) -> List[RadixNodeLike]:
+        """The matched ready node(s) protecting the localities a tier serves.
+
+        Returns the ``last_ready_node`` of exactly the sides the plan uses — the
+        local prefix and/or the peer suffix.  A radixshmem match collapses to the
+        single query guard (only one side carries it); a hie peer match yields
+        the two concrete nodes in its two trees.  No group wrapper: the caller
+        holds a flat list and locks / releases each node one at a time.
+        """
+        nodes: List[RadixNodeLike] = []
+        if (CacheLocality.LOCAL in localities and
+                match.local.last_ready_node is not None):
+            nodes.append(match.local.last_ready_node)
+        if (CacheLocality.PEER in localities and match.remote is not None and
+                match.remote.last_ready_node is not None):
+            nodes.append(match.remote.last_ready_node)
+        return nodes
+
+    @staticmethod
+    def _promote_apply(engine,
+                       sequence_meta: SequenceMeta,
+                       dest_blocks: np.ndarray,
+                       *,
+                       num_insert_blocks: int,
+                       match_result: Optional[MatchResultAccel],
+                       completion_nodes: List[RadixNodeLike],
+                       replace: bool,
+                       blocks_to_free: List[np.ndarray],
+                       op_node_to_ready: Dict,
+                       device_type: DeviceType,
+                       ready_op_id: Optional[int]) -> None:
+        """The mechanical tail shared by every promotion case.
+
+        Insert ``dest_blocks`` as an unready suffix extending ``match_result``'s
+        ready prefix, fold the inserted node into the tier's flat completion
+        list, wire the optional early-ready op, and recycle any slots the index
+        did not attach.  Mutates ``completion_nodes`` / ``blocks_to_free`` /
+        ``op_node_to_ready`` in place (no rebind, so aliases stay valid).
+
+        ``replace=True`` drops the matched node — the inserted descendant pins
+        the same prefix, so the matched guard is released at hand-off.
+        ``replace=False`` keeps the matched node *beside* the inserted one: its
+        guard still protects a separate, still-needed source (the peer slots).
+        """
+        inserted, unused = engine.insert(
+            sequence_meta, dest_blocks,
+            num_insert_blocks=num_insert_blocks,
+            is_ready=False, match_result=match_result,
+        )
+        if inserted is not None:
+            if replace:
+                completion_nodes[:] = [inserted]
+            else:
+                completion_nodes.append(inserted)
+            if ready_op_id is not None:
+                op_node_to_ready[ready_op_id] = (device_type, [inserted])
+        # Runs even when inserted is None: a distributed shmem insert can attach
+        # nothing yet still hand back slots the caller must recycle.
+        if len(unused) > 0:
+            blocks_to_free.append(unused)
 
     def _get_impl_with_lake(self,
                             request_id: int,
@@ -570,229 +723,241 @@ class GlobalCacheEngine:
                             gpu_block_ids: np.ndarray,
                             layer_num: int,
                             temp_cache_strategy: CacheStrategy) \
-                 -> Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int]:
-        """
-        transfer pattern:
+                               -> Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int]:
+        """Plan and build a GET graph across cpu / ssd / lake.
 
-        GPU: (gpu cached) | fragment1 | fragment2      | fragment3      | (need compute)
-                               ↑          ↑               ↑
-        CPU:     ...      | fragment1 | fragment2(new) | fragment3(new) ← (from LAKE)
-                                          ↑               ↓
-        SSD:     ...      | fragment1 | fragment2      | fragment3(new)
-
+        Phase 1 (:func:`get_media_list`) decides *which* media serve the queried
+        prefix; the inlined phase 2 decides *how* each reaches the GPU and applies
+        promotion.  The lake path stages every tier to host first (GDS / peer->GPU
+        direct routes are unsupported alongside it), and LAKE and P2P are mutually
+        exclusive (validated at config), so no peer segment ever appears here.
         """
+        nvtx_range = nvtx.start_range(
+            message=f"CacheEngine._get_impl_with_lake[{request_id}]", color="cyan")
         enable_gpu = not temp_cache_strategy.ignore_gpu
-        enable_cpu = self.cache_config.enable_cpu
-        enable_ssd = self.cache_config.enable_ssd
-        enable_lake = self.cache_config.enable_lake and not temp_cache_strategy.ignore_lake
-        assert enable_cpu and enable_lake
+        enable_ssd = self.cache_config.enable_ssd and not temp_cache_strategy.ignore_ssd
+        assert self.cache_config.enable_cpu
         assert self.cpu_cache_engine is not None
         assert self.lake_cache_engine is not None
-        cpu_matched_result, ssd_matched_result, lake_matched_result = self.match_with_lake(sequence_meta)
-        cpu_matched_blocks = cpu_matched_result.physical_blocks[
-            :cpu_matched_result.num_ready_matched_blocks][block_mask_start:block_mask_end]
-        ssd_matched_blocks = ssd_matched_result.physical_blocks[
-            :ssd_matched_result.num_ready_matched_blocks][block_mask_start:block_mask_end]
-        lake_matched_blocks = lake_matched_result.physical_blocks[
-            :lake_matched_result.num_ready_matched_blocks][block_mask_start:block_mask_end]
-        shared_pcfs_read = self.cache_config.enable_kv_sharing
-        lake_file_nodeids = None
-        if shared_pcfs_read:
-            lake_file_nodeids = lake_matched_result.block_node_ids
-        fragment123_num_blocks = max(len(cpu_matched_blocks), len(ssd_matched_blocks), len(lake_matched_blocks))
-        #early return if no blocks to transfer
-        if fragment123_num_blocks == 0:
-            # All cache levels missed - record miss for all requested blocks
-            if self._metrics_collector is not None:
-                total_query_blocks = block_mask_end - block_mask_start
-                if total_query_blocks > 0:
-                    self._metrics_collector.record_cache_miss(total_query_blocks)
+
+        cpu_match, ssd_match, lake_match = self.match_all(
+            sequence_meta,
+            temp_cache_strategy=temp_cache_strategy,
+            is_put=False,
+            gpu_matched_blocks=block_mask_start,
+        )
+        segments = get_media_list(
+            cpu_match, ssd_match, lake_match,
+            block_mask_start=block_mask_start,
+            block_mask_end=block_mask_end,
+        )
+        total_query_blocks = block_mask_end - block_mask_start
+        if not segments:
+            if self._metrics_collector is not None and total_query_blocks > 0:
+                self._metrics_collector.record_cache_miss(total_query_blocks)
+            nvtx.end_range(nvtx_range)
             self._release_match_pre_locks(
-                cpu_result=cpu_matched_result,
-                ssd_result=ssd_matched_result,
-                lake_result=lake_matched_result)
+                cpu_result=cpu_match,
+                ssd_result=ssd_match,
+                lake_result=lake_match)
             return self._empty_get_return(request_id)
-        assert fragment123_num_blocks <= len(gpu_block_ids)
 
-        transfer_graph = TransferOpGraph()
-        finished_ops_ids = []
+        num_gpu_blocks = segments[-1].logical_end - block_mask_start
+        assert num_gpu_blocks <= len(gpu_block_ids)
 
-        fragment1_num_blocks = len(cpu_matched_blocks)
-        fragment2_num_blocks = max(len(ssd_matched_blocks) - len(cpu_matched_blocks), 0)
-        fragment12_num_blocks = max(len(cpu_matched_blocks), len(ssd_matched_blocks))
-        fragment3_num_blocks = max(len(lake_matched_blocks) - fragment12_num_blocks, 0)
-        fragment23_num_blocks = fragment2_num_blocks + fragment3_num_blocks
+        # Lake stages every tier to host first, so GDS and direct peer->GPU
+        # routes are both off.
+        num_staging = plan_routes(
+            segments,
+            enable_gpu=enable_gpu,
+            enable_gds=False,
+            enable_peer_gpu=False,
+        )
 
-        fragment123_gpu_blocks = gpu_block_ids[:fragment123_num_blocks]
-        fragment123_cpu_blocks = cpu_matched_blocks
-        fragment2_ssd_blocks = ssd_matched_blocks[-fragment2_num_blocks:]
-        fragment3_lake_blocks = lake_matched_blocks[-fragment3_num_blocks:]
-        fragment3_lake_file_nodeids = None
-        if shared_pcfs_read:
-            fragment3_lake_file_nodeids = lake_file_nodeids[-fragment3_num_blocks:]
-        cpu_node_to_unlock = cpu_matched_result.last_ready_node
-        ssd_node_to_unlock = ssd_matched_result.last_ready_node
-        lake_node_to_unlock = lake_matched_result.last_ready_node
-        cpu_blocks_to_free = np.array([], dtype=np.int64)
-        ssd_blocks_to_free = np.array([], dtype=np.int64)
+        nvtx.push_range(f"take {num_staging} cpu blocks", color="green")
+        cpu_staging_blocks = self.cpu_cache_engine.take(
+            num_required_blocks=num_staging,
+            protected_node=cpu_match.local.last_node,
+            strict=False,
+        )
+        nvtx.pop_range()
+        if len(cpu_staging_blocks) < num_staging:
+            self.cpu_cache_engine.recycle(cpu_staging_blocks)
+            if self._metrics_collector is not None:
+                self._metrics_collector.record_allocation_failure("local")
+            nvtx.end_range(nvtx_range)
+            self._release_match_pre_locks(
+                cpu_result=cpu_match,
+                ssd_result=ssd_match,
+                lake_result=lake_match)
+            return self._empty_get_return(request_id)
 
-        if fragment23_num_blocks > 0:
-            num_extra_required_blocks = fragment23_num_blocks
-            fragment23_cpu_blocks = self.cpu_cache_engine.take(
-                num_required_blocks=num_extra_required_blocks,
-                protected_node=cpu_matched_result.last_node,
-                strict=True
+        transfer_graph, finished_ops_ids, _h2d_ops = build_transfer_graph(
+            segments,
+            staging_blocks=cpu_staging_blocks,
+            block_mask_start=block_mask_start,
+            layer_num=layer_num,
+        )
+        op_node_to_ready: Dict[int, Tuple[DeviceType, List[RadixNodeLike]]] = {}
+
+        used: Dict[DeviceType, set] = {}
+        for seg in segments:
+            used.setdefault(seg.tier, set()).add(seg.locality)
+        cpu_nodes = GlobalCacheEngine._completion_nodes(
+            cpu_match, used.get(DeviceType.CPU, set()))
+        ssd_nodes = GlobalCacheEngine._completion_nodes(
+            ssd_match, used.get(DeviceType.SSD, set()))
+        lake_nodes = GlobalCacheEngine._completion_nodes(
+            lake_match, used.get(DeviceType.LAKE, set()))
+        cpu_blocks_to_free: List[np.ndarray] = []
+        ssd_blocks_to_free: List[np.ndarray] = []
+        promoted_ids = set()  # id(seg) whose staging was inserted into an index
+
+        local_cpu = cpu_match.local
+        local_cpu_ready = local_cpu.num_ready_matched_blocks
+
+        # (B) Promote a staged lower-tier (SSD / LAKE) suffix into the local CPU
+        # index when CPU is a fully-ready local prefix.  The inserted descendant
+        # pins that prefix, so it REPLACES the matched node.
+        lower_staged = [
+            seg for seg in segments
+            if seg.tier in (DeviceType.SSD, DeviceType.LAKE) and seg.needs_staging
+        ]
+        if lower_staged:
+            first = lower_staged[0]
+            has_lake = any(s.tier == DeviceType.LAKE for s in lower_staged)
+            triggers = {
+                s.h2d_op.op_id: s.h2d_op
+                for s in lower_staged if s.h2d_op is not None
+            }
+            if not triggers:
+                triggers = {
+                    s.primary_op.op_id: s.primary_op
+                    for s in lower_staged if s.primary_op is not None
+                }
+            base_ok = (
+                local_cpu_ready == local_cpu.num_matched_blocks and
+                block_mask_start <= local_cpu_ready and
+                first.logical_start == local_cpu_ready
             )
-            if len(fragment23_cpu_blocks) < num_extra_required_blocks:
-                self.cpu_cache_engine.recycle(fragment23_cpu_blocks)
-                # Record allocation failure (resource unavailable, not cache miss)
-                if self._metrics_collector is not None:
-                    self._metrics_collector.record_allocation_failure("global")
-                self._release_match_pre_locks(
-                    cpu_result=cpu_matched_result,
-                    ssd_result=ssd_matched_result,
-                    lake_result=lake_matched_result)
-                return self._empty_get_return(request_id)
-            fragment123_cpu_blocks = np.concatenate([fragment123_cpu_blocks, fragment23_cpu_blocks])
-            # we only insert the buffer blocks to cpu cache engine only:
-            # 1. the cpu cache engine satisfies prefix cache after insertion
-            # 2. the sequence is all ready blocks
-            if (cpu_matched_result.num_ready_matched_blocks >= block_mask_start and
-                cpu_matched_result.num_ready_matched_blocks == cpu_matched_result.num_matched_blocks):
-                cpu_node_to_unlock, cpu_unused = self.cpu_cache_engine.insert(
-                    sequence_meta,
-                    fragment23_cpu_blocks,
-                    num_insert_blocks=fragment123_num_blocks + block_mask_start,
-                    is_ready=False,
-                    match_result=cpu_matched_result)
-                # Slots radixshmem didn't attach (race with another DP) MUST
-                # be recycled only after the in-flight transfer that still
-                # references them has completed — defer via buffer_to_free.
-                if cpu_unused.size > 0:
-                    cpu_blocks_to_free = np.concatenate([cpu_blocks_to_free, cpu_unused])
-            else:
-                cpu_blocks_to_free = fragment23_cpu_blocks
+            # A pure-SSD promotion needs one feeding op so it can flip ready
+            # early; a lake promotion spans multiple source tiers, so it only
+            # flips ready at graph completion.
+            if base_ok and (has_lake or len(triggers) == 1):
+                ready_op_id = (
+                    next(iter(triggers))
+                    if not has_lake and len(triggers) == 1 else None
+                )
+                GlobalCacheEngine._promote_apply(
+                    self.cpu_cache_engine, sequence_meta,
+                    np.concatenate([s.staging for s in lower_staged]),
+                    num_insert_blocks=block_mask_start + num_gpu_blocks,
+                    match_result=local_cpu,
+                    completion_nodes=cpu_nodes, replace=True,
+                    blocks_to_free=cpu_blocks_to_free,
+                    op_node_to_ready=op_node_to_ready,
+                    device_type=DeviceType.CPU, ready_op_id=ready_op_id,
+                )
+                promoted_ids.update(id(s) for s in lower_staged)
 
-        # Record cache hit/miss metrics after confirming successful allocation
+        # (C) Promote a LAKE suffix into the local SSD index (extra H2DISK) when
+        # it cleanly extends a fully-ready local SSD prefix.
+        lake_segs = [seg for seg in segments if seg.tier == DeviceType.LAKE]
+        if enable_ssd and lake_segs and self.ssd_cache_engine is not None:
+            local_ssd = ssd_match.local
+            first_lake = lake_segs[0]
+            lake_block_count = sum(s.num_blocks for s in lake_segs)
+            can_promote_ssd = (
+                local_ssd.num_ready_matched_blocks == local_ssd.num_matched_blocks and
+                block_mask_start <= local_ssd.num_ready_matched_blocks and
+                first_lake.logical_start == local_ssd.num_ready_matched_blocks
+            )
+            if can_promote_ssd:
+                lake_ssd_blocks = self.ssd_cache_engine.take(
+                    num_required_blocks=lake_block_count,
+                    protected_node=local_ssd.last_node,
+                    strict=False,
+                )
+                if len(lake_ssd_blocks) == lake_block_count:
+                    op_h2disk = TransferOp(
+                        graph_id=transfer_graph.graph_id,
+                        transfer_type=TransferType.H2DISK,
+                        src_block_ids=np.concatenate(
+                            [s.staging for s in lake_segs]),
+                        dst_block_ids=lake_ssd_blocks,
+                        layer_id=0,
+                        layer_granularity=layer_num,
+                    )
+                    transfer_graph.add_transfer_op(op_h2disk)
+                    for s in lake_segs:
+                        assert s.primary_op is not None
+                        transfer_graph.add_dependency(
+                            op_h2disk.op_id, s.primary_op.op_id)
+                    # H2D and H2DISK share the same lake staging blocks and may
+                    # run in parallel; keep the graph alive until both consume
+                    # them so the callback cannot recycle staging early.
+                    finished_ops_ids.append(op_h2disk.op_id)
+                    GlobalCacheEngine._promote_apply(
+                        self.ssd_cache_engine, sequence_meta, lake_ssd_blocks,
+                        num_insert_blocks=first_lake.logical_start + lake_block_count,
+                        match_result=local_ssd,
+                        completion_nodes=ssd_nodes, replace=True,
+                        blocks_to_free=ssd_blocks_to_free,
+                        op_node_to_ready=op_node_to_ready,
+                        device_type=DeviceType.SSD, ready_op_id=None,
+                    )
+                else:
+                    self.ssd_cache_engine.recycle(lake_ssd_blocks)
+
+        # Recycle staging that no promotion adopted into an index.
+        for seg in segments:
+            if seg.staging is not None and id(seg) not in promoted_ids:
+                cpu_blocks_to_free.append(seg.staging)
+
+        node_to_unlock: Dict[DeviceType, List[RadixNodeLike]] = {}
+        if cpu_nodes:
+            node_to_unlock[DeviceType.CPU] = cpu_nodes
+        if ssd_nodes:
+            node_to_unlock[DeviceType.SSD] = ssd_nodes
+        if lake_nodes:
+            node_to_unlock[DeviceType.LAKE] = lake_nodes
+
+        buffer_to_free: Dict[DeviceType, np.ndarray] = {}
+        if cpu_blocks_to_free:
+            buffer_to_free[DeviceType.CPU] = np.concatenate(cpu_blocks_to_free)
+        if ssd_blocks_to_free:
+            buffer_to_free[DeviceType.SSD] = np.concatenate(ssd_blocks_to_free)
+
+        # This is for sync get
+        transfer_graph.set_gpu_blocks(gpu_block_ids)
+
         if self._metrics_collector is not None:
-            total_query_blocks = block_mask_end - block_mask_start
-            # CPU hit blocks (directly from CPU cache)
-            self._metrics_collector.record_cache_hit("cpu", fragment1_num_blocks)
-            # SSD hit blocks (blocks loaded from SSD)
-            self._metrics_collector.record_cache_hit("ssd", fragment2_num_blocks)
-            # Lake hit blocks (blocks loaded from lake)
-            self._metrics_collector.record_cache_hit("lake", fragment3_num_blocks)
-            # Miss blocks (not in any cache)
-            miss_blocks = total_query_blocks - fragment123_num_blocks
+            cpu_ready = min(block_mask_end, cpu_match.peer_ready)
+            ssd_ready = min(block_mask_end, ssd_match.peer_ready)
+            lake_ready = min(block_mask_end, lake_match.peer_ready)
+            self._metrics_collector.record_cache_hit(
+                "cpu", max(0, cpu_ready - block_mask_start))
+            self._metrics_collector.record_cache_hit(
+                "ssd", max(0, ssd_ready - max(cpu_ready, block_mask_start)))
+            self._metrics_collector.record_cache_hit(
+                "lake",
+                max(0, lake_ready - max(cpu_ready, ssd_ready, block_mask_start)))
+            miss_blocks = total_query_blocks - num_gpu_blocks
             if miss_blocks > 0:
                 self._metrics_collector.record_cache_miss(miss_blocks)
 
-        op_disk2h = None
-        if fragment2_num_blocks > 0:
-            op_disk2h = TransferOp(
-                graph_id = transfer_graph.graph_id,
-                transfer_type = TransferType.DISK2H,
-                src_block_ids = fragment2_ssd_blocks,
-                dst_block_ids = fragment123_cpu_blocks[fragment1_num_blocks:fragment12_num_blocks],
-                layer_id = 0,
-                layer_granularity = layer_num
-            )
-            transfer_graph.add_transfer_op(op_disk2h)
-
-        op_lake2h = None
-        if fragment3_num_blocks > 0:
-            op_lake2h = TransferOp(
-                graph_id = transfer_graph.graph_id,
-                transfer_type = TransferType.LAKE2H,
-                src_block_ids = fragment3_lake_blocks,
-                dst_block_ids = fragment123_cpu_blocks[-fragment3_num_blocks:],
-                layer_id = 0,
-                layer_granularity = layer_num,
-                src_block_node_ids = fragment3_lake_file_nodeids
-            )
-            transfer_graph.add_transfer_op(op_lake2h)
-
-        # prepare ssd blocks to transfer
-        write_ssd_blocks_from_lake = False
-        if (enable_ssd and
-            op_lake2h is not None and
-            ssd_matched_result.num_ready_matched_blocks >= block_mask_start and
-            ssd_matched_result.num_ready_matched_blocks == ssd_matched_result.num_matched_blocks):
-            # only when the above all are satisfied, we load data back from cpu to ssd
-            write_ssd_blocks_from_lake = True
-            fragment3_ssd_blocks = self.ssd_cache_engine.take(
-                num_required_blocks=fragment3_num_blocks,
-                protected_node=ssd_matched_result.last_node,
-                strict=False
-            )
-            if len(fragment3_ssd_blocks) < fragment3_num_blocks:
-                self.ssd_cache_engine.recycle(fragment3_ssd_blocks)
-                write_ssd_blocks_from_lake = False
-            if write_ssd_blocks_from_lake:
-                op_h2disk = TransferOp(
-                    graph_id = transfer_graph.graph_id,
-                    transfer_type = TransferType.H2DISK,
-                    src_block_ids = fragment123_cpu_blocks[-fragment3_num_blocks:],
-                    dst_block_ids = fragment3_ssd_blocks,
-                    layer_id = 0,
-                    layer_granularity = layer_num
-                )
-                transfer_graph.add_transfer_op(op_h2disk)
-                transfer_graph.add_dependency(op_h2disk.op_id, op_lake2h.op_id)
-
-                ssd_node_to_unlock, ssd_unused = self.ssd_cache_engine.insert(
-                    sequence_meta,
-                    fragment3_ssd_blocks,
-                    num_insert_blocks=fragment123_num_blocks + block_mask_start,
-                    is_ready=False,
-                    match_result=ssd_matched_result)
-                if ssd_unused.size > 0:
-                    ssd_blocks_to_free = np.concatenate([ssd_blocks_to_free, ssd_unused])
-        if enable_gpu:
-            op_h2d = TransferOp(
-                graph_id = transfer_graph.graph_id,
-                transfer_type = TransferType.H2D,
-                src_block_ids = fragment123_cpu_blocks,
-                dst_block_ids = fragment123_gpu_blocks,
-                layer_id = 0,
-                layer_granularity = layer_num
-            )
-            transfer_graph.add_transfer_op(op_h2d)
-            if op_disk2h is not None:
-                transfer_graph.add_dependency(op_h2d.op_id, op_disk2h.op_id)
-            if op_lake2h is not None:
-                transfer_graph.add_dependency(op_h2d.op_id, op_lake2h.op_id)
-            finished_ops_ids.append(op_h2d.op_id)
-
-        node_to_unlock = {}
-        if cpu_node_to_unlock is not None:
-            node_to_unlock[DeviceType.CPU] = (cpu_node_to_unlock, cpu_node_to_unlock.size())
-        if ssd_node_to_unlock is not None:
-            node_to_unlock[DeviceType.SSD] = (ssd_node_to_unlock, ssd_node_to_unlock.size())
-        if lake_node_to_unlock is not None:
-            node_to_unlock[DeviceType.LAKE] = (lake_node_to_unlock, lake_node_to_unlock.size())
-
-        buffer_to_free = {DeviceType.CPU: cpu_blocks_to_free}
-        if ssd_blocks_to_free.size > 0:
-            buffer_to_free[DeviceType.SSD] = ssd_blocks_to_free
-
         # Take over protection from the match's atomic pre-lock: lock the
-        # to-be-unlocked nodes (their inserted descendant in some cases) and
-        # then drop the pre-lock. The tree invariant in radixshmem means a
-        # locked descendant also pins its ancestors, so the pre-lock becomes
-        # redundant once lock_node has been applied. Releasing it here closes
-        # the per-match ref leak that would otherwise pin nodes forever.
-        for device_type in node_to_unlock:
-            self.cache_engines[device_type].lock_node(node_to_unlock[device_type][0])
-        self._release_match_pre_locks(
-            cpu_result=cpu_matched_result,
-            ssd_result=ssd_matched_result,
-            lake_result=lake_matched_result)
-
-        # NOTE: for now in build transfer graph, we assume that cpu works as a cache for ssd
+        # completion nodes (their inserted descendant in the promotion cases),
+        # then drop the pre-lock so a per-match ref is never leaked.
+        self._handoff_locks(
+            node_to_unlock,
+            cpu_result=cpu_match,
+            ssd_result=ssd_match,
+            lake_result=lake_match)
+        nvtx.end_range(nvtx_range)
         return (
-            transfer_graph, finished_ops_ids, node_to_unlock, {}, buffer_to_free,
-            len(fragment123_gpu_blocks) if enable_gpu else 0  # op_node_to_ready: {}
+            transfer_graph, finished_ops_ids, node_to_unlock, op_node_to_ready,
+            buffer_to_free, num_gpu_blocks if enable_gpu else 0
         )
 
     def _get_impl_without_lake(self,
@@ -803,239 +968,216 @@ class GlobalCacheEngine:
                                gpu_block_ids: np.ndarray,
                                layer_num: int,
                                temp_cache_strategy: CacheStrategy) \
-                            -> Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int]:
-        """
-        transfer pattern:
+            -> Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int]:
+        """Plan and build a GET graph across cpu / ssd (no lake tier).
 
-        GPU          : (gpu cached) | fragment1 | fragment2      | (need compute)
-                               ↑          ↑
-        CPU(+peerCPU):     ...      | fragment1 | fragment2(new) | (uncached)
-                                          ↑
-        SSD(+peerSSD):     ...      | fragment1 | fragment2      | (uncached)
-
+        Phase 1 (:func:`get_media_list`) decides *which* media serve the queried
+        prefix; the inlined phase 2 decides *how* each reaches the GPU and applies
+        promotion.  Covers local/peer cpu and local/peer ssd, with optional GDS
+        and direct peer->GPU routes.  LAKE and P2P are mutually exclusive
+        (validated at config), so no lake segment ever appears here.
         """
-        nvtx_range = nvtx.start_range(message=f"CacheEngine._get_impl_without_lake[{request_id}]", color="cyan")
+        nvtx_range = nvtx.start_range(
+            message=f"CacheEngine._get_impl_without_lake[{request_id}]", color="cyan")
         enable_gpu = not temp_cache_strategy.ignore_gpu
-        enable_cpu = self.cache_config.enable_cpu
-        enable_ssd = self.cache_config.enable_ssd and not temp_cache_strategy.ignore_ssd
         enable_gds = self.cache_config.enable_gds and not temp_cache_strategy.ignore_gds
-        assert enable_cpu
+        enable_peer_gpu = enable_gpu and self.cache_config.enable_p2p_gpu
+        assert self.cache_config.enable_cpu
         assert self.cpu_cache_engine is not None
 
-        cpu_matched_result, ssd_matched_result = self.match_without_lake(sequence_meta, temp_cache_strategy, is_put=False, gpu_matched_blocks=block_mask_start)
-
-
-        # DEBUG: Log GET operation with hash info
-        #if len(sequence_meta.block_hashes) > 0:
-        #    print(f"[GET {request_id}] hash[0]={sequence_meta.block_hashes[0]}, CPU={cpu_matched_result.num_matched_blocks}/{cpu_matched_result.num_ready_matched_blocks}, SSD={ssd_matched_result.num_matched_blocks}/{ssd_matched_result.num_ready_matched_blocks}, pos_CPU={cpu_matched_result.matched_pos}, pos_SSD={ssd_matched_result.matched_pos}")
-
-        # tailor the blocks to assure:
-        # the blocks are needed by the mask & the blocks are ready
-        cpu_matched_blocks = cpu_matched_result.physical_blocks[:cpu_matched_result.num_ready_matched_blocks]
-        cpu_matched_blocks = cpu_matched_blocks[block_mask_start:block_mask_end]
-        # if ssd disabled, len(ssd_physical_blocks) is 0
-        ssd_matched_blocks = ssd_matched_result.physical_blocks[:ssd_matched_result.num_ready_matched_blocks]
-        ssd_matched_blocks = ssd_matched_blocks[block_mask_start:block_mask_end]
-
-        # TODO: is this possible?
-        if len(cpu_matched_blocks) > len(ssd_matched_blocks):
-            ssd_matched_blocks = np.array([], dtype=np.int64)
-
-        fragment12_num_blocks = max(len(cpu_matched_blocks), len(ssd_matched_blocks))
-        fragment1_num_blocks = len(cpu_matched_blocks)
-        fragment2_num_blocks = max(len(ssd_matched_blocks) - len(cpu_matched_blocks), 0)
-        #early return if no blocks to transfer
-        if fragment12_num_blocks == 0:
-            # All cache levels missed - record miss for all requested blocks
-            if self._metrics_collector is not None:
-                total_query_blocks = block_mask_end - block_mask_start
-                if total_query_blocks > 0:
-                    self._metrics_collector.record_cache_miss(total_query_blocks)
+        cpu_match, ssd_match, _lake_match = self.match_all(
+            sequence_meta,
+            temp_cache_strategy=temp_cache_strategy,
+            is_put=False,
+            gpu_matched_blocks=block_mask_start,
+        )
+        segments = get_media_list(
+            cpu_match, ssd_match, None,
+            block_mask_start=block_mask_start,
+            block_mask_end=block_mask_end,
+        )
+        total_query_blocks = block_mask_end - block_mask_start
+        if not segments:
+            if self._metrics_collector is not None and total_query_blocks > 0:
+                self._metrics_collector.record_cache_miss(total_query_blocks)
             nvtx.end_range(nvtx_range)
             self._release_match_pre_locks(
-                cpu_result=cpu_matched_result,
-                ssd_result=ssd_matched_result)
+                cpu_result=cpu_match,
+                ssd_result=ssd_match)
             return self._empty_get_return(request_id)
-        assert fragment12_num_blocks <= len(gpu_block_ids)
 
-        transfer_graph = TransferOpGraph()
-        finished_ops_ids = []
-        op_node_to_ready = {}
+        num_gpu_blocks = segments[-1].logical_end - block_mask_start
+        assert num_gpu_blocks <= len(gpu_block_ids)
 
-        fragment12_gpu_blocks = gpu_block_ids[:fragment12_num_blocks]
-        fragment2_ssd_blocks = ssd_matched_blocks[-fragment2_num_blocks:]
-        fragment1_cpu_blocks = cpu_matched_blocks[:fragment1_num_blocks]
+        num_staging = plan_routes(
+            segments,
+            enable_gpu=enable_gpu,
+            enable_gds=enable_gds,
+            enable_peer_gpu=enable_peer_gpu,
+        )
 
-        cpu_node_to_unlock = cpu_matched_result.last_ready_node
-        ssd_node_to_unlock = ssd_matched_result.last_ready_node
-
-        # prepare cpu blocks to transfer
-        cpu_blocks_to_free = np.array([], dtype=np.int64)
-        op_disk2h = None
-        op_gds_transfer = None
-        fragment2_cpu_blocks = None
-
-        #allocated new cpu blocks for this request
-        allocated_cpu_block_num = fragment2_num_blocks
-        # NOTE: When matched_pos is "remote", we ALWAYS need to allocate local CPU blocks
-        # to receive the data, regardless of whether we insert to local index or not
-        if cpu_matched_result.matched_pos == "remote" and fragment1_num_blocks > 0:
-            allocated_cpu_block_num += fragment1_num_blocks
-        nvtx.push_range(f"take {allocated_cpu_block_num} cpu blocks", color="green")
-        allocated_cpu_blocks = self.cpu_cache_engine.take(
-            num_required_blocks=allocated_cpu_block_num,
-            protected_node=cpu_matched_result.last_node,
-            strict=False
+        nvtx.push_range(f"take {num_staging} cpu blocks", color="green")
+        cpu_staging_blocks = self.cpu_cache_engine.take(
+            num_required_blocks=num_staging,
+            protected_node=cpu_match.local.last_node,
+            strict=False,
         )
         nvtx.pop_range()
-        # NOTE: not enough space to allocate, skip the request
-        # there might be a better way to handle this
-        if len(allocated_cpu_blocks) < allocated_cpu_block_num:
-            self.cpu_cache_engine.recycle(allocated_cpu_blocks)
-            # Record allocation failure (resource unavailable, not cache miss)
+        if len(cpu_staging_blocks) < num_staging:
+            self.cpu_cache_engine.recycle(cpu_staging_blocks)
             if self._metrics_collector is not None:
                 self._metrics_collector.record_allocation_failure("local")
             nvtx.end_range(nvtx_range)
             self._release_match_pre_locks(
-                cpu_result=cpu_matched_result,
-                ssd_result=ssd_matched_result)
+                cpu_result=cpu_match,
+                ssd_result=ssd_match)
             return self._empty_get_return(request_id)
 
-        # Record cache hit/miss metrics after confirming successful allocation
+        transfer_graph, finished_ops_ids, _h2d_ops = build_transfer_graph(
+            segments,
+            staging_blocks=cpu_staging_blocks,
+            block_mask_start=block_mask_start,
+            layer_num=layer_num,
+        )
+        op_node_to_ready: Dict[int, Tuple[DeviceType, List[RadixNodeLike]]] = {}
+
+        used: Dict[DeviceType, set] = {}
+        for seg in segments:
+            used.setdefault(seg.tier, set()).add(seg.locality)
+        cpu_nodes = GlobalCacheEngine._completion_nodes(
+            cpu_match, used.get(DeviceType.CPU, set()))
+        ssd_nodes = GlobalCacheEngine._completion_nodes(
+            ssd_match, used.get(DeviceType.SSD, set()))
+        cpu_blocks_to_free: List[np.ndarray] = []
+        promoted_ids = set()  # id(seg) whose staging was inserted into an index
+
+        local_cpu = cpu_match.local
+        local_cpu_ready = local_cpu.num_ready_matched_blocks
+        cpu_has_peer = CacheLocality.PEER in used.get(DeviceType.CPU, set())
+
+        # (A) Promote a staged PEER-CPU suffix into the local CPU index so the
+        # next GET hits CPU directly.  Keeps the matched guard AND the inserted
+        # node (the inserted copy is independent of the still-needed peer source).
+        peer_cpu_segs = [
+            seg for seg in segments
+            if seg.tier == DeviceType.CPU and seg.is_peer and seg.needs_staging
+        ]
+        if peer_cpu_segs:
+            cpu_matched = max(
+                local_cpu.num_matched_blocks,
+                cpu_match.remote.num_matched_blocks if cpu_match.remote else 0,
+            )
+            first = peer_cpu_segs[0]
+            can_promote = (
+                    cpu_match.peer_ready == cpu_matched and
+                    local_cpu_ready == local_cpu.num_matched_blocks and
+                    block_mask_start <= local_cpu_ready and
+                    first.logical_start == local_cpu_ready
+            )
+            if can_promote:
+                trigger = peer_cpu_segs[-1].primary_op
+                assert trigger is not None  # a staged peer-CPU seg always has PEERH2H
+                GlobalCacheEngine._promote_apply(
+                    self.cpu_cache_engine, sequence_meta,
+                    np.concatenate([s.staging for s in peer_cpu_segs]),
+                    num_insert_blocks=cpu_match.peer_ready,
+                    match_result=(
+                        local_cpu if local_cpu.num_matched_blocks > 0 else None),
+                    completion_nodes=cpu_nodes, replace=False,
+                    blocks_to_free=cpu_blocks_to_free,
+                    op_node_to_ready=op_node_to_ready,
+                    device_type=DeviceType.CPU, ready_op_id=trigger.op_id,
+                )
+                promoted_ids.update(id(s) for s in peer_cpu_segs)
+
+        # (B) Promote a staged local/peer SSD suffix into the local CPU index when
+        # CPU is a purely-local, fully-ready prefix (no peer CPU).  The inserted
+        # descendant pins that prefix, so it REPLACES the matched node.
+        ssd_staged = [
+            seg for seg in segments
+            if seg.tier == DeviceType.SSD and seg.needs_staging
+        ]
+        if ssd_staged and not cpu_has_peer:
+            first = ssd_staged[0]
+            triggers = {
+                s.h2d_op.op_id: s.h2d_op
+                for s in ssd_staged if s.h2d_op is not None
+            }
+            if not triggers:  # when gpu not enabled
+                triggers = {
+                    s.primary_op.op_id: s.primary_op
+                    for s in ssd_staged if s.primary_op is not None
+                }
+            base_ok = (
+                    local_cpu_ready == local_cpu.num_matched_blocks and
+                    block_mask_start <= local_cpu_ready and
+                    first.logical_start == local_cpu_ready
+            )
+            # A pure-SSD promotion needs exactly one feeding op so it can flip
+            # ready early (via that op's completion callback).
+            if base_ok and len(triggers) == 1:
+                GlobalCacheEngine._promote_apply(
+                    self.cpu_cache_engine, sequence_meta,
+                    np.concatenate([s.staging for s in ssd_staged]),
+                    num_insert_blocks=block_mask_start + num_gpu_blocks,
+                    match_result=local_cpu,
+                    completion_nodes=cpu_nodes, replace=True,
+                    blocks_to_free=cpu_blocks_to_free,
+                    op_node_to_ready=op_node_to_ready,
+                    device_type=DeviceType.CPU, ready_op_id=next(iter(triggers)),
+                )
+                promoted_ids.update(id(s) for s in ssd_staged)
+
+        # Local SSD direct-to-GPU (GDS): flip the matched SSD node ready as soon
+        # as its DISK2D op completes, preserving the legacy ready-callback.
+        if ssd_nodes:
+            for seg in segments:
+                if (seg.tier == DeviceType.SSD and not seg.is_peer and
+                        seg.primary_type == TransferType.DISK2D and
+                        seg.primary_op is not None):
+                    op_node_to_ready[seg.primary_op.op_id] = (
+                        DeviceType.SSD, ssd_nodes)
+
+        # Recycle staging that no promotion adopted into an index.
+        for seg in segments:
+            if seg.staging is not None and id(seg) not in promoted_ids:
+                cpu_blocks_to_free.append(seg.staging)
+
+        node_to_unlock: Dict[DeviceType, List[RadixNodeLike]] = {}
+        if cpu_nodes:
+            node_to_unlock[DeviceType.CPU] = cpu_nodes
+        if ssd_nodes:
+            node_to_unlock[DeviceType.SSD] = ssd_nodes
+
+        buffer_to_free: Dict[DeviceType, np.ndarray] = {}
+        if cpu_blocks_to_free:
+            buffer_to_free[DeviceType.CPU] = np.concatenate(cpu_blocks_to_free)
+
+        # This is for sync get
+        transfer_graph.set_gpu_blocks(gpu_block_ids)
+
         if self._metrics_collector is not None:
-            total_query_blocks = block_mask_end - block_mask_start
-            # CPU hit blocks (directly from CPU cache)
-            self._metrics_collector.record_cache_hit("cpu", fragment1_num_blocks)
-            # SSD hit blocks (blocks loaded from SSD to CPU)
-            self._metrics_collector.record_cache_hit("ssd", fragment2_num_blocks)
-            # Miss blocks (not in any cache)
-            miss_blocks = total_query_blocks - fragment12_num_blocks
+            cpu_ready = min(block_mask_end, cpu_match.peer_ready)
+            ssd_ready = min(block_mask_end, ssd_match.peer_ready)
+            self._metrics_collector.record_cache_hit(
+                "cpu", max(0, cpu_ready - block_mask_start))
+            self._metrics_collector.record_cache_hit(
+                "ssd", max(0, ssd_ready - max(cpu_ready, block_mask_start)))
+            miss_blocks = total_query_blocks - num_gpu_blocks
             if miss_blocks > 0:
                 self._metrics_collector.record_cache_miss(miss_blocks)
 
-        if cpu_matched_result.matched_pos == "remote" and fragment1_num_blocks > 0:
-            fragment1_cpu_blocks_local = allocated_cpu_blocks[-fragment1_num_blocks:]
-            op_peerh2h = TransferOp(
-                graph_id = transfer_graph.graph_id,
-                transfer_type = TransferType.PEERH2H,
-                src_block_ids = fragment1_cpu_blocks,
-                dst_block_ids = fragment1_cpu_blocks_local,
-                layer_id = 0,
-                layer_granularity = layer_num,
-                remote_node_ids = cpu_matched_result.matched_node_ids,
-                src_block_node_ids = cpu_matched_result.matched_node_ids  # Add this for worker
-            )
-            transfer_graph.add_transfer_op(op_peerh2h)
-            #TODO here we dont combine peer cpu or local cpu match results, so we can safely add remote results to local cpu
-            #TODO here assume all matched blocks are ready blocks for peer cpu
-            if (cpu_matched_result.insert_to_local_cpu_index and
-                cpu_matched_result.num_ready_matched_blocks >= block_mask_start and
-                cpu_matched_result.num_ready_matched_blocks == cpu_matched_result.num_matched_blocks):
-                cpu_node_to_unlock, cpu_unused = self.cpu_cache_engine.insert(
-                    sequence_meta, fragment1_cpu_blocks_local, is_ready=False)
-                # insert() returns None when nothing was attached (suffix already
-                # present in the shared tree) — no unready node to flip ready.
-                if cpu_node_to_unlock is not None:
-                    op_node_to_ready[op_peerh2h.op_id] = (
-                        DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
-                if cpu_unused.size > 0:
-                    cpu_blocks_to_free = np.concatenate([cpu_blocks_to_free, cpu_unused])
-            else:
-                cpu_blocks_to_free = np.concatenate([cpu_blocks_to_free, fragment1_cpu_blocks_local])
-
-        if fragment2_num_blocks > 0:
-            if enable_gds:
-                # For GDS, transfer directly from SSD to GPU using GDS transfer path (DISK2D)
-                op_gds_transfer = TransferOp(
-                    graph_id = transfer_graph.graph_id,
-                    transfer_type = TransferType.DISK2D,
-                    src_block_ids = fragment2_ssd_blocks,
-                    dst_block_ids = fragment12_gpu_blocks[-fragment2_num_blocks:],
-                    layer_id = 0,
-                    layer_granularity = layer_num
-                )
-                transfer_graph.add_transfer_op(op_gds_transfer)
-                finished_ops_ids.append(op_gds_transfer.op_id)
-                op_node_to_ready[op_gds_transfer.op_id] = (DeviceType.SSD,
-                                                           ssd_node_to_unlock,
-                                                           ssd_node_to_unlock.size())
-            else:
-                fragment2_cpu_blocks = allocated_cpu_blocks[:fragment2_num_blocks]
-
-                op_disk2h = TransferOp(
-                    graph_id = transfer_graph.graph_id,
-                    transfer_type = TransferType.PEERSSD2H if ssd_matched_result.matched_pos == "remote" else TransferType.DISK2H,
-                    src_block_ids = fragment2_ssd_blocks,
-                    dst_block_ids = fragment2_cpu_blocks,
-                    layer_id = 0,
-                    layer_granularity = layer_num,
-                    remote_node_ids = ssd_matched_result.matched_node_ids if ssd_matched_result.matched_pos == "remote" else None,
-                    src_block_node_ids = ssd_matched_result.matched_node_ids if ssd_matched_result.matched_pos == "remote" else None
-                )
-                transfer_graph.add_transfer_op(op_disk2h)
-                # we only insert the buffer blocks to cpu cache engine only:
-                # 1. the cpu cache engine satisfies prefix cache after insertion
-                # 2. the sequence is all ready blocks
-                # TODO: for simplicity, if we use peer cpu results, we dont insert the buffer ssd blocks to local cpu any more
-                if (cpu_matched_result.matched_pos == "local" and
-                    cpu_matched_result.num_ready_matched_blocks >= block_mask_start and
-                    cpu_matched_result.num_ready_matched_blocks == cpu_matched_result.num_matched_blocks):
-                    cpu_node_to_unlock, cpu_unused = self.cpu_cache_engine.insert(
-                        sequence_meta,
-                        fragment2_cpu_blocks,
-                        num_insert_blocks=fragment12_num_blocks + block_mask_start,
-                        is_ready=False,
-                        match_result=cpu_matched_result)
-                    if cpu_node_to_unlock is not None:
-                        op_node_to_ready[op_disk2h.op_id] = (
-                            DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
-                    if cpu_unused.size > 0:
-                        cpu_blocks_to_free = np.concatenate([cpu_blocks_to_free, cpu_unused])
-                else:
-                    cpu_blocks_to_free = np.concatenate([cpu_blocks_to_free, fragment2_cpu_blocks])
-        if self.cache_config.enable_p2p_cpu and cpu_matched_result.matched_pos == "remote" and fragment1_num_blocks > 0:
-            fragment1_cpu_blocks = fragment1_cpu_blocks_local
-
-        if fragment2_cpu_blocks is not None:
-            fragment12_cpu_blocks = np.concatenate([fragment1_cpu_blocks, fragment2_cpu_blocks])
-        else:
-            fragment12_cpu_blocks = fragment1_cpu_blocks
-
-        if enable_gpu:
-            op_h2d = TransferOp(
-                graph_id = transfer_graph.graph_id,
-                transfer_type = TransferType.H2D,
-                src_block_ids = fragment12_cpu_blocks if not enable_gds else fragment1_cpu_blocks,
-                dst_block_ids = fragment12_gpu_blocks if not enable_gds \
-                    else fragment12_gpu_blocks[:fragment1_num_blocks],
-                layer_id = 0,
-                layer_granularity = layer_num
-            )
-            transfer_graph.add_transfer_op(op_h2d)
-            if op_disk2h is not None:
-                transfer_graph.add_dependency(op_h2d.op_id, op_disk2h.op_id)
-            if cpu_matched_result.matched_pos == "remote" and fragment1_num_blocks > 0:
-                transfer_graph.add_dependency(op_h2d.op_id, op_peerh2h.op_id)
-            finished_ops_ids.append(op_h2d.op_id)
-
-        node_to_unlock = {}
-        if cpu_node_to_unlock is not None:
-            node_to_unlock[DeviceType.CPU] = (cpu_node_to_unlock, cpu_node_to_unlock.size())
-        if ssd_node_to_unlock is not None:
-            node_to_unlock[DeviceType.SSD] = (ssd_node_to_unlock, ssd_node_to_unlock.size())
-        buffer_to_free = {DeviceType.CPU: cpu_blocks_to_free}
-        # Same as in _get_impl_global: take over protection from the match's
-        # atomic pre-lock by locking node_to_unlock entries first, then drop
-        # the pre-lock to avoid a per-match ref leak.
-        for device_type in node_to_unlock:
-            self.cache_engines[device_type].lock_node(node_to_unlock[device_type][0])
-        self._release_match_pre_locks(
-            cpu_result=cpu_matched_result,
-            ssd_result=ssd_matched_result)
+        # Take over protection from the match's atomic pre-lock: lock the
+        # completion nodes (their inserted descendant in the promotion cases),
+        # then drop the pre-lock so a per-match ref is never leaked.
+        self._handoff_locks(
+            node_to_unlock,
+            cpu_result=cpu_match,
+            ssd_result=ssd_match)
         nvtx.end_range(nvtx_range)
         return (
             transfer_graph, finished_ops_ids, node_to_unlock, op_node_to_ready,
-            buffer_to_free, len(fragment12_gpu_blocks) if enable_gpu else 0
+            buffer_to_free, num_gpu_blocks if enable_gpu else 0
         )
 
     def put(self,
@@ -1113,11 +1255,10 @@ class GlobalCacheEngine:
                            is_put=True)
 
         op_callback_dict = {}
-        for op_id in op_node_to_ready:
+        for op_id, (device_type, nodes) in op_node_to_ready.items():
             op_callback_dict[op_id] = partial(self._op_callback,
-                                              device_type=op_node_to_ready[op_id][0],
-                                              node_to_ready=op_node_to_ready[op_id][1],
-                                              ready_length=op_node_to_ready[op_id][2])
+                                              device_type=device_type,
+                                              nodes=nodes)
 
         # Update mempool metrics after PUT operation
         if self._metrics_collector is not None:
@@ -1158,8 +1299,12 @@ class GlobalCacheEngine:
         assert self.cpu_cache_engine is not None
         assert self.lake_cache_engine is not None
 
-        cpu_matched_result, ssd_matched_result, lake_matched_result = self.match_with_lake(
+        cpu_match, ssd_match, lake_match = self.match_all(
             sequence_meta, temp_cache_strategy=temp_cache_strategy, is_put=True)
+        # PUT is local-only; each MatchResult carries just its `.local` side.
+        cpu_matched_result = cpu_match.local
+        ssd_matched_result = ssd_match.local
+        lake_matched_result = lake_match.local
         cpu_matched_blocks = cpu_matched_result.physical_blocks[
             :cpu_matched_result.num_matched_blocks][block_mask_start:block_mask_end]
         ssd_matched_blocks = ssd_matched_result.physical_blocks[
@@ -1171,9 +1316,9 @@ class GlobalCacheEngine:
         fragment12_num_blocks = len(gpu_block_ids) - num_skipped_blocks
         if fragment12_num_blocks == 0:
             self._release_match_pre_locks(
-                cpu_result=cpu_matched_result,
-                ssd_result=ssd_matched_result,
-                lake_result=lake_matched_result)
+                cpu_result=cpu_match,
+                ssd_result=ssd_match,
+                lake_result=lake_match)
             return self._empty_put_return(request_id)
         fragment2_num_blocks = len(gpu_block_ids) - len(ssd_matched_blocks)
         if not enable_ssd:
@@ -1190,9 +1335,9 @@ class GlobalCacheEngine:
         if len(fragment12_cpu_blocks) < fragment12_num_blocks:
             self.cpu_cache_engine.recycle(fragment12_cpu_blocks)
             self._release_match_pre_locks(
-                cpu_result=cpu_matched_result,
-                ssd_result=ssd_matched_result,
-                lake_result=lake_matched_result)
+                cpu_result=cpu_match,
+                ssd_result=ssd_match,
+                lake_result=lake_match)
             return self._empty_put_return(request_id)
         put_to_ssd = False
         if enable_ssd and fragment2_num_blocks > 0:
@@ -1253,12 +1398,15 @@ class GlobalCacheEngine:
             transfer_graph.add_transfer_op(op_h2disk)
 
             transfer_graph.add_dependency(op_h2disk.op_id, op_d2h.op_id)
+            finished_ops_ids.append(op_h2disk.op_id)
 
         if put_to_lake:
             if fragment3_num_blocks > fragment12_num_blocks:
                 extra_num_cpu_blocks = fragment3_num_blocks - fragment12_num_blocks
-                fragment3_cpu_blocks = np.concatenate([fragment12_cpu_blocks,
-                                                  cpu_matched_blocks[-extra_num_cpu_blocks:]])
+                fragment3_cpu_blocks = np.concatenate([
+                    cpu_matched_blocks[-extra_num_cpu_blocks:],
+                    fragment12_cpu_blocks,
+                ])
             else:
                 fragment3_cpu_blocks = fragment12_cpu_blocks[-fragment3_num_blocks:]
             op_h2lake = TransferOp(
@@ -1271,6 +1419,7 @@ class GlobalCacheEngine:
             )
             transfer_graph.add_transfer_op(op_h2lake)
             transfer_graph.add_dependency(op_h2lake.op_id, op_d2h.op_id)
+            finished_ops_ids.append(op_h2lake.op_id)
 
         # Defer recycling of slots radixshmem didn't attach (race with another
         # DP that already inserted the same prefix). They're still committed
@@ -1298,20 +1447,19 @@ class GlobalCacheEngine:
                 buffer_to_free[DeviceType.LAKE] = lake_unused
         node_to_unlock = {}
         if cpu_node_to_unlock is not None:
-            node_to_unlock[DeviceType.CPU] = (cpu_node_to_unlock, cpu_node_to_unlock.size())
+            node_to_unlock[DeviceType.CPU] = [cpu_node_to_unlock]
         if ssd_node_to_unlock is not None:
-            node_to_unlock[DeviceType.SSD] = (ssd_node_to_unlock, ssd_node_to_unlock.size())
+            node_to_unlock[DeviceType.SSD] = [ssd_node_to_unlock]
         if lake_node_to_unlock is not None:
-            node_to_unlock[DeviceType.LAKE] = (lake_node_to_unlock, lake_node_to_unlock.size())
+            node_to_unlock[DeviceType.LAKE] = [lake_node_to_unlock]
 
-        # See _get_impl_global: take over protection via lock_node, then drop
-        # the match's atomic pre-lock so it doesn't accumulate per request.
-        for device_type in node_to_unlock:
-            self.cache_engines[device_type].lock_node(node_to_unlock[device_type][0])
-        self._release_match_pre_locks(
-            cpu_result=cpu_matched_result,
-            ssd_result=ssd_matched_result,
-            lake_result=lake_matched_result)
+        # Take over protection via lock_node, then drop the match's atomic
+        # pre-lock so it doesn't accumulate per request.
+        self._handoff_locks(
+            node_to_unlock,
+            cpu_result=cpu_match,
+            ssd_result=ssd_match,
+            lake_result=lake_match)
 
         skipped_gpu_blocks = len(cpu_matched_blocks)
         return (
@@ -1346,24 +1494,22 @@ class GlobalCacheEngine:
         assert enable_cpu
         assert self.cpu_cache_engine is not None
 
-        cpu_matched_result, ssd_matched_result = self.match_without_lake(
+        cpu_match, ssd_match, _lake_match = self.match_all(
             sequence_meta, temp_cache_strategy=temp_cache_strategy, is_put=True)
+        # PUT is local-only; each MatchResult carries just its `.local` side.
+        cpu_matched_result = cpu_match.local
+        ssd_matched_result = ssd_match.local
         cpu_matched_blocks = cpu_matched_result.physical_blocks[
             :cpu_matched_result.num_matched_blocks][block_mask_start:block_mask_end]
         ssd_matched_blocks = ssd_matched_result.physical_blocks[
             :ssd_matched_result.num_matched_blocks][block_mask_start:block_mask_end]
 
-        #if len(cpu_matched_blocks) > len(ssd_matched_blocks):
-        #    print(f"[PUT_LOCAL] CPU matched blocks are greater than SSD matched blocks, skipping")
-        #    return self._empty_put_return(request_id)
-
-
         num_skipped_blocks = len(cpu_matched_blocks)
         fragment12_num_blocks = len(gpu_block_ids) - num_skipped_blocks
         if fragment12_num_blocks == 0:
             self._release_match_pre_locks(
-                cpu_result=cpu_matched_result,
-                ssd_result=ssd_matched_result)
+                cpu_result=cpu_match,
+                ssd_result=ssd_match)
             return self._empty_put_return(request_id)
         fragment2_num_blocks = len(gpu_block_ids) - len(ssd_matched_blocks)
         if not enable_ssd:
@@ -1393,8 +1539,8 @@ class GlobalCacheEngine:
             if enable_ssd:
                 self.ssd_cache_engine.recycle(fragment2_ssd_blocks)
             self._release_match_pre_locks(
-                cpu_result=cpu_matched_result,
-                ssd_result=ssd_matched_result)
+                cpu_result=cpu_match,
+                ssd_result=ssd_match)
             return self._empty_put_return(request_id)
 
         transfer_graph = TransferOpGraph()
@@ -1446,7 +1592,7 @@ class GlobalCacheEngine:
         # already present in the shared tree) — then there is no unready node to
         # flip ready after the transfer, so skip the ready-callback bookkeeping.
         if cpu_node_to_unlock is not None:
-            op_node_to_ready[op_d2h.op_id] = (DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
+            op_node_to_ready[op_d2h.op_id] = (DeviceType.CPU, [cpu_node_to_unlock])
         if cpu_unused.size > 0:
             buffer_to_free[DeviceType.CPU] = cpu_unused
         ssd_node_to_unlock = None
@@ -1455,22 +1601,21 @@ class GlobalCacheEngine:
                 sequence_meta, fragment2_ssd_blocks,
                 is_ready=False, match_result=ssd_matched_result)
             if ssd_node_to_unlock is not None:
-                op_node_to_ready[op_h2disk.op_id] = (DeviceType.SSD, ssd_node_to_unlock, ssd_node_to_unlock.size())
+                op_node_to_ready[op_h2disk.op_id] = (DeviceType.SSD, [ssd_node_to_unlock])
             if ssd_unused.size > 0:
                 buffer_to_free[DeviceType.SSD] = ssd_unused
         node_to_unlock = {}
         if cpu_node_to_unlock is not None:
-            node_to_unlock[DeviceType.CPU] = (cpu_node_to_unlock, cpu_node_to_unlock.size())
+            node_to_unlock[DeviceType.CPU] = [cpu_node_to_unlock]
         if ssd_node_to_unlock is not None:
-            node_to_unlock[DeviceType.SSD] = (ssd_node_to_unlock, ssd_node_to_unlock.size())
+            node_to_unlock[DeviceType.SSD] = [ssd_node_to_unlock]
 
-        # See _get_impl_global: take over protection via lock_node, then drop
-        # the match's atomic pre-lock so it doesn't accumulate per request.
-        for device_type in node_to_unlock:
-            self.cache_engines[device_type].lock_node(node_to_unlock[device_type][0])
-        self._release_match_pre_locks(
-            cpu_result=cpu_matched_result,
-            ssd_result=ssd_matched_result)
+        # Take over protection via lock_node, then drop the match's atomic
+        # pre-lock so it doesn't accumulate per request.
+        self._handoff_locks(
+            node_to_unlock,
+            cpu_result=cpu_match,
+            ssd_result=ssd_match)
 
         skipped_gpu_blocks = len(cpu_matched_blocks)
         return (
@@ -1479,115 +1624,93 @@ class GlobalCacheEngine:
         )
 
     def _transfer_callback(self,
-                           node_to_unlock: Dict[DeviceType, Tuple[RadixNodeLike, int]],
+                           node_to_unlock: Dict[DeviceType, List[RadixNodeLike]],
                            buffer_to_free: Optional[Dict[DeviceType, np.ndarray]] = None,
                            is_put: bool = False) -> None:
         # Order matters: under shmradix the cache index is in shared memory and
-        # another DP's auto-evict could pick up this node the moment its ref
-        # drops to 0. We call set_ready THEN unlock. For inserted nodes the
-        # shmradix engine fuses both into one armed `finalize` (set_ready +
-        # dec_ref) fired by unlock(), so set_ready() is a no-op and unlock()
-        # does the atomic flip-then-release — closing the race by construction.
-        # For matched nodes set_ready is an idempotent hash-path no-op and
-        # unlock drops the hash-path ref.
-        if DeviceType.CPU in node_to_unlock:
-            assert self.cpu_cache_engine is not None
-            cpu_node = node_to_unlock[DeviceType.CPU][0]
-            self.cpu_cache_engine.set_ready(cpu_node, True, node_to_unlock[DeviceType.CPU][1])
-            self.cpu_cache_engine.unlock(cpu_node)
-            if is_put and self.cache_config.enable_p2p_cpu:
-                self.cpu_cache_engine.local_index.insert_and_publish(cpu_node)
-        if DeviceType.SSD in node_to_unlock:
-            assert self.ssd_cache_engine is not None
-            ssd_node = node_to_unlock[DeviceType.SSD][0]
-            self.ssd_cache_engine.set_ready(ssd_node, True, node_to_unlock[DeviceType.SSD][1])
-            self.ssd_cache_engine.unlock(ssd_node)
-            if is_put and self.cache_config.enable_p2p_ssd:
-                self.ssd_cache_engine.local_index.insert_and_publish(node_to_unlock[DeviceType.SSD][0])
-        if DeviceType.LAKE in node_to_unlock:
-            assert self.lake_cache_engine is not None
-            self.lake_cache_engine.set_ready(
-                node_to_unlock[DeviceType.LAKE][0], True, node_to_unlock[DeviceType.LAKE][1]
-            )
-            self.lake_cache_engine.unlock(node_to_unlock[DeviceType.LAKE][0])
-            if is_put and self.enable_kv_sharing:
-                self.lake_cache_engine.local_index.insert_and_publish(node_to_unlock[DeviceType.LAKE][0])
+        # another DP's auto-evict could pick up a node the moment its ref drops
+        # to 0.  Per tier we set_ready EVERY node THEN unlock EVERY node.  For an
+        # inserted node the shmradix engine fuses both into one armed `finalize`
+        # (set_ready + dec_ref) fired by unlock(), so set_ready() is a no-op and
+        # unlock() does the atomic flip-then-release.  For a matched node
+        # set_ready is an idempotent no-op and unlock drops the ref.
+        for device_type in (DeviceType.CPU, DeviceType.SSD, DeviceType.LAKE):
+            nodes = node_to_unlock.get(device_type)
+            if not nodes:
+                continue
+            engine = self.cache_engines[device_type]
+            assert engine is not None
+            for node in nodes:
+                engine.set_ready(node, True, node.size())
+            for node in nodes:
+                engine.unlock(node)
+            if is_put:
+                if device_type == DeviceType.CPU:
+                    should_publish = self.cache_config.enable_p2p_cpu
+                elif device_type == DeviceType.SSD:
+                    should_publish = self.cache_config.enable_p2p_ssd
+                else:
+                    should_publish = self.enable_kv_sharing
+                if should_publish:
+                    for node in nodes:
+                        if hasattr(engine, "publish_ready"):
+                            engine.publish_ready(node)
+                        else:
+                            engine.local_index.insert_and_publish(node)
         if buffer_to_free is not None:
-            if DeviceType.CPU in buffer_to_free:
-                assert self.cpu_cache_engine is not None
-                self.cpu_cache_engine.recycle(buffer_to_free[DeviceType.CPU])
-            if DeviceType.SSD in buffer_to_free:
-                assert self.ssd_cache_engine is not None
-                self.ssd_cache_engine.recycle(buffer_to_free[DeviceType.SSD])
-            if DeviceType.LAKE in buffer_to_free:
-                assert self.lake_cache_engine is not None
-                self.lake_cache_engine.recycle(buffer_to_free[DeviceType.LAKE])
+            for device_type in (DeviceType.CPU, DeviceType.SSD, DeviceType.LAKE):
+                blocks = buffer_to_free.get(device_type)
+                if blocks is not None:
+                    engine = self.cache_engines[device_type]
+                    assert engine is not None
+                    engine.recycle(blocks)
 
-    def _op_callback(self, device_type: DeviceType, node_to_ready: RadixNodeLike, ready_length: int) -> None:
-        if device_type == DeviceType.CPU:
-            assert self.cpu_cache_engine is not None
-            self.cpu_cache_engine.set_ready(node_to_ready, True, ready_length)
-        elif device_type == DeviceType.SSD:
-            assert self.ssd_cache_engine is not None
-            self.ssd_cache_engine.set_ready(node_to_ready, True, ready_length)
-        elif device_type == DeviceType.LAKE:
-            assert self.lake_cache_engine is not None
-            self.lake_cache_engine.set_ready(node_to_ready, True, ready_length)
+    def _op_callback(self,
+                     device_type: DeviceType,
+                     nodes: List[RadixNodeLike]) -> None:
+        engine = self.cache_engines[device_type]
+        assert engine is not None
+        for node in nodes:
+            engine.set_ready(node, True, node.size())
 
-    @nvtx.annotate("Match Prefix Accel Without Lake", color="yellow")
-    def match_without_lake(self,
-                           sequence_meta: SequenceMeta,
-                           temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY,
-                           is_put: bool = False,
-                           gpu_matched_blocks: int = 0) \
-                            -> Tuple[MatchResultAccel, MatchResultAccel]:
-        #from flexkv.common.debug import flexkv_logger
-        cpu_matched_result = MatchResultAccel()
-        ssd_matched_result = MatchResultAccel()
+    @staticmethod
+    def _empty_match() -> MatchResult:
+        return MatchResult(local=MatchResultAccel())
+
+    @nvtx.annotate("Match Prefix Accel", color="yellow")
+    def match_all(self,
+                  sequence_meta: SequenceMeta,
+                  temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY,
+                  is_put: bool = False,
+                  gpu_matched_blocks: int = 0) \
+                     -> Tuple[MatchResult, MatchResult, MatchResult]:
+        """Match every enabled tier, returning ``(cpu, ssd, lake)``.
+
+        A tier that is disabled or ignored comes back empty.  PUT writes only
+        locally, so it never queries a peer index (``with_peer=False``); GET
+        queries peers.  LAKE and P2P are mutually exclusive, so this single
+        matcher serves both the peer and the lake plans.
+        """
+        with_peer = not is_put
+        cpu_match = GlobalCacheEngine._empty_match()
+        ssd_match = GlobalCacheEngine._empty_match()
+        lake_match = GlobalCacheEngine._empty_match()
         if self.cpu_cache_engine:
-            if not self.cache_config.enable_p2p_cpu:
-                cpu_matched_result = self.cpu_cache_engine.match(sequence_meta)
-            else:
-                #flexkv_logger.info(f"[MATCH DEBUG] CPU P2P enabled, calling match_all() instead of match_local()")
-                if is_put:
-                    cpu_matched_result = self.cpu_cache_engine.match_local(sequence_meta)
-                else:
-                    cpu_matched_result = self.cpu_cache_engine.match_all(sequence_meta, gpu_matched_blocks)
-        if temp_cache_strategy.ignore_ssd:
-            return cpu_matched_result, ssd_matched_result
-        #TODO: we assume that ssd and gds are not enabled at the same time
-        if self.ssd_cache_engine:
-            if not self.cache_config.enable_p2p_ssd:
-                ssd_matched_result = self.ssd_cache_engine.match(sequence_meta)
-            else:
-                #flexkv_logger.info(f"[MATCH DEBUG] SSD P2P enabled, calling match_all() instead of match_local()")
-                if is_put:
-                    ssd_matched_result = self.ssd_cache_engine.match_local(sequence_meta)
-                else:
-                    ssd_matched_result = self.ssd_cache_engine.match_all(sequence_meta, gpu_matched_blocks)
-
-        return cpu_matched_result, ssd_matched_result
-
-    @nvtx.annotate("Match Prefix Accel With Lake", color="yellow")
-    def match_with_lake(self,
-                        sequence_meta: SequenceMeta,
-                        temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY,
-                        is_put: bool = False) \
-                            -> Tuple[MatchResultAccel, MatchResultAccel, MatchResultAccel]:
-        cpu_matched_result = MatchResultAccel()
-        ssd_matched_result = MatchResultAccel()
-        lake_matched_result = MatchResultAccel()
-        if self.cpu_cache_engine:
-            cpu_matched_result = self.cpu_cache_engine.match(sequence_meta)
+            cpu_match = self.cpu_cache_engine.match(
+                sequence_meta, with_peer=with_peer,
+                gpu_matched_blocks=gpu_matched_blocks,
+            )
         if self.ssd_cache_engine and not temp_cache_strategy.ignore_ssd:
-            ssd_matched_result = self.ssd_cache_engine.match(sequence_meta)
+            ssd_match = self.ssd_cache_engine.match(
+                sequence_meta, with_peer=with_peer,
+                gpu_matched_blocks=gpu_matched_blocks,
+            )
         if self.lake_cache_engine and not temp_cache_strategy.ignore_lake:
-            if self.enable_kv_sharing and is_put:
-                lake_matched_result = self.lake_cache_engine.match_local(sequence_meta)
-            else:
-                lake_matched_result = self.lake_cache_engine.match(sequence_meta)
-
-        return cpu_matched_result, ssd_matched_result, lake_matched_result
+            lake_match = self.lake_cache_engine.match(
+                sequence_meta, with_peer=with_peer,
+                gpu_matched_blocks=gpu_matched_blocks,
+            )
+        return cpu_match, ssd_match, lake_match
 
     def _check_input(self,
                       token_ids: np.ndarray,

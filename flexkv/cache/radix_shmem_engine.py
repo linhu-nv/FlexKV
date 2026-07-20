@@ -10,7 +10,7 @@ rwlock.
 
 Public surface mirrors `CacheEngineAccel` so that `GlobalCacheEngine` and the
 `_get_impl_*`/`_put_*` helpers in `cache_engine.py` treat both backends
-uniformly: `match()` returns a `MatchResultAccel`, `insert` returns an opaque
+uniformly: `match()` returns a `MatchResult`, `insert` returns an opaque
 "node" handle with `.size()`, and `lock_node`/`unlock`/`set_ready` operate on
 that handle.
 
@@ -51,6 +51,7 @@ the boundary.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
@@ -58,7 +59,10 @@ import numpy as np
 
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.transfer import DeviceType
-from flexkv.common.type import MatchResultAccel
+from flexkv.common.type import (
+    MatchResult,
+    MatchResultAccel,
+)
 
 if TYPE_CHECKING:
     from flexkv.common.block import SequenceMeta
@@ -97,23 +101,36 @@ class ShmRadixNode:
     start: int = 0
     length: int = 0
     finalize: object = None
+    query_finalize: object = None
 
     def size(self) -> int:
         return self.num_blocks
 
     def is_valid(self) -> bool:
-        return self.hashes is not None or self.finalize is not None
+        return (
+            self.hashes is not None or self.finalize is not None or
+            self.query_finalize is not None
+        )
 
     @property
     def is_inserted(self) -> bool:
         """True if this handle is auto-protected by an armed insert finalize."""
         return self.finalize is not None
 
+    @property
+    def is_query_guard(self) -> bool:
+        return self.query_finalize is not None
+
     def run_finalize(self) -> None:
         """Idempotent one-shot: run the armed finalize then disarm."""
         if self.finalize is not None:
             self.finalize()
             self.finalize = None
+
+    def run_query_finalize(self) -> None:
+        if self.query_finalize is not None:
+            self.query_finalize()
+            self.query_finalize = None
 
 
 def _ensure_shmradix():
@@ -145,7 +162,10 @@ class CacheEngineRadixShmem:
                  eviction_policy: str = "lru",
                  event_collector: Optional[KVEventCollector] = None,
                  metrics_collector=None,
-                 protected_threshold: int = 2):
+                 protected_threshold: int = 2,
+                 peer_enabled: bool = False,
+                 redis_meta=None,
+                 radix_cluster_id: str = "default"):
         """Attach to an existing radix shm region by name. The RadixServer
         owning the region must have been created elsewhere (e.g. by
         `flexkv.server.shm_radix_bootstrap.create_shm_radix_regions`)."""
@@ -169,9 +189,18 @@ class CacheEngineRadixShmem:
 
         self.event_collector = event_collector
         self._metrics_collector = metrics_collector
-
+        self.peer_enabled = bool(peer_enabled)
+        self._redis_meta = redis_meta
+        self._radix_cluster_id = radix_cluster_id
+        self._peer_node_ids = {}
+        self._trace_peer = os.getenv("FLEXKV_TRACE_RADIX_PEER", "0") == "1"
         # RadixClient always; the RadixServer is owned by the bootstrap process.
         self._tree = shmradix.RadixClient(shm_name)
+        if self.peer_enabled and not self._tree.is_distributed():
+            flexkv_logger.warning(
+                "radixshmem peer matching is enabled but the attached region "
+                "has world_size=1; GETs will remain local-only"
+            )
 
         # -1 => recover tokens_per_block from the region itself.
         if tokens_per_block is None or tokens_per_block < 0:
@@ -199,8 +228,34 @@ class CacheEngineRadixShmem:
             "tear down and recreate the shm region instead."
         )
 
+    def start(self) -> None:
+        """Compatibility with the peer-capable cache engine lifecycle."""
+
+    def _resolve_peer_node_id(self, radix_rank: int) -> int:
+        cached = self._peer_node_ids.get(radix_rank)
+        if cached is not None:
+            return cached
+        if self._redis_meta is None:
+            raise RuntimeError(
+                "radixshmem peer match requires Redis peer metadata"
+            )
+        node_id = self._redis_meta.resolve_radix_rank(
+            self._radix_cluster_id, radix_rank
+        )
+        if node_id is None:
+            raise RuntimeError(
+                f"No active FlexKV node is registered for radix rank {radix_rank}"
+            )
+        self._peer_node_ids[radix_rank] = int(node_id)
+        return int(node_id)
+
     def close(self) -> None:
         self._tree = None
+
+    def publish_ready(self, node: ShmRadixNode) -> None:
+        """Make asynchronous distributed RHT publications visible."""
+        if self.peer_enabled:
+            self._tree.flush()
 
     # ---------- Hash-path ref helpers (matched nodes) ----------
 
@@ -214,7 +269,29 @@ class CacheEngineRadixShmem:
 
     # ---------- Match / insert / lock ----------
 
-    def match(self, sequence_meta: SequenceMeta) -> MatchResultAccel:
+    def match(self,
+              sequence_meta: SequenceMeta,
+              *,
+              with_peer: bool = True,
+              gpu_matched_blocks: int = 0) -> MatchResult:
+        """Query the shared tree, returning a ``MatchResult(local, remote)``.
+
+        Two shapes come out of this one code path:
+          * ``with_peer=False`` (or a non-distributed tree) → a LOCAL-only
+            result: ``remote is None`` and the guard rides ``local``.
+          * ``with_peer=True`` on a distributed tree → LOCAL + PEER: ``local``
+            covers the local ready prefix and ``remote`` extends it with the
+            peer suffix.
+
+        A single distributed query serves both sides at once, so they share ONE
+        atomic guard: the ``pre_locked_node`` (and ``last_ready_node``) live on
+        whichever side reaches furthest — ``remote`` when a peer suffix exists,
+        otherwise ``local`` — and the cache_engine releases it exactly once.
+
+        ``gpu_matched_blocks`` is accepted only for interface parity with the
+        accel/hie engines; radixshmem matches the full sequence, so it is unused.
+        """
+        local_only = not (with_peer and self.peer_enabled)
         sequence_meta.gen_hashes()
         # SequenceMeta.block_hashes is int64; radixshmem expects uint64. Same
         # byte width → view-cast is safe. Keep a contiguous copy on the handles
@@ -225,45 +302,120 @@ class CacheEngineRadixShmem:
         # lock=True atomically inc_refs the ready prefix under the read_lock,
         # preventing another process from auto-evicting the matched slots (and
         # recycling our slot ids) between match() and the consuming transfer.
-        qr = self._tree.query(hashes, local_only=True, lock=True, update_meta=True)
+        qr = self._tree.query(
+            hashes,
+            local_only=local_only,
+            lock=True,
+            update_meta=True,
+        )
+        if getattr(self, "_trace_peer", False):
+            flexkv_logger.info(
+                "[RADIX PEER QUERY] "
+                f"shm={self.shm_name} local_only={local_only} "
+                f"blocks={len(hashes)} first_hash="
+                f"{int(hashes[0]) if len(hashes) else None} "
+                f"ready={int(qr.ready_prefix_len)} "
+                f"local={int(qr.local_hit_length)} "
+                f"total={int(qr.total_hit_length)} "
+                f"remote_node={int(qr.remote_node_id)} "
+                f"remote_hit={int(qr.remote_hit_length)} "
+                f"rdma_reads={int(qr.rdma_read_count)} "
+                f"rdma_atomics={int(qr.rdma_atomic_count)}"
+            )
 
-        ready_len = int(qr.ready_prefix_len)
-        matched_len = int(qr.total_hit_length)
+        # --- decompose the query into local-ready and peer-ready spans --------
+        # radixshmem contract: `ready_prefix_slots` holds ONLY the local-tree
+        # ready slots, so its length is the LOCAL ready prefix. `ready_prefix_len`
+        # equals that in local_only mode, but once a distributed walk extends the
+        # ready prefix it becomes the TOTAL (local + peer) ready — so recover the
+        # local span with min(), and the peer tail is carried in `remote_slots`.
+        ready_len = int(qr.ready_prefix_len)            # total ready (local + peer)
+        matched_len = int(qr.total_hit_length)          # total matched (incl. unready)
+        local_hit = int(qr.local_hit_length)            # local matched length
+        local_ready_len = min(local_hit, ready_len)     # == len(qr.ready_prefix_slots)
+        remote_ready_len = ready_len - local_ready_len  # peer suffix == len(qr.remote_slots)
+        has_peer = remote_ready_len > 0
 
-        # last_ready_node: protects [0, ready_len). Same object is reused as
-        # pre_locked_node so the cache_engine hand-off (lock_node → release
-        # pre-lock → callback unlock) accounts against one handle.
+        local_ready_blocks = np.asarray(qr.ready_prefix_slots, dtype=np.int64)
+        if len(local_ready_blocks) != local_ready_len:
+            raise RuntimeError(
+                "radixshmem returned inconsistent local ready slot metadata"
+            )
+
+        # --- one atomic guard, on the furthest-reaching side ------------------
+        # query(lock=True) took a single evict-protection ref over the whole
+        # ready prefix — including, for a peer hit, a remote RDMA atomic ref;
+        # `qr.finalize` releases all of it in one call. Hand that finalize to a
+        # single guard node and attach it to whichever side reaches furthest
+        # (`remote` when a peer suffix exists, else `local`), so the peer slots
+        # stay evict-protected until the graph callback fires it.
         if ready_len > 0:
-            last_ready_node = ShmRadixNode(
-                num_blocks=ready_len, hashes=hashes, start=0, length=ready_len)
+            query_guard = ShmRadixNode(
+                num_blocks=ready_len,
+                hashes=hashes,
+                start=0,
+                length=local_ready_len,
+                query_finalize=qr.finalize,
+            )
         else:
-            last_ready_node = None
+            qr.finalize()
+            query_guard = None
 
-        # last_node: governs the full matched range [0, matched_len). Used as
-        # `protected_node` in take(); never carries an insert finalize.
-        if matched_len > 0:
-            last_node = ShmRadixNode(
-                num_blocks=int(qr.local_hit_length) or matched_len,
-                hashes=hashes, start=0, length=matched_len)
-        else:
-            last_node = None
+        # last_node governs the full LOCAL matched range [0, local_hit); it is
+        # take()'s protected_node and never carries an insert finalize.
+        local_last_node = (
+            ShmRadixNode(num_blocks=local_hit, hashes=hashes, start=0,
+                         length=local_hit)
+            if local_hit > 0 else None
+        )
 
-        physical = np.asarray(qr.ready_prefix_slots, dtype=np.int64)
+        # `local` always describes [0, local_ready_len). It carries the shared
+        # guard ONLY when there is no peer suffix to carry it instead.
+        local = MatchResultAccel(
+            num_ready_matched_blocks=local_ready_len,
+            num_matched_blocks=local_hit,
+            last_ready_node=None if has_peer else query_guard,
+            last_node=local_last_node,
+            last_node_matched_length=local_hit,
+            physical_blocks=local_ready_blocks,
+            pre_locked_node=None if has_peer else query_guard,
+        )
+        if not has_peer:
+            # Local-only result: the guard (if any) protects [0, ready_len).
+            return MatchResult(local=local)
 
-        return MatchResultAccel(
+        # --- peer suffix: build `remote`; the shared guard rides here ---------
+        remote_ready_blocks = np.asarray(qr.remote_slots, dtype=np.int64)
+        if len(remote_ready_blocks) != remote_ready_len:
+            qr.finalize()
+            raise RuntimeError(
+                "radixshmem returned inconsistent remote ready slot metadata"
+            )
+        try:
+            peer_node_id = self._resolve_peer_node_id(int(qr.remote_node_id))
+        except Exception:
+            qr.finalize()
+            raise
+
+        # Peer-inclusive physical view indexed by logical block: the local ready
+        # slots followed by the peer suffix. The planner slices only the
+        # [local_ready_len, ready_len) tail (the local prefix is served by
+        # `local`), so the -1 placeholder node ids below local_ready_len are
+        # never read.
+        remote_physical = np.concatenate([local_ready_blocks, remote_ready_blocks])
+        remote_node_ids = np.concatenate([
+            np.full(local_ready_len, -1, dtype=np.int64),
+            np.full(remote_ready_len, peer_node_id, dtype=np.int64),
+        ])
+        remote = MatchResultAccel(
             num_ready_matched_blocks=ready_len,
             num_matched_blocks=matched_len,
-            last_ready_node=last_ready_node,
-            last_node=last_node,
-            last_node_matched_length=matched_len,
-            physical_blocks=physical,
-            block_node_ids=None,
-            matched_pos="local",
-            # query(lock=True) atomically inc_ref'd [0, ready_len); the
-            # cache_engine layer releases this exactly once (via unlock →
-            # hash-path dec_ref on the same handle).
-            pre_locked_node=last_ready_node,
+            last_ready_node=query_guard,
+            physical_blocks=remote_physical,
+            block_node_ids=remote_node_ids,
+            pre_locked_node=query_guard,
         )
+        return MatchResult(local=local, remote=remote)
 
     def insert(self,
                sequence_meta: SequenceMeta,
@@ -357,21 +509,45 @@ class CacheEngineRadixShmem:
         # another ref here would leak it. Matched nodes take an independent
         # hash-path ref (the cache_engine hand-off then drops the match's
         # pre-lock).
-        if node.is_inserted:
+        if node.is_inserted or node.is_query_guard:
             return
         self._inc_ref_node(node)
 
     def unlock(self, node: ShmRadixNode) -> None:
         if node is None or not node.is_valid():
             return
+        if node.is_query_guard:
+            node.run_query_finalize()
+            return
         if node.is_inserted:
             # One-shot: set_ready + dec_ref. Idempotent.
             node.run_finalize()
+            if self.peer_enabled:
+                # Publish the single insert's RHT updates after its data is
+                # marked ready.
+                self._tree.flush()
         else:
             self._dec_ref_node(node)
+            return
+        if getattr(self, "_trace_peer", False):
+            verify = self._tree.query(
+                node.hashes,
+                local_only=True,
+                lock=False,
+                update_meta=False,
+            )
+            flexkv_logger.info(
+                "[RADIX PEER READY] "
+                f"shm={self.shm_name} nodes=1 "
+                f"flushed={self.peer_enabled} "
+                f"local_ready={int(verify.ready_prefix_len)} "
+                f"local_total={int(verify.total_hit_length)}"
+            )
 
     def set_ready(self, node: ShmRadixNode, ready: bool, ready_length: int) -> None:
         if node is None or not node.is_valid():
+            return
+        if node.is_query_guard:
             return
         if node.is_inserted:
             # Handled atomically by the armed finalize in unlock(); the

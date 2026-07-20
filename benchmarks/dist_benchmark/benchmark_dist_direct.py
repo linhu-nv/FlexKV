@@ -120,6 +120,8 @@ def load_dist_direct_config(config_path: str):
         user_config.enable_p2p_cpu = config["enable_p2p_cpu"]
     if "enable_p2p_ssd" in config:
         user_config.enable_p2p_ssd = config["enable_p2p_ssd"]
+    if "enable_p2p_gpu" in config:
+        user_config.enable_p2p_gpu = config["enable_p2p_gpu"]
     if "enable_3rd_lake" in config:
         user_config.enable_3rd_lake = config["enable_3rd_lake"]
 
@@ -518,6 +520,7 @@ def main(args):
     print(f"  cache_config: {cache_config}")
     print(f"  enable_kv_sharing: {cache_config.enable_kv_sharing}")
     print(f"  enable_p2p_cpu: {cache_config.enable_p2p_cpu}")
+    print(f"  enable_p2p_gpu: {cache_config.enable_p2p_gpu}")
     print(f"  redis: {cache_config.redis_host}:{cache_config.redis_port}")
     print(f"  num_gpu_blocks: {num_gpu_blocks}")
     print(f"  bench_config: {bench_config}")

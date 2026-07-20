@@ -13,7 +13,10 @@ from flexkv.common.block import SequenceMeta
 #if TYPE_CHECKING:
 from flexkv.common.config import CacheConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.transfer import DeviceType
-from flexkv.common.type import MatchResultAccel
+from flexkv.common.type import (
+    MatchResult,
+    MatchResultAccel,
+)
 
 
 class HierarchyLRCacheEngine:
@@ -47,6 +50,7 @@ class HierarchyLRCacheEngine:
 
         self.device_type = device_type
         self._meta: Optional[RedisMeta] = meta # todo: define storage type in meta
+        self.redis_node_id = int(redis_node_id)
 
 
         # belows are only for 3rd-party lake storage (like pcfs)
@@ -139,116 +143,123 @@ class HierarchyLRCacheEngine:
         self.local_index.reset()
         self.mempool.reset()
 
-    def match(self, sequence_meta: SequenceMeta) -> MatchResultAccel:
-        """Match a sequence against the cache index.
-        
-        This method provides a simple interface similar to CacheEngine.match(),
-        delegating to match_all() for consistency.
-        
-        Args:
-            sequence_meta: The sequence metadata to match
-            
-        Returns:
-            MatchResultAccel: The match result
+    def match(self,
+              sequence_meta: SequenceMeta,
+              *,
+              with_peer: bool = True,
+              gpu_matched_blocks: int = 0) -> MatchResult:
+        """Unified tier match.
+
+        ``with_peer=False`` (PUT) queries only the local tree.  Otherwise both
+        the local and the distributed (peer) trees are queried and returned as
+        the two sides of a ``MatchResult``; each is an independent prefix hit,
+        and the planner composes local-first / peer-suffix from them.
         """
-        return self.match_all(sequence_meta)
-    #match all will be called for get
-    def match_all(self, sequence_meta: SequenceMeta, gpu_matched_blocks: int = 0) -> MatchResultAccel:
+        if not with_peer:
+            return MatchResult(local=self.match_local(sequence_meta))
+
         sequence_meta.gen_hashes()
         block_hashes_t = torch.from_numpy(sequence_meta.block_hashes).to(torch.int64)
         num_blocks = sequence_meta.num_blocks
 
-        # Query both local and remote
-        import time
-        t0 = time.perf_counter()
         mr_local = self.local_index.match_prefix(block_hashes_t, int(num_blocks), True)
-        t1 = time.perf_counter()
         mr_remote = self.remote_index.match_prefix(block_hashes_t, int(num_blocks), True)
-        t2 = time.perf_counter()
-        print(f"[match_prefix timing] local: {(t1-t0)*1000:.3f}ms, remote: {(t2-t1)*1000:.3f}ms")
-        # For simplicy, we choose the one with the larger matched length; tie-break on ready length
-        # We should allow to combine the two results in the future.
-        local_key = (int(mr_local.num_matched_blocks), int(mr_local.num_ready_matched_blocks))
-        remote_key = (int(mr_remote.num_matched_blocks), int(mr_remote.num_ready_matched_blocks))
-        matched_pos = "local" if local_key >= remote_key else "remote"
-        chosen = mr_local if local_key >= remote_key else mr_remote
-        
-        # update cumulative statistics
-        queried_tokens = num_blocks * self.tokens_per_block
-        gpu_matched_tokens = gpu_matched_blocks * self.tokens_per_block
-        local_matched_tokens = int(mr_local.num_matched_blocks) * self.tokens_per_block
-        distributed_matched_tokens = int(chosen.num_matched_blocks) * self.tokens_per_block
-        
-        self._stats_total_queried_tokens += queried_tokens
-        self._stats_gpu_matched_tokens += gpu_matched_tokens
-        self._stats_local_matched_tokens += local_matched_tokens
-        self._stats_distributed_matched_tokens += distributed_matched_tokens
+
+        local_ready = int(mr_local.num_ready_matched_blocks)
+        remote_ready = int(mr_remote.num_ready_matched_blocks)
+        local_matched = int(mr_local.num_matched_blocks)
+        remote_matched = int(mr_remote.num_matched_blocks)
+
+        local_phys = mr_local.physical_blocks.cpu().numpy().astype(np.int64, copy=False)
+        remote_phys = mr_remote.physical_blocks.cpu().numpy().astype(np.int64, copy=False)
+
+        # Lake blocks are read from concrete PCFS files; without a per-block file
+        # node id a block cannot be transferred, so drop that side's readiness.
+        local_source_ids = None
+        if self.device_type == DeviceType.LAKE and local_ready > 0:
+            local_source_ids = self.nodeids_to_file_nodeids(
+                np.full(len(local_phys), self.redis_node_id, dtype=np.int64),
+                local_phys,
+            )
+            if local_source_ids is None or len(local_source_ids) < local_ready:
+                local_ready = 0
+
+        remote_node_ids = None
+        nids = mr_remote.block_node_ids
+        if isinstance(nids, torch.Tensor) and nids.numel() > 0:
+            if self.device_type == DeviceType.LAKE:
+                remote_node_ids = self.nodeids_to_file_nodeids(
+                    nids.cpu().numpy(), remote_phys
+                )
+            else:
+                remote_node_ids = nids.cpu().numpy().astype(np.int64, copy=False)
+        if remote_ready > 0 and (
+            remote_node_ids is None or len(remote_node_ids) < remote_ready
+        ):
+            remote_ready = 0
+
+        # LOCAL side: a plain local prefix hit.  For Lake, its block_node_ids
+        # carry the per-block file node ids the planner needs.
+        local = MatchResultAccel(
+            num_ready_matched_blocks=local_ready,
+            num_matched_blocks=local_matched,
+            last_ready_node=mr_local.last_ready_node,
+            last_node=mr_local.last_node,
+            last_node_matched_length=int(mr_local.last_node_matched_length),
+            physical_blocks=local_phys,
+            block_node_ids=(
+                np.asarray(local_source_ids, dtype=np.int64)
+                if (self.device_type == DeviceType.LAKE and local_ready > 0)
+                else None
+            ),
+        )
+
+        # PEER side: only when the peer tree reaches a valid, transferable
+        # prefix.  block_node_ids name the owning peer (or Lake file) per block.
+        remote = None
+        if remote_ready > 0:
+            remote = MatchResultAccel(
+                num_ready_matched_blocks=remote_ready,
+                num_matched_blocks=remote_matched,
+                last_ready_node=mr_remote.last_ready_node,
+                last_node=mr_remote.last_node,
+                last_node_matched_length=int(mr_remote.last_node_matched_length),
+                physical_blocks=remote_phys,
+                block_node_ids=np.asarray(remote_node_ids, dtype=np.int64),
+            )
+
+        self._log_reuse_stats(
+            num_blocks, gpu_matched_blocks, local_matched,
+            max(local_matched, remote_matched),
+        )
+        return MatchResult(local=local, remote=remote)
+
+    def _log_reuse_stats(self,
+                         num_blocks: int,
+                         gpu_matched_blocks: int,
+                         local_matched: int,
+                         distributed_matched: int) -> None:
+        self._stats_total_queried_tokens += num_blocks * self.tokens_per_block
+        self._stats_gpu_matched_tokens += gpu_matched_blocks * self.tokens_per_block
+        self._stats_local_matched_tokens += local_matched * self.tokens_per_block
+        self._stats_distributed_matched_tokens += distributed_matched * self.tokens_per_block
         self._stats_match_count += 1
-        
-        # calculate hit ratio for each level
+
         total = self._stats_total_queried_tokens
         gpu_pct = (self._stats_gpu_matched_tokens * 100 / total) if total > 0 else 0
         local_pct = (self._stats_local_matched_tokens * 100 / total) if total > 0 else 0
         distributed_pct = (self._stats_distributed_matched_tokens * 100 / total) if total > 0 else 0
-        
-        # calculate extra benefits for each level
         extra_from_local = self._stats_local_matched_tokens - self._stats_gpu_matched_tokens
         extra_from_distributed = self._stats_distributed_matched_tokens - self._stats_local_matched_tokens
         extra_local_pct = (extra_from_local * 100 / total) if total > 0 else 0
         extra_distributed_pct = (extra_from_distributed * 100 / total) if total > 0 else 0
-        
+
         print(
             f"[STATS][REUSE] cnt={self._stats_match_count}, queried={total}, "
             f"gpu={self._stats_gpu_matched_tokens} ({gpu_pct:.2f}%), "
             f"flexkv_local={self._stats_local_matched_tokens} ({local_pct:.2f}%, +{extra_local_pct:.2f}%), "
             f"flexkv_global={self._stats_distributed_matched_tokens} ({distributed_pct:.2f}%, "
             f"+{extra_distributed_pct:.2f}%)"
-        )
-        
-        # physical blocks
-        bnids_np = None
-        if chosen is mr_remote:
-            #try to use DistributedRadixTree's block_node_ids
-            #if check fails, use LocalRadixTree's match result
-            nids = chosen.block_node_ids
-            nps = chosen.physical_blocks
-            # Convert tensors to numpy views (CPU) if present
-            if isinstance(nids, torch.Tensor) and nids.numel() > 0:
-                # For P2P mode (CPU/SSD), no PCFS conversion is needed
-                # Only convert to PCFS file_nodeids if device_type is REMOTE
-                if self.device_type == DeviceType.LAKE:
-                    bnids_np = self.nodeids_to_file_nodeids(nids.cpu().numpy(), nps.cpu().numpy())
-                    if bnids_np is None:
-                        chosen = mr_local
-                        matched_pos = "local"  # Update matched_pos after fallback
-                else:
-                    # For P2P mode, use node_ids directly
-                    bnids_np = nids.cpu().numpy().astype(np.uint32)
-                    #print(f"[REMOTE_MATCH {self.device_type.name}] Using remote data: block_ids={nps.cpu().numpy()[:min(4, len(nps))]}, node_ids={bnids_np[:min(4, len(bnids_np))]}")
-            else:
-                bnids_np = None
-                if mr_remote.num_matched_blocks > 0:
-                    #print(f"[REMOTE_MATCH {self.device_type.name}] Warning: remote matched but block_node_ids is empty, falling back to local")
-                    chosen = mr_local
-                    matched_pos = "local"  # Update matched_pos after fallback
-        phys_np = chosen.physical_blocks.cpu().numpy()
-        #maybe we should always not insert
-        if self.device_type == DeviceType.CPU and matched_pos == "remote" and mr_local.num_matched_blocks > 0:
-            insert_to_local_cpu_index = False
-        else:
-            insert_to_local_cpu_index = True
-        #TODO A big question is how to get the node id for peer_cpu and peer_ssd?
-        return MatchResultAccel(
-            num_ready_matched_blocks=int(chosen.num_ready_matched_blocks),
-            num_matched_blocks=int(chosen.num_matched_blocks),
-            last_ready_node=chosen.last_ready_node,
-            last_node=chosen.last_node,
-            last_node_matched_length=int(chosen.last_node_matched_length),
-            physical_blocks=phys_np,
-            block_node_ids=bnids_np,
-            matched_pos=matched_pos,
-            matched_node_ids=bnids_np,  # Set matched_node_ids for P2P transfer
-            insert_to_local_cpu_index=insert_to_local_cpu_index,
         )
 
     def nodeids_to_file_nodeids(self,
@@ -311,7 +322,6 @@ class HierarchyLRCacheEngine:
             last_node_matched_length=int(mr_local.last_node_matched_length),
             physical_blocks=phys_np,
             block_node_ids=None,
-            matched_pos="local",
         )
 
     def insert(self,

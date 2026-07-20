@@ -103,6 +103,38 @@ def shutdown_tp_client(tp_client_processes):
                 tp_process.kill()
                 tp_process.join(timeout=2)
 
+
+def test_mps_daemon_does_not_inherit_cuda_visible_devices(monkeypatch):
+    manager = KVManager.__new__(KVManager)
+    manager.enable_mps = True
+    manager.server_client_mode = False
+
+    class FakeTaskEngine:
+        started = False
+
+        def start(self):
+            self.started = True
+
+    manager.kv_task_engine = FakeTaskEngine()
+    captured = {}
+
+    def fake_run(command, *, check, env):
+        captured["command"] = command
+        captured["check"] = check
+        captured["env"] = env
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3")
+    monkeypatch.setattr("flexkv.kvmanager.subprocess.run", fake_run)
+
+    manager.start()
+
+    assert captured["command"] == ["nvidia-cuda-mps-control", "-d"]
+    assert captured["check"] is False
+    assert "CUDA_VISIBLE_DEVICES" not in captured["env"]
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == "3"
+    assert manager.kv_task_engine.started
+
+
 @pytest.mark.parametrize(
     "model_config",
     [

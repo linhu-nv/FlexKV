@@ -103,6 +103,7 @@ class PrefetchController:
                  enable_ssd: bool = True):
         from flexkv.cache.radix_shmem_engine import CacheEngineRadixShmem
         from flexkv.server.shm_radix_bootstrap import shm_name_for
+        from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
 
         self.server_id = server_id
         self._ext_lock_fd: Optional[int] = None
@@ -175,14 +176,36 @@ class PrefetchController:
         self.cpu_engine = CacheEngineRadixShmem(
             device_type=DeviceType.CPU, num_total_blocks=0,
             tokens_per_block=-1,
-            shm_name=shm_name_for(DeviceType.CPU, self.server_id))
+            shm_name=shm_name_for(
+                DeviceType.CPU,
+                self.server_id,
+                rank=getattr(GLOBAL_CONFIG_FROM_ENV, "radix_rank", 0),
+                world_size=getattr(
+                    GLOBAL_CONFIG_FROM_ENV, "radix_world_size", 1
+                ),
+                cluster_id=getattr(
+                    GLOBAL_CONFIG_FROM_ENV, "radix_cluster_id", self.server_id
+                ),
+            ))
         self.tokens_per_block = self.cpu_engine.tokens_per_block
         self.ssd_engine = None
         if enable_ssd:
             self.ssd_engine = CacheEngineRadixShmem(
                 device_type=DeviceType.SSD, num_total_blocks=0,
                 tokens_per_block=-1,
-                shm_name=shm_name_for(DeviceType.SSD, self.server_id))
+                shm_name=shm_name_for(
+                    DeviceType.SSD,
+                    self.server_id,
+                    rank=getattr(GLOBAL_CONFIG_FROM_ENV, "radix_rank", 0),
+                    world_size=getattr(
+                        GLOBAL_CONFIG_FROM_ENV, "radix_world_size", 1
+                    ),
+                    cluster_id=getattr(
+                        GLOBAL_CONFIG_FROM_ENV,
+                        "radix_cluster_id",
+                        self.server_id,
+                    ),
+                ))
 
         # CE-side shm channel to the shared TE (created by the FlexKV bootstrap).
         # The handle attaches purely by (server_id, channel_id).
@@ -368,8 +391,12 @@ class PrefetchController:
 
         empty_graph = TransferOpGraph.create_empty_graph()
 
-        cpu_m = self.cpu_engine.match(seq)
-        ssd_m = self.ssd_engine.match(seq) if self.ssd_engine is not None else None
+        # Prefetch warms CPU from the local SSD prefix, so query local-only.
+        cpu_m = self.cpu_engine.match(seq, with_peer=False).local
+        ssd_m = (
+            self.ssd_engine.match(seq, with_peer=False).local
+            if self.ssd_engine is not None else None
+        )
 
         cpu_ready = cpu_m.num_ready_matched_blocks
         ssd_ready = ssd_m.num_ready_matched_blocks if ssd_m is not None else 0

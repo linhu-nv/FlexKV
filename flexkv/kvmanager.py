@@ -62,6 +62,10 @@ class KVManager:
         # via shm channels.
         self.use_radix_shmem = bool(getattr(GLOBAL_CONFIG_FROM_ENV,
                                             "radix_shmem", False))
+        if self.use_radix_shmem and cache_config.enable_lake:
+            raise ValueError(
+                "radixshmem and Lake cannot be enabled at the same time"
+            )
         self._shm_radix_server_id = getattr(GLOBAL_CONFIG_FROM_ENV,
                                             "shm_radix_server_id", "default")
 
@@ -154,6 +158,53 @@ class KVManager:
         is_bootstrap = (self.instance_id == 0 and self.dp_client_id == 0)
         total_clients = self.instance_num * self.model_config.dp_size
         server_id = self._shm_radix_server_id
+        cluster_id = getattr(
+            GLOBAL_CONFIG_FROM_ENV, "radix_cluster_id", server_id
+        )
+        radix_rank = getattr(GLOBAL_CONFIG_FROM_ENV, "radix_rank", 0)
+        radix_world_size = getattr(
+            GLOBAL_CONFIG_FROM_ENV, "radix_world_size", 1
+        )
+        # Two simulated ranks can share one host.  Keep their TE channel
+        # namespaces separate even though their radix cluster_id is shared.
+        te_server_id = (
+            f"{server_id}_r{radix_rank}"
+            if radix_world_size > 1 else server_id
+        )
+
+        if self.cache_config.enable_kv_sharing:
+            self.redis_meta_client = RedisMeta(
+                self.cache_config.redis_host,
+                self.cache_config.redis_port,
+                self.cache_config.redis_password,
+                self.cache_config.local_ip,
+                node_ttl_seconds=self.cache_config.node_ttl_seconds,
+            )
+            if is_bootstrap:
+                node_id = self.redis_meta_client.init_meta()
+                if node_id is None:
+                    raise RuntimeError(
+                        "Failed to initialize Redis peer metadata for radixshmem"
+                    )
+                self.redis_meta_client.register_radix_rank(
+                    cluster_id, radix_rank
+                )
+            else:
+                deadline = time.monotonic() + 60.0
+                node_id = None
+                while time.monotonic() < deadline:
+                    node_id = self.redis_meta_client.resolve_radix_rank(
+                        cluster_id, radix_rank
+                    )
+                    if node_id is not None:
+                        break
+                    time.sleep(0.01)
+                if node_id is None:
+                    raise TimeoutError(
+                        "Timed out resolving local radix rank to a FlexKV node id"
+                    )
+                self.redis_meta_client.set_node_id(node_id)
+            self.cache_config.distributed_node_id = int(node_id)
 
         # Disjoint graph_id and op_id ranges per CE process: 2^32 ids per CE,
         # high bits = global_client_id. Critical for the multi-DP path where
@@ -173,6 +224,25 @@ class KVManager:
             self._shm_radix_owners = create_shm_radix_regions(
                 self.model_config, self.cache_config,
                 server_id=server_id,
+                cluster_id=cluster_id,
+                rank=radix_rank,
+                world_size=radix_world_size,
+                master_addr=getattr(
+                    GLOBAL_CONFIG_FROM_ENV, "radix_master_addr", "127.0.0.1"
+                ),
+                master_port=getattr(
+                    GLOBAL_CONFIG_FROM_ENV, "radix_master_port", 18500
+                ),
+                rdma_dev=getattr(
+                    GLOBAL_CONFIG_FROM_ENV, "radix_rdma_dev", ""
+                ),
+                gid_idx=getattr(
+                    GLOBAL_CONFIG_FROM_ENV, "radix_gid_idx", 3
+                ),
+                bootstrap_timeout_sec=getattr(
+                    GLOBAL_CONFIG_FROM_ENV,
+                    "radix_bootstrap_timeout_sec", 120,
+                ),
             )
             # Reserve extra channels beyond the internal DP clients so external
             # processes (e.g. a prefetch controller) can attach to the shared TE
@@ -181,7 +251,7 @@ class KVManager:
             self._shm_te_process = TransferManagerShmTEProcess(
                 self.model_config, self.cache_config,
                 gpu_register_port=self.gpu_register_port,
-                server_id=server_id,
+                server_id=te_server_id,
                 num_channels=total_clients + num_extra,
                 total_clients=total_clients,
             )
@@ -189,7 +259,13 @@ class KVManager:
         else:
             # Wait until bootstrap created the shm radix regions before
             # GlobalCacheEngine tries to attach as RadixClient.
-            attach_shm_radix_clients(self.cache_config, server_id=server_id)
+            attach_shm_radix_clients(
+                self.cache_config,
+                server_id=server_id,
+                cluster_id=cluster_id,
+                rank=radix_rank,
+                world_size=radix_world_size,
+            )
 
         # GlobalCacheEngine inspects GLOBAL_CONFIG_FROM_ENV.radix_shmem and
         # constructs CacheEngineRadixShmem (RadixClient) per device type.
@@ -199,7 +275,7 @@ class KVManager:
             self.gpu_register_port,
             redis_meta=self.redis_meta_client,
             event_collector=event_collector,
-            shm_te_server_id=server_id,
+            shm_te_server_id=te_server_id,
             shm_te_channel_id=self.global_client_id,
         )
 
@@ -209,8 +285,19 @@ class KVManager:
 
     def start(self) -> None:
         if self.enable_mps:
-            # try to start MPS
-            subprocess.run(['nvidia-cuda-mps-control', '-d'], check=False)
+            # The scheduler/engine process can be restricted to one physical
+            # GPU by CUDA_VISIBLE_DEVICES.  The MPS control daemon is shared by
+            # all local FlexKV instances, so inheriting that restriction makes
+            # the first instance's GPU the only one available to later
+            # instances.  Keep the restriction on this process, but let the
+            # daemon discover every GPU.
+            mps_env = os.environ.copy()
+            mps_env.pop("CUDA_VISIBLE_DEVICES", None)
+            subprocess.run(
+                ['nvidia-cuda-mps-control', '-d'],
+                check=False,
+                env=mps_env,
+            )
             flexkv_logger.debug("MPS started")
 
         if not self.server_client_mode:

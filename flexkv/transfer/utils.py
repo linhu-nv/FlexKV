@@ -98,6 +98,16 @@ def group_blocks_by_node_and_segment(
     return dict(groups)
 
 class RemoteSSD2HMetaInfo:
+    """Metadata for a remote-SSD read, sent from the requester to the SSD owner.
+
+    Despite the "2H" name it serves both peer-SSD paths:
+      * PEERSSD2H — owner stages SSD blocks to host and RDMA-writes them back to
+        the requester's CPU buffer (the ``gpu_*`` fields stay None).
+      * PEERSSD2D — owner stages then RDMA-writes token/head slices straight into
+        the requester's GPU buffers (the ``gpu_*`` fields describe those slices).
+    The ``gpu_*`` lists are an index-aligned struct-of-arrays; when
+    ``gpu_dst_ptrs`` is set they must all have the same length.
+    """
     task_id: int
     cpu_block_ids: List[int]
     ssd_block_ids: List[int]
@@ -112,7 +122,9 @@ class RemoteSSD2HMetaInfo:
     def __init__(
         self, task_id, cpu_block_ids, ssd_block_ids, peer_engine_addr,
         peer_cpu_base_ptr, peer_zmq_status_addr, data_size, layer_id,
-        layer_granularity
+        layer_granularity, gpu_dst_ptrs=None, gpu_block_positions=None,
+        gpu_layer_ids=None, gpu_kv_ids=None, gpu_token_ids=None,
+        gpu_head_starts=None, gpu_data_lens=None
     ):
         self.task_id = task_id
         self.cpu_block_ids = cpu_block_ids
@@ -123,6 +135,20 @@ class RemoteSSD2HMetaInfo:
         self.data_size = data_size
         self.layer_id = layer_id
         self.layer_granularity = layer_granularity
+        self.gpu_dst_ptrs = gpu_dst_ptrs
+        self.gpu_block_positions = gpu_block_positions
+        self.gpu_layer_ids = gpu_layer_ids
+        self.gpu_kv_ids = gpu_kv_ids
+        self.gpu_token_ids = gpu_token_ids
+        self.gpu_head_starts = gpu_head_starts
+        self.gpu_data_lens = gpu_data_lens
+        if gpu_dst_ptrs is not None:
+            n = len(gpu_dst_ptrs)
+            assert all(
+                col is not None and len(col) == n
+                for col in (gpu_block_positions, gpu_layer_ids, gpu_kv_ids,
+                            gpu_token_ids, gpu_head_starts, gpu_data_lens)
+            ), "RemoteSSD2HMetaInfo gpu_* lists must all be equal length"
 
     @classmethod
     def from_dict(self, data: dict) -> "RemoteSSD2HMetaInfo":
@@ -135,7 +161,14 @@ class RemoteSSD2HMetaInfo:
             peer_zmq_status_addr = data.get("peer_zmq_status_addr"),
             data_size=data.get("data_size"),
             layer_id = data.get("layer_id"),
-            layer_granularity = data.get("layer_granularity")
+            layer_granularity = data.get("layer_granularity"),
+            gpu_dst_ptrs=data.get("gpu_dst_ptrs"),
+            gpu_block_positions=data.get("gpu_block_positions"),
+            gpu_layer_ids=data.get("gpu_layer_ids"),
+            gpu_kv_ids=data.get("gpu_kv_ids"),
+            gpu_token_ids=data.get("gpu_token_ids"),
+            gpu_head_starts=data.get("gpu_head_starts"),
+            gpu_data_lens=data.get("gpu_data_lens"),
         )
     def to_dict(self) -> dict:
         return {
@@ -148,6 +181,13 @@ class RemoteSSD2HMetaInfo:
             "data_size": self.data_size,
             "layer_id": self.layer_id,
             "layer_granularity": self.layer_granularity,
+            "gpu_dst_ptrs": self.gpu_dst_ptrs,
+            "gpu_block_positions": self.gpu_block_positions,
+            "gpu_layer_ids": self.gpu_layer_ids,
+            "gpu_kv_ids": self.gpu_kv_ids,
+            "gpu_token_ids": self.gpu_token_ids,
+            "gpu_head_starts": self.gpu_head_starts,
+            "gpu_data_lens": self.gpu_data_lens,
         }
 
 class NodeMetaInfo:

@@ -68,6 +68,68 @@ except ImportError:
 
 cudart = ctypes.CDLL('libcudart.so')
 
+
+def _cpu_token_slice_ptr(
+    layout: KVCacheLayout,
+    dtype: torch.dtype,
+    base_ptr: int,
+    block_id: int,
+    layer_id: int,
+    kv_id: int,
+    token_id: int,
+    head_start: int,
+) -> int:
+    """Address one contiguous token/head slice in a CPU KV layout."""
+    kv_dim = 1 if layout.is_mla else 2
+    if layout.type == KVCacheLayoutType.LAYERFIRST:
+        element_offset = (
+            (((layer_id * kv_dim + kv_id) * layout.num_block + block_id)
+             * layout.tokens_per_block + token_id)
+            * layout.num_head + head_start
+        ) * layout.head_size
+    elif layout.type == KVCacheLayoutType.BLOCKFIRST:
+        element_offset = (
+            (((block_id * layout.num_layer + layer_id) * kv_dim + kv_id)
+             * layout.tokens_per_block + token_id)
+            * layout.num_head + head_start
+        ) * layout.head_size
+    else:
+        raise ValueError(f"Invalid CPU KV layout: {layout.type}")
+    return base_ptr + element_offset * dtype.itemsize
+
+
+def _gpu_token_slice_ptr(
+    tensors: List[torch.Tensor],
+    layout: KVCacheLayout,
+    block_type: int,
+    block_id: int,
+    layer_id: int,
+    kv_id: int,
+    token_id: int,
+) -> int:
+    """Address one token in VLLM, TRT-LLM, or SGLang GPU KV storage."""
+    token_stride = layout.num_head * layout.head_size * tensors[0].element_size()
+    if block_type == 0:  # one tensor per layer: [kv, block, token, head, dim]
+        tensor = tensors[layer_id]
+        offset = (
+            kv_id * layout.get_kv_stride()
+            + block_id * layout.get_block_stride()
+            + token_id * layout.num_head * layout.head_size
+        ) * tensor.element_size()
+    elif block_type == 1:  # one tensor containing the complete cache
+        tensor = tensors[0]
+        return _cpu_token_slice_ptr(
+            layout, tensor.dtype, tensor.data_ptr(), block_id, layer_id,
+            kv_id, token_id, 0,
+        )
+    elif block_type == 2:  # one tensor per (kv, layer): [block, token, head, dim]
+        tensor = tensors[kv_id * layout.num_layer + layer_id]
+        offset = block_id * layout.get_block_stride() * tensor.element_size()
+        offset += token_id * token_stride
+    else:
+        raise ValueError(f"Invalid GPU block type: {block_type}")
+    return tensor.data_ptr() + offset
+
 # Per-call size limit for cudaHostRegister / cudaHostUnregister.
 #
 # CUDA driver 595.x has a known bug where the size argument to cudaHostRegister
@@ -242,6 +304,7 @@ class WorkerTransferOp:
     src_block_ids: np.ndarray
     dst_block_ids: np.ndarray
     src_block_node_ids: Optional[np.ndarray]
+    dp_id: int
     # successors: List[int]
 
     def __init__(self, transfer_op: TransferOp):
@@ -255,6 +318,7 @@ class WorkerTransferOp:
         self.valid_block_num = transfer_op.valid_block_num
         # Always preserve optional src_block_node_ids from TransferOp
         self.src_block_node_ids = transfer_op.src_block_node_ids
+        self.dp_id = transfer_op.dp_id
 
         if self.src_slot_id == -1 or self.dst_slot_id == -1:
             self.src_block_ids = transfer_op.src_block_ids
@@ -953,13 +1017,8 @@ class CPULakeTransferWorker(TransferWorkerBase):
             raise ValueError(f"num_lake_blocks_per_file {self.num_lake_blocks_per_file} "
                              f"is not divisible by round_robin {self.round_robin}")
 
-        # For multi-group layouts, get_chunk_size() is not valid.
-        # CPULakeTransferWorker uses LAYERFIRST which is single-group only,
-        # but guard for safety.
-        if cpu_kv_layout.layer_groups is not None:
-            self.block_size = cpu_kv_layout.get_block_stride()
-        else:
-            self.block_size = cpu_kv_layout.get_chunk_size()
+        # CPULakeTransferWorker uses a single-group LAYERFIRST layout.
+        self.block_size = cpu_kv_layout.get_chunk_size()
         self.dtype = dtype
 
         self.is_mla = cpu_kv_layout.is_mla
@@ -1866,12 +1925,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         self.cpu_layer_ptrs = self._get_layer_ptrs(cpu_blocks)
         self.num_layers = cpu_kv_layout.num_layer
         self.num_cpu_blocks = cpu_kv_layout.num_block
-        # For multi-group layouts (e.g. gemma4), get_chunk_size() is invalid;
-        # use get_block_stride() which works for both single and multi-group BLOCKFIRST.
-        if cpu_kv_layout.layer_groups is not None:
-            self.block_size = cpu_kv_layout.get_block_stride()
-        else:
-            self.block_size = cpu_kv_layout.get_chunk_size()
+        self.block_size = cpu_kv_layout.get_chunk_size()
         self.dtype = dtype
         self.cpu_kv_layout = cpu_kv_layout
         self.remote_kv_layout = remote_kv_layout
@@ -2066,8 +2120,10 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             return old_value
 
     def shutdown(self):
-        self.zmq_server.shutdown()
-        self.zmq_client.shutdown()
+        if hasattr(self, "zmq_server"):
+            self.zmq_server.shutdown()
+        if hasattr(self, "zmq_client"):
+            self.zmq_client.shutdown()
         # unregist buffer in mooncake engine
         self.mooncake_transfer_engine.unregist_buffer(self.cpu_blocks.data_ptr())
         if self.cache_config.enable_p2p_ssd:
@@ -2414,6 +2470,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                             "Invalid cpu_block_ids or ssd_block_ids, skipping this transfer..."
                         )
                         self.zmq_server.send_transfer_status(recv_meta.peer_zmq_status_addr, failure_msg)
+                        nvtx.end_range(nvtx_range)
                         continue
 
                 # TODO: we need to support dynamic temp buffer or split the ssd
@@ -2426,6 +2483,66 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                             f"{self.cache_config.num_tmp_cpu_blocks}, can not do transfer now"
                         )
                     self.zmq_server.send_transfer_status(recv_meta.peer_zmq_status_addr, failure_msg)
+                    nvtx.end_range(nvtx_range)
+                    continue
+
+                # PEERSSD2D: the SSD owner stages blocks in its temporary CPU
+                # buffer, then Mooncake writes token/head slices directly into
+                # the requester's registered GPU buffers.
+                if recv_meta.gpu_dst_ptrs is not None:
+                    local_block_ids = torch.arange(
+                        len(recv_meta.ssd_block_ids), dtype=torch.int64
+                    )
+                    layer_ids = torch.arange(
+                        recv_meta.layer_id,
+                        recv_meta.layer_id + recv_meta.layer_granularity,
+                        dtype=torch.int32,
+                    )
+                    if not self.copy_ssd_data_to_dram(
+                        layer_ids,
+                        torch.tensor(recv_meta.ssd_block_ids, dtype=torch.int64),
+                        local_block_ids,
+                    ):
+                        self.zmq_server.send_transfer_status(
+                            recv_meta.peer_zmq_status_addr, failure_msg
+                        )
+                        nvtx.end_range(nvtx_range)
+                        continue
+
+                    src_ptrs = [
+                        _cpu_token_slice_ptr(
+                            self.tmp_cpu_buffer_layout,
+                            self.dtype,
+                            self.tmp_cpu_buffer.data_ptr(),
+                            recv_meta.gpu_block_positions[i],
+                            recv_meta.gpu_layer_ids[i],
+                            recv_meta.gpu_kv_ids[i],
+                            recv_meta.gpu_token_ids[i],
+                            recv_meta.gpu_head_starts[i],
+                        )
+                        for i in range(len(recv_meta.gpu_dst_ptrs))
+                    ]
+                    write_ok = True
+                    for batch_start in range(0, len(src_ptrs), 1024):
+                        batch_end = batch_start + 1024
+                        if not self.write_data_back_to_peer(
+                            recv_meta.peer_engine_addr,
+                            src_ptrs[batch_start:batch_end],
+                            recv_meta.gpu_dst_ptrs[batch_start:batch_end],
+                            recv_meta.gpu_data_lens[batch_start:batch_end],
+                        ):
+                            write_ok = False
+                            break
+                    if not write_ok:
+                        self.zmq_server.send_transfer_status(
+                            recv_meta.peer_zmq_status_addr, failure_msg
+                        )
+                        nvtx.end_range(nvtx_range)
+                        continue
+                    self.zmq_server.send_transfer_status(
+                        recv_meta.peer_zmq_status_addr, success_msg
+                    )
+                    nvtx.end_range(nvtx_range)
                     continue
 
                 ## step3: do copy data from ssd to cpu
@@ -2496,6 +2613,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                 ## step4: do rdma transfer and send notify
                 if not all_copy_complete:
                     self.zmq_server.send_transfer_status(recv_meta.peer_zmq_status_addr, failure_msg)
+                    nvtx.end_range(nvtx_range)
                     continue
 
                 if not self.write_data_back_to_peer(
@@ -2503,6 +2621,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                 ):
                     self.zmq_server.send_transfer_status(recv_meta.peer_zmq_status_addr, failure_msg)
                     flexkv_logger.error("Failed to write data back to peer")
+                    nvtx.end_range(nvtx_range)
                     continue
 
                 self.zmq_server.send_transfer_status(recv_meta.peer_zmq_status_addr, success_msg)
@@ -2793,3 +2912,348 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             flexkv_logger.info(f"Fetched node {node_id} meta from Redis.")
 
         return self.node_metas[node_id]
+
+
+class PEER2GPUTransferWorker(PEER2CPUTransferWorker):
+    """Mooncake worker for peer CPU/SSD directly into local GPU KV buffers.
+
+    There is one worker (and therefore one Mooncake endpoint) per FlexKV node.
+    It owns every local DP/TP GPU group and selects the destination group using
+    ``TransferOp.dp_id``.  The inherited SSD service provides the remote
+    SSD -> temporary CPU half of PEERSSD2D.
+    """
+
+    def __init__(
+        self,
+        worker_id: int,
+        transfer_conn: Connection,
+        finished_ops_queue: MPQueue,
+        op_buffer_tensor: torch.Tensor,
+        gpu_blocks: Dict[int, List[List[TensorSharedHandle]]],
+        gpu_kv_layouts: Dict[int, List[KVCacheLayout]],
+        cpu_blocks: torch.Tensor,
+        cpu_kv_layout: KVCacheLayout,
+        remote_kv_layout: KVCacheLayout,
+        dtype: torch.dtype,
+        cache_config: CacheConfig,
+        ssd_kv_layout: KVCacheLayout = None,
+        ssd_files: Dict[int, List[str]] = None,
+        num_blocks_per_file: int = 0,
+        mooncake_config_path: str = None,
+    ):
+        super().__init__(
+            worker_id=worker_id,
+            transfer_conn=transfer_conn,
+            finished_ops_queue=finished_ops_queue,
+            op_buffer_tensor=op_buffer_tensor,
+            cpu_blocks=cpu_blocks,
+            cpu_kv_layout=cpu_kv_layout,
+            remote_kv_layout=remote_kv_layout,
+            dtype=dtype,
+            cache_config=cache_config,
+            ssd_kv_layout=ssd_kv_layout,
+            ssd_files=ssd_files,
+            num_blocks_per_file=num_blocks_per_file,
+            mooncake_config_path=mooncake_config_path,
+        )
+        self.gpu_groups: Dict[int, List[List[torch.Tensor]]] = {}
+        self.gpu_layouts = gpu_kv_layouts
+        self.gpu_block_types: Dict[int, List[int]] = {}
+        self._registered_gpu_ptrs: List[int] = []
+
+        for dp_id, tp_handles in gpu_blocks.items():
+            tp_tensors = [
+                [handle.get_tensor() for handle in handles]
+                for handles in tp_handles
+            ]
+            layouts = self.gpu_layouts[dp_id]
+            if len(tp_tensors) != len(layouts):
+                raise ValueError(
+                    f"GPU handle/layout count mismatch for dp_id={dp_id}"
+                )
+            self.gpu_groups[dp_id] = tp_tensors
+            self.gpu_block_types[dp_id] = []
+            for tensors, layout in zip(tp_tensors, layouts):
+                if len(tensors) == 1:
+                    block_type = 1
+                elif len(tensors) == layout.num_layer:
+                    block_type = 0
+                elif len(tensors) == layout.num_layer * 2:
+                    block_type = 2
+                else:
+                    raise ValueError(
+                        f"Invalid GPU tensor count {len(tensors)} for "
+                        f"dp_id={dp_id}, num_layers={layout.num_layer}"
+                    )
+                self.gpu_block_types[dp_id].append(block_type)
+                for tensor in tensors:
+                    ptr = tensor.data_ptr()
+                    size = tensor.numel() * tensor.element_size()
+                    if ptr in self._registered_gpu_ptrs:
+                        continue
+                    ret = self.mooncake_transfer_engine.regist_buffer(ptr, size)
+                    if ret != 0:
+                        raise RuntimeError(
+                            f"Mooncake failed to register GPU buffer at {ptr}"
+                        )
+                    self._registered_gpu_ptrs.append(ptr)
+
+    def shutdown(self):
+        for ptr in self._registered_gpu_ptrs:
+            self.mooncake_transfer_engine.unregist_buffer(ptr)
+        super().shutdown()
+
+    def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
+        # A request may intentionally ignore its GPU tier.  Keep the inherited
+        # CPU destination path available without starting a second Mooncake
+        # endpoint on the same node.
+        if transfer_op.transfer_type in (
+            TransferType.PEERH2H,
+            TransferType.PEERSSD2H,
+        ):
+            return super().launch_transfer(transfer_op)
+        layer_id = 0 if transfer_op.layer_id == -1 else transfer_op.layer_id
+        layer_granularity = (
+            self.num_layers
+            if transfer_op.layer_granularity == -1
+            else transfer_op.layer_granularity
+        )
+        task_info_list = self.op_parser(
+            transfer_op, layer_id, layer_granularity
+        )
+        start_time = time.time()
+        transferred_size = 0
+        for task_info in task_info_list:
+            if not self._batch_transfer_impl(
+                task_info,
+                transfer_op.transfer_type,
+                layer_id,
+                layer_granularity,
+            ):
+                return False
+            transferred_size += task_info.data_size
+        self._log_transfer_performance(
+            transfer_op, transferred_size, start_time, time.time()
+        )
+        return True
+
+    def _batch_transfer_impl(
+        self,
+        task_info: RDMATaskInfo,
+        transfer_type: TransferType,
+        layer_id: int,
+        layer_granularity: int,
+        **kwargs,
+    ) -> bool:
+        if transfer_type == TransferType.PEERH2D:
+            import concurrent.futures
+            def read_all_batches():
+                for batch_start in range(0, len(task_info.src_ptrs), 1024):
+                    batch_end = batch_start + 1024
+                    ret = self.mooncake_transfer_engine.batch_transfer_sync_read(
+                        task_info.peer_engine_addr,
+                        task_info.src_ptrs[batch_start:batch_end],
+                        task_info.dst_ptrs[batch_start:batch_end],
+                        task_info.data_lens[batch_start:batch_end],
+                    )
+                    if ret != 0:
+                        return ret
+                return 0
+
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            try:
+                future = executor.submit(read_all_batches)
+                try:
+                    ret = future.result(
+                        timeout=self.RDMA_TRANSFER_TIMEOUT_SECONDS
+                    )
+                except concurrent.futures.TimeoutError:
+                    flexkv_logger.error(
+                        f"PEERH2D RDMA read from {task_info.peer_engine_addr} "
+                        f"timed out after {self.RDMA_TRANSFER_TIMEOUT_SECONDS}s; "
+                        f"waiting for the in-flight read to drain before failing"
+                    )
+                    return False
+            finally:
+                # Block until the in-flight read actually finishes:
+                # batch_transfer_sync_read cannot be cancelled, so abandoning it
+                # (wait=False) would let the detached thread keep writing into
+                # the requester's GPU blocks after we report failure — the
+                # caller may recompute/overwrite those blocks meanwhile and
+                # corrupt them. A genuinely hung peer blocks here, which is
+                # preferable to silent GPU corruption.
+                executor.shutdown(wait=True)
+            if ret != 0:
+                flexkv_logger.error(
+                    f"PEERH2D RDMA read failed with error code: {ret}"
+                )
+                return False
+            return True
+
+        if transfer_type != TransferType.PEERSSD2D:
+            raise ValueError(
+                f"Invalid transfer type {transfer_type} for PEER2GPUTransferWorker"
+            )
+
+        meta = RemoteSSD2HMetaInfo(
+            task_id=task_info.task_id,
+            cpu_block_ids=task_info.dst_block_ids,
+            ssd_block_ids=task_info.src_block_ids,
+            peer_engine_addr=task_info.local_engine_addr,
+            peer_cpu_base_ptr=0,
+            peer_zmq_status_addr=self.zmq_client.get_addr(),
+            data_size=task_info.data_size,
+            layer_id=layer_id,
+            layer_granularity=layer_granularity,
+            gpu_dst_ptrs=task_info.dst_ptrs,
+            gpu_block_positions=task_info.gpu_block_positions,
+            gpu_layer_ids=task_info.gpu_layer_ids,
+            gpu_kv_ids=task_info.gpu_kv_ids,
+            gpu_token_ids=task_info.gpu_token_ids,
+            gpu_head_starts=task_info.gpu_head_starts,
+            gpu_data_lens=task_info.data_lens,
+        )
+        if not self.zmq_client.send_meta_info(meta, task_info.peer_zmq_addr):
+            flexkv_logger.error(
+                f"Sending PEERSSD2D metadata to {task_info.peer_zmq_addr} failed"
+            )
+            return False
+        return self.zmq_client.wait_transfer_notify(
+            task_info.peer_engine_addr, task_info.task_id
+        )
+
+    def op_parser(
+        self,
+        transfer_op: WorkerTransferOp,
+        layer_id: int,
+        layer_granularity: int,
+    ) -> List[RDMATaskInfo]:
+        if transfer_op.transfer_type not in (
+            TransferType.PEERH2D,
+            TransferType.PEERSSD2D,
+        ):
+            raise ValueError(
+                f"PEER2GPUTransferWorker does not support {transfer_op.transfer_type}"
+            )
+        src_blocks, dst_blocks = self.get_transfer_block_ids(transfer_op, False)
+        groups = group_blocks_by_node(
+            src_blocks, dst_blocks, transfer_op.src_block_node_ids
+        )
+        tasks: List[RDMATaskInfo] = []
+        for node_id, segment in groups.items():
+            task = self._make_gpu_task(
+                node_id,
+                segment["src"],
+                segment["dst"],
+                transfer_op.dp_id,
+                transfer_op.transfer_type,
+                layer_id,
+                layer_granularity,
+            )
+            if task is not None:
+                tasks.append(task)
+        return tasks
+
+    def _make_gpu_task(
+        self,
+        node_id: int,
+        src_blocks: List[int],
+        dst_blocks: List[int],
+        dp_id: int,
+        transfer_type: TransferType,
+        layer_id: int,
+        layer_granularity: int,
+    ) -> Optional[RDMATaskInfo]:
+        peer_meta = self.get_node_meta(node_id)
+        if peer_meta is None:
+            # A dead / not-yet-registered peer must not abort transfers from the
+            # healthy peers of the same op — mirror
+            # PEER2CPUTransferWorker._dist_cpu_op_parser and skip this node.
+            flexkv_logger.warning(
+                f"[PEER2GPUTransferWorker] Skipping node {node_id}: "
+                f"meta unavailable, {len(src_blocks)} block(s) not fetched"
+            )
+            return None
+        if dp_id not in self.gpu_groups:
+            raise ValueError(f"No GPU group registered for dp_id={dp_id}")
+
+        dst_ptrs: List[int] = []
+        src_ptrs: List[int] = []
+        data_lens: List[int] = []
+        block_positions: List[int] = []
+        layer_ids: List[int] = []
+        kv_ids: List[int] = []
+        token_ids: List[int] = []
+        head_starts: List[int] = []
+        tp_head_start = 0
+        tp_specs = []
+        for tensors, layout, block_type in zip(
+            self.gpu_groups[dp_id],
+            self.gpu_layouts[dp_id],
+            self.gpu_block_types[dp_id],
+        ):
+            head_start = 0 if self.is_mla else tp_head_start
+            tp_specs.append((tensors, layout, block_type, head_start))
+            if not self.is_mla:
+                tp_head_start += layout.num_head
+        if not self.is_mla and tp_head_start != self.cpu_kv_layout.num_head:
+            raise ValueError(
+                f"TP GPU heads ({tp_head_start}) do not match CPU heads "
+                f"({self.cpu_kv_layout.num_head})"
+            )
+
+        kv_dim = 1 if self.is_mla else 2
+        for block_pos, (src_block, dst_block) in enumerate(
+            zip(src_blocks, dst_blocks)
+        ):
+            for lid in range(layer_id, layer_id + layer_granularity):
+                for kv_id in range(kv_dim):
+                    for tensors, layout, block_type, head_start in tp_specs:
+                        data_len = (
+                            layout.num_head * layout.head_size * self.dtype.itemsize
+                        )
+                        for token_id in range(layout.tokens_per_block):
+                            dst_ptrs.append(
+                                _gpu_token_slice_ptr(
+                                    tensors, layout, block_type, int(dst_block),
+                                    lid, kv_id, token_id,
+                                )
+                            )
+                            data_lens.append(data_len)
+                            block_positions.append(block_pos)
+                            layer_ids.append(lid)
+                            kv_ids.append(kv_id)
+                            token_ids.append(token_id)
+                            head_starts.append(head_start)
+                            if transfer_type == TransferType.PEERH2D:
+                                src_ptrs.append(
+                                    _cpu_token_slice_ptr(
+                                        self.remote_kv_layout,
+                                        self.dtype,
+                                        peer_meta.cpu_bufer_base_ptr,
+                                        int(src_block),
+                                        lid,
+                                        kv_id,
+                                        token_id,
+                                        head_start,
+                                    )
+                                )
+
+        task = RDMATaskInfo(
+            self.gen_task_id() if transfer_type == TransferType.PEERSSD2D else 0,
+            self.mooncake_transfer_engine.get_engine_addr(),
+            peer_meta.engine_addr,
+            peer_meta.zmq_addr or "",
+            src_ptrs,
+            dst_ptrs,
+            [int(x) for x in src_blocks],
+            [int(x) for x in dst_blocks],
+            data_lens,
+            data_size=sum(data_lens),
+        )
+        task.gpu_block_positions = block_positions
+        task.gpu_layer_ids = layer_ids
+        task.gpu_kv_ids = kv_ids
+        task.gpu_token_ids = token_ids
+        task.gpu_head_starts = head_starts
+        return task

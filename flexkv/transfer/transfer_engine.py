@@ -41,6 +41,7 @@ from flexkv.transfer.worker import (
     tpGDSTransferWorker,
     NixlTransferWorker,
     PEER2CPUTransferWorker,
+    PEER2GPUTransferWorker,
 )
 from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.ring_buffer import SharedOpPool
@@ -68,6 +69,8 @@ def register_op_to_buffer(op: TransferOp, pin_buffer: SharedOpPool) -> None:
         TransferType.H2PEERH: (2, 5),  # CPU -> PEER_CPU
         TransferType.PEERSSD2H: (6, 2),# PEER_SSD -> CPU
         TransferType.H2PEERSSD: (2, 6),# CPU -> PEER_SSD
+        TransferType.PEERH2D: (5, 1),  # PEER_CPU -> GPU
+        TransferType.PEERSSD2D: (6, 1),# PEER_SSD -> GPU
     }
 
     src_device, dst_device = transfer_type_to_devices.get(op.transfer_type, (0, 0))
@@ -341,8 +344,29 @@ class TransferEngine:
             ## NOTE:if we have the cpu handle and enable p2p cpu transfer we need this worker
             ## (currently we inplement cpu and ssd distributed transfer in one worker)
 
-            flexkv_logger.info("[transfer_engine] initializing the PEER2CPUTransferWorker!")
-            self.cpu_remote_cpu_worker: WorkerHandle = PEER2CPUTransferWorker.create_worker(
+            peer_worker_cls = (
+                PEER2GPUTransferWorker
+                if self.cache_config.enable_p2p_gpu
+                else PEER2CPUTransferWorker
+            )
+            flexkv_logger.info(
+                f"[transfer_engine] initializing {peer_worker_cls.__name__}!"
+            )
+            peer_worker_kwargs = {}
+            if self.cache_config.enable_p2p_gpu:
+                peer_worker_kwargs.update(
+                    gpu_blocks={
+                        dp_id: [
+                            handle.get_tensor_handle_list() for handle in handles
+                        ]
+                        for dp_id, handles in self.gpu_handles.items()
+                    },
+                    gpu_kv_layouts={
+                        dp_id: [handle.kv_layout for handle in handles]
+                        for dp_id, handles in self.gpu_handles.items()
+                    },
+                )
+            self.peer_transfer_worker: WorkerHandle = peer_worker_cls.create_worker(
                 mp_ctx=self.mp_ctx,
                 finished_ops_queue=self.finished_ops_queue,
                 op_buffer_tensor = self.pin_buffer.get_buffer(),
@@ -356,12 +380,20 @@ class TransferEngine:
                 ssd_files = self._ssd_handle.get_file_list() if self._ssd_handle else None,
                 num_blocks_per_file = self._ssd_handle.num_blocks_per_file if self._ssd_handle else 0,
                 mooncake_config_path = getattr(self.cache_config, 'mooncake_config_path', None) or os.environ.get("MOONCAKE_CONFIG_PATH"),
+                **peer_worker_kwargs,
             )
-            # NOTE: now peerH2H and peerSSD2H op use the same worker
-            if self.cache_config.enable_p2p_cpu:
-                self._worker_map[TransferType.PEERH2H] = self.cpu_remote_cpu_worker
-            if self.cache_config.enable_p2p_ssd:
-                self._worker_map[TransferType.PEERSSD2H] = self.cpu_remote_cpu_worker
+            if self.cache_config.enable_p2p_gpu:
+                if self.cache_config.enable_p2p_cpu:
+                    self._worker_map[TransferType.PEERH2D] = self.peer_transfer_worker
+                    self._worker_map[TransferType.PEERH2H] = self.peer_transfer_worker
+                if self.cache_config.enable_p2p_ssd:
+                    self._worker_map[TransferType.PEERSSD2D] = self.peer_transfer_worker
+                    self._worker_map[TransferType.PEERSSD2H] = self.peer_transfer_worker
+            else:
+                if self.cache_config.enable_p2p_cpu:
+                    self._worker_map[TransferType.PEERH2H] = self.peer_transfer_worker
+                if self.cache_config.enable_p2p_ssd:
+                    self._worker_map[TransferType.PEERSSD2H] = self.peer_transfer_worker
 
 
         if len(self._worker_map) == 0:
@@ -582,13 +614,19 @@ class TransferEngine:
                 else:
                     flexkv_logger.debug(f"Shutdown pipes already closed: {e}")
 
-            # shutdown all workers
+            # shutdown all workers. Dedup by object identity, NOT worker_id:
+            # _worker_id_counter is per-subclass, so the first worker of every
+            # distinct class is id 0 — deduping by worker_id would skip distinct
+            # workers (e.g. leave PEER2GPUTransferWorker's mooncake buffers
+            # registered). The same instance can still appear under several
+            # _worker_map keys, which id() dedup handles correctly.
+            shutdown_workers = set()
             for worker in self._worker_map.values():
-                if isinstance(worker, List):
-                    for w in worker:
+                workers = worker if isinstance(worker, List) else [worker]
+                for w in workers:
+                    if id(w) not in shutdown_workers:
                         w.shutdown()
-                else:
-                    worker.shutdown()
+                        shutdown_workers.add(id(w))
         except Exception as e:
             flexkv_logger.error(f"Error during shutdown: {e}")
         finally:
