@@ -3,6 +3,8 @@ from enum import Enum
 from typing import Optional, Protocol, TypeVar, TYPE_CHECKING
 import numpy as np
 
+from flexkv.common.source import BlockSource, LocalSource
+
 if TYPE_CHECKING:
     from flexkv.common.block import SequenceMeta
 
@@ -31,9 +33,11 @@ class MatchResultAccel:
     """A single-locality prefix match against one cache tier's index.
 
     ``physical_blocks[i]`` is the block that serves logical position ``i`` of
-    the queried sequence.  ``block_node_ids[i]`` (when present) names the
-    source that owns block ``i`` — a peer node id for a PEER match, or a PCFS
-    file node id for a Lake match.  A tier match is expressed as a
+    the queried sequence.  ``source`` names where those blocks come from: a
+    :class:`~flexkv.common.source.LocalSource` for a plain local hit, a
+    :class:`~flexkv.common.source.PeerSource` (a single peer node id) for a
+    cpu/ssd PEER match, or a :class:`~flexkv.common.source.LakeSource` (per-block
+    PCFS file ids) for a Lake match.  A tier match is expressed as a
     ``MatchResult`` pairing the LOCAL hit with an optional peer (remote) hit
     that extends it; each side is one of these objects.
     """
@@ -44,7 +48,7 @@ class MatchResultAccel:
     last_node: Optional["RadixNodeLike"] = None
     last_node_matched_length: int = 0
     physical_blocks: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
-    block_node_ids: Optional[np.ndarray] = None
+    source: BlockSource = field(default_factory=LocalSource)
     # Set by backends whose `match()` performs an atomic inc_ref to protect the
     # matched slots from eviction between the read and the consuming transfer
     # (e.g. CacheEngineRadixShmem with lock=True). The cache_engine layer is
@@ -66,8 +70,8 @@ class MatchResult:
     ``remote`` is ``None`` when the tier has no peer index or peer matching was
     not requested (e.g. PUT).  When present, ``remote`` covers a ready prefix
     that reaches at least as far as ``local`` and whose ``physical_blocks`` /
-    ``block_node_ids`` describe the peer source for every logical position
-    beyond ``local.num_ready_matched_blocks``.
+    ``source`` describe the peer origin for every logical position beyond
+    ``local.num_ready_matched_blocks``.
     """
 
     local: MatchResultAccel

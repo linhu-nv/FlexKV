@@ -18,11 +18,12 @@ engines and lives in ``GlobalCacheEngine._get_impl_with_lake`` /
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, NamedTuple, Optional, Tuple
 
 import numpy as np
 
+from flexkv.common.source import BlockSource, LakeSource, LocalSource, PeerSource
 from flexkv.common.transfer import (
     DeviceType,
     TransferOp,
@@ -38,9 +39,12 @@ class MediaSegment:
 
     ``block_ids[i]`` is the source block for logical position
     ``logical_start + i``; physical block ids need not be contiguous.
-    ``src_block_node_ids`` names the owning source for each block — a peer node
-    id for a cpu/ssd PEER segment, or a per-block PCFS file id for a LAKE
-    segment — and is ``None`` for a purely-local cpu/ssd segment.
+    ``source`` names where the segment's blocks come from — a
+    :class:`~flexkv.common.source.PeerSource` (single peer node id) for a
+    cpu/ssd PEER segment, a :class:`~flexkv.common.source.LakeSource` (per-block
+    PCFS file ids) for a LAKE segment, or a
+    :class:`~flexkv.common.source.LocalSource` for a purely-local cpu/ssd
+    segment.
 
     The route fields (``primary_type`` / ``needs_staging`` / ``needs_h2d``) are
     filled by :func:`plan_routes`; the op handles (``primary_op`` / ``staging``
@@ -52,7 +56,7 @@ class MediaSegment:
     locality: CacheLocality
     logical_start: int
     block_ids: np.ndarray
-    src_block_node_ids: Optional[np.ndarray] = None
+    source: BlockSource = field(default_factory=LocalSource)
 
     # Route (path selection).
     primary_type: Optional[TransferType] = None
@@ -66,10 +70,6 @@ class MediaSegment:
 
     def __post_init__(self) -> None:
         self.block_ids = np.asarray(self.block_ids, dtype=np.int64)
-        if self.src_block_node_ids is not None:
-            self.src_block_node_ids = np.asarray(
-                self.src_block_node_ids, dtype=np.int64
-            )
 
     @property
     def num_blocks(self) -> int:
@@ -140,18 +140,25 @@ def get_media_list(cpu_match: MatchResult,
         if reach <= cursor:
             continue
         block_ids = np.asarray(accel.physical_blocks[cursor:reach], dtype=np.int64)
-        node_ids = None
-        if tier == DeviceType.LAKE or locality == CacheLocality.PEER:
-            # LAKE carries per-block PCFS file ids for both localities; a cpu/ssd
-            # PEER segment carries the owning peer node id per block.
-            if accel.block_node_ids is None or len(accel.block_node_ids) < reach:
+        seg_source = accel.source.slice(cursor, reach)
+        # Validate the origin matches what this medium needs. Check LAKE FIRST:
+        # a LAKE-PEER segment carries per-block PCFS file ids (a LakeSource), not
+        # a peer node id, and must never be routed to a peer.
+        if tier == DeviceType.LAKE:
+            if not isinstance(seg_source, LakeSource) or not seg_source.covers(
+                reach - cursor
+            ):
                 raise ValueError(
-                    f"{tier.name} {locality.value} segment is missing "
-                    "per-block source node ids"
+                    f"{tier.name} {locality.value} segment is missing per-block "
+                    "PCFS file ids"
                 )
-            node_ids = np.asarray(accel.block_node_ids[cursor:reach], dtype=np.int64)
+        elif locality == CacheLocality.PEER:
+            if not isinstance(seg_source, PeerSource):
+                raise ValueError(
+                    f"{tier.name} peer segment is missing its peer node id"
+                )
         segments.append(
-            MediaSegment(tier, locality, cursor, block_ids, node_ids)
+            MediaSegment(tier, locality, cursor, block_ids, seg_source)
         )
         cursor = reach
     return segments
@@ -257,7 +264,7 @@ def build_transfer_graph(segments: List[MediaSegment],
             dst_block_ids=dst,
             layer_id=0,
             layer_granularity=layer_num,
-            src_block_node_ids=seg.src_block_node_ids,
+            source=seg.source,
             gpu_block_offset=(
                 seg.logical_start - block_mask_start if direct else None
             ),

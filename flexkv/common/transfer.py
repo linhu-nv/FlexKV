@@ -5,6 +5,8 @@ from typing import ClassVar, List, Set, Dict, Callable, Tuple, Optional
 
 import numpy as np
 
+from flexkv.common.source import BlockSource, LocalSource
+
 
 @dataclass(frozen=True)
 class CompletedOp:
@@ -101,7 +103,6 @@ class TransferOp:
     dst_block_ids: np.ndarray
     layer_id: int = 0
     layer_granularity: int = -1
-    # src_block_node_ids: Optional[np.ndarray] = None
     # this will change dynamically as transfer ops executed
     predecessors: Set[int] = field(default_factory=set)
     # this will keep the full info
@@ -112,9 +113,10 @@ class TransferOp:
     src_slot_id: int = -1
     dst_slot_id: int = -1
     valid_block_num: int = 0
-    remote_node_ids: Optional[np.ndarray] = None
-    # used for distributed cpu and ssd
-    src_block_node_ids: Optional[np.ndarray] = None
+    # Origin of the source blocks: a PeerSource (single peer node, for cpu/ssd
+    # P2P), a LakeSource (per-block PCFS file ids), or LocalSource for a local /
+    # GPU-side op. Consumed by the transfer worker to route/partition the read.
+    source: BlockSource = field(default_factory=LocalSource)
     # Exact logical offset into the rebound GPU block list.  The legacy
     # prefix/suffix rules remain in effect when this is None.  Combined
     # LOCAL+PEER matches need an exact offset because a direct peer route can

@@ -128,7 +128,7 @@ def _rank_main(rank, prefix, port, rdma_dev, ready, done, output):
             output.put({
                 "is_pure_peer": result.local.num_ready_matched_blocks == 0,
                 "physical": peer.physical_blocks.tolist(),
-                "peer_node_ids": peer.block_node_ids.tolist(),
+                "peer_node_id": peer.source.node_id,
                 "staged_type": staged_type,
                 "direct_type": direct_type,
             })
@@ -176,6 +176,6 @@ def test_radixshmem_single_peer_match_over_rdma():
     assert all(process.exitcode == 0 for process in processes)
     result = next(message for message in messages if "is_pure_peer" in message)
     assert result["is_pure_peer"] is True
-    assert result["peer_node_ids"] == [100] * 25
+    assert result["peer_node_id"] == 100
     assert result["staged_type"] == "PEERH2H"
     assert result["direct_type"] == "PEERH2D"

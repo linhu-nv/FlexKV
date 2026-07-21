@@ -18,6 +18,7 @@ from flexkv.common.transfer import DeviceType, TransferType
 from flexkv.common.block import SequenceMeta
 from flexkv.common.config import CacheConfig, ModelConfig, UserConfig
 
+from flexkv.common.source import LakeSource, PeerSource
 from flexkv.common.type import (
     MatchResult,
     MatchResultAccel,
@@ -1382,8 +1383,8 @@ def test_get_with_lake_uses_three_tier_planner():
     cpu_match = _local_match([10])
     ssd_match = _local_match([20, 21, 22])
     lake_match = _local_match([30, 31, 32, 33, 34])
-    lake_match.local.block_node_ids = np.array(
-        [100, 101, 102, 103, 104], dtype=np.int64
+    lake_match.local.source = LakeSource(
+        np.array([100, 101, 102, 103, 104], dtype=np.int64)
     )
     fake = types.SimpleNamespace(
         cache_config=types.SimpleNamespace(
@@ -1430,7 +1431,7 @@ def test_get_with_lake_uses_three_tier_planner():
         if op.transfer_type == TransferType.LAKE2H
     )
     np.testing.assert_array_equal(lake_op.src_block_ids, [33, 34])
-    np.testing.assert_array_equal(lake_op.src_block_node_ids, [103, 104])
+    np.testing.assert_array_equal(lake_op.source.file_ids, [103, 104])
     h2disk_op = next(
         op for op in graph._op_map.values()
         if op.transfer_type == TransferType.H2DISK
@@ -1539,14 +1540,51 @@ def test_lake_combined_match_maps_local_and_peer_file_node_ids():
     # LOCAL side maps its blocks to this node's file ids; the planner will use
     # its [0, 2) prefix.
     np.testing.assert_array_equal(match.local.physical_blocks, [10, 11])
-    np.testing.assert_array_equal(match.local.block_node_ids, [710, 711])
+    np.testing.assert_array_equal(match.local.source.file_ids, [710, 711])
     # PEER side is the peer index prefix with peer file ids; the planner slices
     # its [2, 4) tail ([32, 33] -> [832, 833]) after the local prefix.
     assert match.remote is not None
     np.testing.assert_array_equal(match.remote.physical_blocks, [30, 31, 32, 33])
     np.testing.assert_array_equal(
-        match.remote.block_node_ids, [830, 831, 832, 833]
+        match.remote.source.file_ids, [830, 831, 832, 833]
     )
+    assert match.remote.num_ready_matched_blocks == 4
+
+
+def test_cpu_remote_match_spanning_peers_keeps_the_extending_peer():
+    """A cpu/ssd remote match can span many peers (the distributed tree merges
+    every peer). match() keeps only the single peer that extends the local
+    prefix, truncated to that peer's contiguous run — no crash, no mis-route."""
+    engine = HierarchyLRCacheEngine.__new__(HierarchyLRCacheEngine)
+    engine.device_type = DeviceType.CPU
+    engine.redis_node_id = 7
+    engine.tokens_per_block = 1
+    engine.local_index = _FakeRadixIndex(_FakeRadixMatch([10, 11], ready=2))
+    # Remote prefix [0,5) owned by peers [7, 7, 8, 8, 9]; blocks [0,2) are served
+    # locally, so the peer extension starts at logical block 2 (peer 8).
+    engine.remote_index = _FakeRadixIndex(
+        _FakeRadixMatch([20, 21, 22, 23, 24], ready=5, node_ids=[7, 7, 8, 8, 9])
+    )
+    engine._stats_total_queried_tokens = 0
+    engine._stats_gpu_matched_tokens = 0
+    engine._stats_local_matched_tokens = 0
+    engine._stats_distributed_matched_tokens = 0
+    engine._stats_match_count = 0
+    sequence = types.SimpleNamespace(
+        gen_hashes=lambda: None,
+        block_hashes=np.arange(5, dtype=np.int64),
+        num_blocks=5,
+    )
+
+    match = engine.match(sequence)
+
+    # LOCAL side is a plain local hit (no peer/lake source).
+    from flexkv.common.source import LocalSource
+    assert isinstance(match.local.source, LocalSource)
+    # PEER side: the single peer (8) that extends the local prefix, truncated to
+    # its run [2, 4) — peer 9 at block 4 is dropped, peer 7 at [0,2) is local.
+    assert match.remote is not None
+    assert match.remote.source == PeerSource(8)
     assert match.remote.num_ready_matched_blocks == 4
 
 

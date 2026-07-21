@@ -38,9 +38,8 @@ from flexkv.common.config import CacheConfig, GLOBAL_CONFIG_FROM_ENV, MooncakeTr
 from flexkv.mooncakeEngineWrapper import MoonCakeTransferEngineWrapper
 from flexkv.transfer.zmqHelper import NotifyMsg, NotifyStatus, SSDZMQServer, SSDZMQClient
 from flexkv.cache.redis_meta import RedisMeta
+from flexkv.common.source import BlockSource, LakeSource, PeerSource
 from flexkv.transfer.utils import (
-    group_blocks_by_node_and_segment,
-    group_blocks_by_node,
     split_contiguous_blocks,
     RemoteSSD2HMetaInfo,
     NodeMetaInfo,
@@ -291,6 +290,21 @@ def cudaHostUnregister(tensor: torch.Tensor) -> None:
                 f"error code {ret} (ignored)"
             )
 
+def _require_peer_node_id(transfer_op: "WorkerTransferOp") -> int:
+    """The single peer node id for a peer transfer op.
+
+    Under the P2P single-peer invariant every peer op is served by exactly one
+    peer, so its source is a scalar :class:`PeerSource`. Fail loudly if a
+    non-peer source reaches a peer op-parser."""
+    src = transfer_op.source
+    if not isinstance(src, PeerSource):
+        raise TypeError(
+            f"peer transfer op {transfer_op.transfer_type} expected a "
+            f"PeerSource, got {type(src).__name__}"
+        )
+    return int(src.node_id)
+
+
 @dataclass
 class WorkerTransferOp:
     transfer_op_id: int
@@ -303,7 +317,7 @@ class WorkerTransferOp:
     valid_block_num: int
     src_block_ids: np.ndarray
     dst_block_ids: np.ndarray
-    src_block_node_ids: Optional[np.ndarray]
+    source: "BlockSource"
     dp_id: int
     # successors: List[int]
 
@@ -316,8 +330,8 @@ class WorkerTransferOp:
         self.src_slot_id = transfer_op.src_slot_id
         self.dst_slot_id = transfer_op.dst_slot_id
         self.valid_block_num = transfer_op.valid_block_num
-        # Always preserve optional src_block_node_ids from TransferOp
-        self.src_block_node_ids = transfer_op.src_block_node_ids
+        # Origin of the source blocks (peer node / Lake files / local).
+        self.source = transfer_op.source
         self.dp_id = transfer_op.dp_id
 
         if self.src_slot_id == -1 or self.dst_slot_id == -1:
@@ -1105,18 +1119,18 @@ class CPULakeTransferWorker(TransferWorkerBase):
         if self.enable_pcfs_sharing and transfer_type == TransferType.LAKE2H:
             # For PCFS sharing, we need to construct cfs_blocks_partition and cpu_blocks_partition
             # based on the file_nodeids from the transfer operation
-            # Optional: per-source-block node ids for remote routing (numpy.ndarray)
-            src_block_node_ids = kwargs.get("src_block_node_ids")
-            if src_block_node_ids is not None and not isinstance(src_block_node_ids, np.ndarray):
-                raise TypeError("src_block_node_ids must be a numpy.ndarray if provided")
+            # Per-block PCFS file node ids for this LAKE read (numpy.ndarray).
+            lake_file_ids = kwargs.get("lake_file_ids")
+            if lake_file_ids is not None and not isinstance(lake_file_ids, np.ndarray):
+                raise TypeError("lake_file_ids must be a numpy.ndarray if provided")
 
-            assert len(src_block_node_ids) == len(lake_block_id_list)
+            assert len(lake_file_ids) == len(lake_block_id_list)
 
             # Construct cfs_blocks_partition and cpu_blocks_partition
             # This is a simplified implementation - in practice, you might need more sophisticated logic
 
             # Group blocks by file_nodeid (simplified grouping logic)
-            files_set = set(src_block_node_ids)
+            files_set = set(lake_file_ids)
             file_nodeids_list = list(files_set)
 
             # Initialize partitions with proper size
@@ -1128,7 +1142,7 @@ class CPULakeTransferWorker(TransferWorkerBase):
             #因为每个flexkv的文件数量是相同的，所以total_file_num是相同的，后面用全局block_id计算block_id_in_file时，需要除以total_file_num
             total_file_num = len(self.file_nodeid_list)
             for i in range(len(lake_block_id_list)):
-                file_nodeid = src_block_node_ids[i]
+                file_nodeid = lake_file_ids[i]
                 fid = file2fid_dict[file_nodeid]
 
                 # Calculate block_id_in_file using the same logic as C++
@@ -1192,6 +1206,10 @@ class CPULakeTransferWorker(TransferWorkerBase):
 
         src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
 
+        # A LAKE read carries per-block PCFS file ids; other tiers carry none.
+        src = transfer_op.source
+        lake_file_ids = src.file_ids if isinstance(src, LakeSource) else None
+
         start_time = time.time()
         self._transfer_impl(
             src_block_ids,
@@ -1199,7 +1217,7 @@ class CPULakeTransferWorker(TransferWorkerBase):
             transfer_op.transfer_type,
             layer_id,           # Use corrected value, not transfer_op.layer_id
             layer_granularity,  # Use corrected value, not transfer_op.layer_granularity
-            src_block_node_ids=transfer_op.src_block_node_ids,
+            lake_file_ids=lake_file_ids,
         )
         end_time = time.time()
 
@@ -2330,29 +2348,26 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
 
         assert len(src_block_ids) == len(dst_block_ids)
 
-        src_block_node_ids = transfer_op.src_block_node_ids
+        # One peer owns the whole op (P2P): a single node id, no grouping.
+        node_id = _require_peer_node_id(transfer_op)
 
-        # step1: group the blocks by remote node id and remote block source type,
-        # each segment is a list of continuous blocks
-        #flexkv_logger.info(
-        #    f"[PEER2CPUTransferWorker] src_block_ids: {src_block_ids} \n \
-        #                        dst_block_ids: {dst_block_ids} \n \
-        #                        src_block_node_ids: {src_block_node_ids} \n"
-        #)
         task_info_list = []
 
         if transfer_op.transfer_type == TransferType.PEERH2H:
-            groups = group_blocks_by_node_and_segment(
-                src_block_ids, dst_block_ids, src_block_node_ids
+            # Split into maximal contiguous (src, dst) runs — the per-op work
+            # group_blocks_by_node_and_segment used to do for one node (it sorts
+            # by (src, dst) first, so preserve that ordering).
+            pairs = sorted(zip(src_block_ids.tolist(), dst_block_ids.tolist()))
+            segments = split_contiguous_blocks(
+                [s for s, _ in pairs], [d for _, d in pairs]
             )
             task_info_list = self._dist_cpu_op_parser(
-                groups, layer_id, layer_granularity
+                node_id, segments, layer_id, layer_granularity
             )
         elif transfer_op.transfer_type == TransferType.PEERSSD2H:
-            groups = group_blocks_by_node(
-                src_block_ids, dst_block_ids, src_block_node_ids
+            task_info_list = self._dist_ssd_op_parser(
+                node_id, src_block_ids.tolist(), dst_block_ids.tolist()
             )
-            task_info_list = self._dist_ssd_op_parser(groups)
         else:
             raise RuntimeError(
                 f"Unsurpported transfer_type {transfer_op.transfer_type} in PEER2CPUTransferWorker"
@@ -2362,13 +2377,14 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
 
     #========================== distrbuted ssd related ==========================
     #========================== local behaviors
-    def _dist_ssd_op_parser(self, groups: Dict[int, Dict[str, List[int]]]):
+    def _dist_ssd_op_parser(self, node_id: int, src_blocks: List[int],
+                            dst_blocks: List[int]):
         """
-        Distributed ssd op parser
-        1. for each segment, get the remote ssd blocks and local cpu blocks
-        2. create RDMATaskInfo for each segment
+        Distributed ssd op parser (single peer).
+        Get the remote ssd blocks and local cpu blocks and create one RDMATaskInfo.
         Args:
-            groups (Dict[int, Dict[str, List[int]]]): the grouped blocks
+            node_id: the single peer node owning these blocks
+            src_blocks / dst_blocks: the remote/local block ids
 
         Returns:
             task_info_list: the list of RDMATaskInfo, each task refers to one data transfer operation
@@ -2378,38 +2394,35 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
 
         task_info_list = []
 
-        for node_id, segment in groups.items():
-            ##NOTE: for ssd scenario, each node will only have one set of src and dst block ids
-            peer_node_info = self.get_node_meta(node_id)
-            if peer_node_info is None:
-                return []
-            peer_zmq_addr = peer_node_info.zmq_addr
-            peer_engine_addr = peer_node_info.engine_addr
-            assert (
-                peer_zmq_addr != ""
-            ), f"Node {node_id} zmq addr not found in redis server"
+        ##NOTE: for ssd scenario, each node will only have one set of src and dst block ids
+        peer_node_info = self.get_node_meta(node_id)
+        if peer_node_info is None:
+            return []
+        peer_zmq_addr = peer_node_info.zmq_addr
+        peer_engine_addr = peer_node_info.engine_addr
+        assert (
+            peer_zmq_addr != ""
+        ), f"Node {node_id} zmq addr not found in redis server"
 
-            src_blocks = segment["src"]
-            dst_blocks = segment["dst"]
-            assert len(src_blocks) == len(dst_blocks)
+        assert len(src_blocks) == len(dst_blocks)
 
-            data_size = self.cpu_kv_layout.get_block_stride() * self.dtype.itemsize * len(src_blocks)
-            ssd_task_id = self.gen_task_id()
-            task_info_list.append(
-                RDMATaskInfo(
-                    ssd_task_id,
-                    self.mooncake_transfer_engine.get_engine_addr(),
-                    # for ssd transfer, peer engine addr refers to local mooncake engine
-                    peer_engine_addr,
-                    peer_zmq_addr,
-                    None,
-                    None,
-                    src_blocks,
-                    dst_blocks,
-                    [], # not used in ssd transfer
-                    data_size=data_size
-                )
+        data_size = self.cpu_kv_layout.get_block_stride() * self.dtype.itemsize * len(src_blocks)
+        ssd_task_id = self.gen_task_id()
+        task_info_list.append(
+            RDMATaskInfo(
+                ssd_task_id,
+                self.mooncake_transfer_engine.get_engine_addr(),
+                # for ssd transfer, peer engine addr refers to local mooncake engine
+                peer_engine_addr,
+                peer_zmq_addr,
+                None,
+                None,
+                src_blocks,
+                dst_blocks,
+                [], # not used in ssd transfer
+                data_size=data_size
             )
+        )
         return task_info_list
 
 
@@ -2687,17 +2700,19 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
 
     def _dist_cpu_op_parser(
         self,
-        groups: Dict[int, List[Dict[str, List[int]]]],
+        node_id: int,
+        segments: List[Dict[str, List[int]]],
         layer_id: int,
         layer_granularity: int,
     ):
         """
-        Distributed cpu op parser
-        1. for each segment, get the remote cpu ptrs and local cpu ptrs
-        2. create RDMATaskInfo for each segment
+        Distributed cpu op parser (single peer).
+        For each contiguous segment, get the remote cpu ptrs and local cpu ptrs
+        and create one RDMATaskInfo for the peer.
 
         Inputs:
-            groups (Dict[int, List[Dict[str, List[int]]]]): the grouped blocks
+            node_id (int): the single peer node owning these blocks
+            segments (List[Dict[str, List[int]]]): contiguous (src, dst) segments
             layer_id (int): start layer id
             layer_granularity (int): number of layers to be transferred
 
@@ -2707,81 +2722,78 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
 
         task_info_list = []
 
-        for node_id, segments in groups.items():
-            # step1: get the remote meta info
-            src_meta = self.get_node_meta(node_id)
-            if src_meta is None:
-                # Skip this node's blocks instead of aborting all nodes.
-                # In multi-node P2P, one dead node should not prevent fetching
-                # blocks from other healthy nodes.
-                flexkv_logger.warning(
-                    f"[PEER2CPUTransferWorker] Skipping node {node_id}: "
-                    f"meta unavailable, will skip {len(segments)} segment(s)"
-                )
-                continue
-            peer_engine_addr = src_meta.engine_addr
-            src_ptr_list = []
-            dst_ptr_list = []
-            data_size_list = []
-            for seg in segments:
-                src_blocks = seg["src"]
-                dst_blocks = seg["dst"]
-
-                # step2: calculate the src and dst block start ptrs
-                src_block_start_ptrs, src_data_size_per_block = (
-                    self.get_cpu_buffer_block_start_ptr(
-                        src_blocks,
-                        src_meta.cpu_bufer_base_ptr,  # the cpu buffer ptr on remote machine
-                        layer_id,
-                        layer_granularity,
-                    )
-                )
-
-
-                dst_block_start_ptrs, dst_data_size_per_block = (
-                    self.get_cpu_buffer_block_start_ptr(
-                        dst_blocks,
-                        self.dst_buffer_ptr,  # the cpu buffer ptr on local machine
-                        layer_id,
-                        layer_granularity,
-                    )
-                )
-
-                assert (
-                    src_data_size_per_block == dst_data_size_per_block
-                ), "src and dst blocks have different layout"
-
-
-                for _ in range(len(src_block_start_ptrs)):
-                    data_size = src_data_size_per_block * len(src_blocks)
-                    data_size_list.append(data_size)
-                src_ptr_list.extend(src_block_start_ptrs)
-                dst_ptr_list.extend(dst_block_start_ptrs)
-                assert len(data_size_list) == len(src_ptr_list) and len(data_size_list) == len(dst_ptr_list)
-
-            flexkv_logger.info(
-                f"[PEER2CPUTransferWorker]: remote cpu op parser "
-                f"src_ptr_list: {src_ptr_list}, dst_ptr_list: {dst_ptr_list} "
+        # step1: get the remote meta info
+        src_meta = self.get_node_meta(node_id)
+        if src_meta is None:
+            # A dead / not-yet-registered peer must not crash the transfer.
+            flexkv_logger.warning(
+                f"[PEER2CPUTransferWorker] Skipping node {node_id}: "
+                f"meta unavailable, will skip {len(segments)} segment(s)"
             )
-            # step3: create RDMATaskInfo for each segment
-            # NOTE: block wise layout: only one start ptr for each segment
-            #       layer wise layout: multiple start ptrs for each segment,
-            #       the number of start ptrs equals to layer_granularity * kv_dim
+            return task_info_list
+        peer_engine_addr = src_meta.engine_addr
+        src_ptr_list = []
+        dst_ptr_list = []
+        data_size_list = []
+        for seg in segments:
+            src_blocks = seg["src"]
+            dst_blocks = seg["dst"]
 
-            task_info_list.append(
-                  RDMATaskInfo(
-                    0,
-                    "",
-                    peer_engine_addr,
-                    "",
-                    src_ptr_list,
-                    dst_ptr_list,
-                    None,
-                    None,
-                    data_size_list,
-                    data_size = sum(data_size_list)
+            # step2: calculate the src and dst block start ptrs
+            src_block_start_ptrs, src_data_size_per_block = (
+                self.get_cpu_buffer_block_start_ptr(
+                    src_blocks,
+                    src_meta.cpu_bufer_base_ptr,  # the cpu buffer ptr on remote machine
+                    layer_id,
+                    layer_granularity,
                 )
             )
+
+
+            dst_block_start_ptrs, dst_data_size_per_block = (
+                self.get_cpu_buffer_block_start_ptr(
+                    dst_blocks,
+                    self.dst_buffer_ptr,  # the cpu buffer ptr on local machine
+                    layer_id,
+                    layer_granularity,
+                )
+            )
+
+            assert (
+                src_data_size_per_block == dst_data_size_per_block
+            ), "src and dst blocks have different layout"
+
+
+            for _ in range(len(src_block_start_ptrs)):
+                data_size = src_data_size_per_block * len(src_blocks)
+                data_size_list.append(data_size)
+            src_ptr_list.extend(src_block_start_ptrs)
+            dst_ptr_list.extend(dst_block_start_ptrs)
+            assert len(data_size_list) == len(src_ptr_list) and len(data_size_list) == len(dst_ptr_list)
+
+        flexkv_logger.info(
+            f"[PEER2CPUTransferWorker]: remote cpu op parser "
+            f"src_ptr_list: {src_ptr_list}, dst_ptr_list: {dst_ptr_list} "
+        )
+        # step3: create one RDMATaskInfo for the peer
+        # NOTE: block wise layout: only one start ptr for each segment
+        #       layer wise layout: multiple start ptrs for each segment,
+        #       the number of start ptrs equals to layer_granularity * kv_dim
+
+        task_info_list.append(
+              RDMATaskInfo(
+                0,
+                "",
+                peer_engine_addr,
+                "",
+                src_ptr_list,
+                dst_ptr_list,
+                None,
+                None,
+                data_size_list,
+                data_size = sum(data_size_list)
+            )
+        )
 
         return task_info_list
 
@@ -3136,23 +3148,18 @@ class PEER2GPUTransferWorker(PEER2CPUTransferWorker):
                 f"PEER2GPUTransferWorker does not support {transfer_op.transfer_type}"
             )
         src_blocks, dst_blocks = self.get_transfer_block_ids(transfer_op, False)
-        groups = group_blocks_by_node(
-            src_blocks, dst_blocks, transfer_op.src_block_node_ids
+        # One peer owns the whole op (P2P): a single GPU task, no grouping.
+        node_id = _require_peer_node_id(transfer_op)
+        task = self._make_gpu_task(
+            node_id,
+            src_blocks.tolist(),
+            dst_blocks.tolist(),
+            transfer_op.dp_id,
+            transfer_op.transfer_type,
+            layer_id,
+            layer_granularity,
         )
-        tasks: List[RDMATaskInfo] = []
-        for node_id, segment in groups.items():
-            task = self._make_gpu_task(
-                node_id,
-                segment["src"],
-                segment["dst"],
-                transfer_op.dp_id,
-                transfer_op.transfer_type,
-                layer_id,
-                layer_granularity,
-            )
-            if task is not None:
-                tasks.append(task)
-        return tasks
+        return [task] if task is not None else []
 
     def _make_gpu_task(
         self,

@@ -13,6 +13,7 @@ from flexkv.common.block import SequenceMeta
 #if TYPE_CHECKING:
 from flexkv.common.config import CacheConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.transfer import DeviceType
+from flexkv.common.source import BlockSource, LakeSource, LocalSource, PeerSource
 from flexkv.common.type import (
     MatchResult,
     MatchResultAccel,
@@ -184,22 +185,45 @@ class HierarchyLRCacheEngine:
             if local_source_ids is None or len(local_source_ids) < local_ready:
                 local_ready = 0
 
-        remote_node_ids = None
+        # Resolve the peer (remote) origin. For LAKE the peer's blocks map to
+        # per-block PCFS file ids. For cpu/ssd the distributed tree merges every
+        # peer's blocks, so one remote match can span MULTIPLE peers — a shared
+        # prefix and its extension may be owned by different nodes. A match
+        # returns at most ONE peer to the planner, so keep only the single peer
+        # that extends this tier's local prefix.
+        remote_source: Optional[BlockSource] = None
         nids = mr_remote.block_node_ids
         if isinstance(nids, torch.Tensor) and nids.numel() > 0:
+            nids_np = nids.cpu().numpy()
             if self.device_type == DeviceType.LAKE:
-                remote_node_ids = self.nodeids_to_file_nodeids(
-                    nids.cpu().numpy(), remote_phys
-                )
+                file_ids = self.nodeids_to_file_nodeids(nids_np, remote_phys)
+                if file_ids is not None:
+                    remote_source = LakeSource(np.asarray(file_ids, dtype=np.int64))
+            elif remote_ready > local_ready:
+                # Blocks [0, local_ready) are served locally; the peer only
+                # extends [local_ready, remote_ready). Anchor at local_ready and
+                # take the contiguous run of the single peer owning it — the
+                # maximal single-peer extension the planner can consume.
+                peer_ids = nids_np.astype(np.int64, copy=False)
+                owner = int(peer_ids[local_ready])
+                end = local_ready
+                while end < remote_ready and int(peer_ids[end]) == owner:
+                    end += 1
+                remote_ready = end
+                remote_source = PeerSource(owner)
             else:
-                remote_node_ids = nids.cpu().numpy().astype(np.int64, copy=False)
+                # The peer reaches no further than the local prefix; ignore it.
+                remote_ready = 0
+        # Without a usable origin the peer blocks cannot be transferred; drop the
+        # peer readiness so the planner ignores this side.
         if remote_ready > 0 and (
-            remote_node_ids is None or len(remote_node_ids) < remote_ready
+            remote_source is None or not remote_source.covers(remote_ready)
         ):
             remote_ready = 0
+            remote_source = None
 
-        # LOCAL side: a plain local prefix hit.  For Lake, its block_node_ids
-        # carry the per-block file node ids the planner needs.
+        # LOCAL side: a plain local prefix hit.  For Lake, its source carries the
+        # per-block file node ids the planner needs.
         local = MatchResultAccel(
             num_ready_matched_blocks=local_ready,
             num_matched_blocks=local_matched,
@@ -207,17 +231,19 @@ class HierarchyLRCacheEngine:
             last_node=mr_local.last_node,
             last_node_matched_length=int(mr_local.last_node_matched_length),
             physical_blocks=local_phys,
-            block_node_ids=(
-                np.asarray(local_source_ids, dtype=np.int64)
+            source=(
+                LakeSource(np.asarray(local_source_ids, dtype=np.int64))
                 if (self.device_type == DeviceType.LAKE and local_ready > 0)
-                else None
+                else LocalSource()
             ),
         )
 
         # PEER side: only when the peer tree reaches a valid, transferable
-        # prefix.  block_node_ids name the owning peer (or Lake file) per block.
+        # prefix.  Its source is a single PeerSource (cpu/ssd) or a per-block
+        # LakeSource (Lake file ids).
         remote = None
         if remote_ready > 0:
+            assert remote_source is not None  # guaranteed by the drop above
             remote = MatchResultAccel(
                 num_ready_matched_blocks=remote_ready,
                 num_matched_blocks=remote_matched,
@@ -225,7 +251,7 @@ class HierarchyLRCacheEngine:
                 last_node=mr_remote.last_node,
                 last_node_matched_length=int(mr_remote.last_node_matched_length),
                 physical_blocks=remote_phys,
-                block_node_ids=np.asarray(remote_node_ids, dtype=np.int64),
+                source=remote_source,
             )
 
         self._log_reuse_stats(
@@ -268,8 +294,10 @@ class HierarchyLRCacheEngine:
         """Convert per-block node ids to per-block PCFS file_nodeids.
 
         Args:
-            bnids_np: block_node_ids from MatchResultAccel.block_node_ids
-            phys: physical_blocks from MatchResultAccel.physical_blocks
+            bnids_np: per-block owning node ids from the radix match
+                (the distributed match's per-block node ids, or this node's own
+                id broadcast for a local Lake hit)
+            phys: physical_blocks from the match
 
         Returns:
             file_nodeids array with dtype=uint32, or None if conversion fails
@@ -321,7 +349,6 @@ class HierarchyLRCacheEngine:
             last_node=mr_local.last_node,
             last_node_matched_length=int(mr_local.last_node_matched_length),
             physical_blocks=phys_np,
-            block_node_ids=None,
         )
 
     def insert(self,

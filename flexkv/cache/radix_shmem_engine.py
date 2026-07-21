@@ -53,12 +53,13 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Dict, Optional
 
 import numpy as np
 
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.transfer import DeviceType
+from flexkv.common.source import PeerSource
 from flexkv.common.type import (
     MatchResult,
     MatchResultAccel,
@@ -192,7 +193,12 @@ class CacheEngineRadixShmem:
         self.peer_enabled = bool(peer_enabled)
         self._redis_meta = redis_meta
         self._radix_cluster_id = radix_cluster_id
-        self._peer_node_ids = {}
+        # Peer rank -> node id cache. A single match() returns AT MOST ONE peer
+        # (`qr.remote_node_id`), but the region can span many peers and which one
+        # a match returns varies, so cache per rank. Each rank is resolved once
+        # (pre-warmed in start(), or lazily on first sight) so match() performs
+        # no per-match Redis resolution.
+        self._peer_node_ids: Dict[int, int] = {}
         self._trace_peer = os.getenv("FLEXKV_TRACE_RADIX_PEER", "0") == "1"
         # RadixClient always; the RadixServer is owned by the bootstrap process.
         self._tree = shmradix.RadixClient(shm_name)
@@ -229,12 +235,32 @@ class CacheEngineRadixShmem:
         )
 
     def start(self) -> None:
-        """Compatibility with the peer-capable cache engine lifecycle."""
+        """Pre-resolve every peer rank's node id once, up front, so ``match()``
+        does no per-match Redis resolution.
 
-    def _resolve_peer_node_id(self, radix_rank: int) -> int:
-        cached = self._peer_node_ids.get(radix_rank)
-        if cached is not None:
-            return cached
+        A radixshmem region can span many peers; a single match returns at most
+        one of them (``qr.remote_node_id``), and which one varies across matches
+        — hence a per-rank cache, not a single peer. Ranks not yet registered at
+        start (startup race) are resolved lazily on first sight and then cached."""
+        if not (self.peer_enabled and self._tree.is_distributed()):
+            return
+        own_rank = int(self._tree.rank())
+        for rank in range(int(self._tree.world_size())):
+            if rank == own_rank or rank in self._peer_node_ids:
+                continue
+            try:
+                node_id = self._resolve_rank_via_redis(rank)
+            except Exception:
+                node_id = None  # peer not registered yet; resolve lazily later
+            if node_id is not None:
+                self._peer_node_ids[rank] = node_id
+        if self._trace_peer:
+            flexkv_logger.info(
+                "[RADIX PEER] pre-resolved peer ranks at start: %s",
+                self._peer_node_ids,
+            )
+
+    def _resolve_rank_via_redis(self, radix_rank: int) -> Optional[int]:
         if self._redis_meta is None:
             raise RuntimeError(
                 "radixshmem peer match requires Redis peer metadata"
@@ -242,12 +268,21 @@ class CacheEngineRadixShmem:
         node_id = self._redis_meta.resolve_radix_rank(
             self._radix_cluster_id, radix_rank
         )
+        return int(node_id) if node_id is not None else None
+
+    def _peer_node_id_for(self, radix_rank: int) -> int:
+        """Resolve one peer rank to its node id, cached per rank so match() does
+        no per-match Redis work after the first sight of each rank."""
+        cached = self._peer_node_ids.get(radix_rank)
+        if cached is not None:
+            return cached
+        node_id = self._resolve_rank_via_redis(radix_rank)
         if node_id is None:
             raise RuntimeError(
                 f"No active FlexKV node is registered for radix rank {radix_rank}"
             )
-        self._peer_node_ids[radix_rank] = int(node_id)
-        return int(node_id)
+        self._peer_node_ids[radix_rank] = node_id
+        return node_id
 
     def close(self) -> None:
         self._tree = None
@@ -392,7 +427,7 @@ class CacheEngineRadixShmem:
                 "radixshmem returned inconsistent remote ready slot metadata"
             )
         try:
-            peer_node_id = self._resolve_peer_node_id(int(qr.remote_node_id))
+            peer_node_id = self._peer_node_id_for(int(qr.remote_node_id))
         except Exception:
             qr.finalize()
             raise
@@ -400,19 +435,15 @@ class CacheEngineRadixShmem:
         # Peer-inclusive physical view indexed by logical block: the local ready
         # slots followed by the peer suffix. The planner slices only the
         # [local_ready_len, ready_len) tail (the local prefix is served by
-        # `local`), so the -1 placeholder node ids below local_ready_len are
-        # never read.
+        # `local`). One peer owns the whole suffix, so the origin is a scalar
+        # PeerSource rather than a per-block node-id array.
         remote_physical = np.concatenate([local_ready_blocks, remote_ready_blocks])
-        remote_node_ids = np.concatenate([
-            np.full(local_ready_len, -1, dtype=np.int64),
-            np.full(remote_ready_len, peer_node_id, dtype=np.int64),
-        ])
         remote = MatchResultAccel(
             num_ready_matched_blocks=ready_len,
             num_matched_blocks=matched_len,
             last_ready_node=query_guard,
             physical_blocks=remote_physical,
-            block_node_ids=remote_node_ids,
+            source=PeerSource(peer_node_id),
             pre_locked_node=query_guard,
         )
         return MatchResult(local=local, remote=remote)

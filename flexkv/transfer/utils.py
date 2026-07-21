@@ -1,18 +1,5 @@
-from collections import defaultdict
-from typing import Tuple, List, Dict, Optional, Any
-import torch
+from typing import List, Dict, Optional, Any
 
-
-def group_blocks_by_node(
-    src_block_ids: torch.Tensor,
-    dst_block_ids: torch.Tensor,
-    remote_block_node_ids: List[int]
-) -> Dict[int, Dict[str, List[int]]]:
-    groups = defaultdict(lambda: {"src": [], "dst": []})
-    for src, dst, node_id in zip(src_block_ids.tolist(), dst_block_ids.tolist(), remote_block_node_ids):
-        groups[node_id]["src"].append(src)
-        groups[node_id]["dst"].append(dst)
-    return dict(groups)
 
 def split_contiguous_blocks(
     src_list: List[int], dst_list: List[int]
@@ -38,64 +25,7 @@ def split_contiguous_blocks(
 
     result.append({"src": current_src, "dst": current_dst})
     return result
-def group_blocks_by_node_and_segment(
-    src_block_ids: torch.Tensor,
-    dst_block_ids: torch.Tensor,
-    remote_block_node_ids: List[int],
-) -> Dict[int, List[Dict[str, List[int]]]]:
-    '''
-    Group by node_id and divide blocks with consecutive source/dst into subsegments.
-    Parameters:
-        src_block_ids (torch.Tensor): source block ids
-        dst_block_ids (torch.Tensor): target block ids
-        remote_block_node_ids (List[int]): the remote node ids for each block
-    Returns:
-        Dict[node_id, List[Dict[str, List[int]]]]:
-            {
-                node_id: [
-                    {"src": [...], "dst": [...]},
-                    ...
-                ]
-            }
-    '''
-    groups = defaultdict(list)
-    tmp = defaultdict(lambda: {"src": [], "dst": []})
-    for src, dst, node_id in zip(src_block_ids.tolist(), dst_block_ids.tolist(), remote_block_node_ids):
-        tmp[node_id]["src"].append(src)
-        tmp[node_id]["dst"].append(dst)
 
-    for node_id, pair in tmp.items():
-        sorted_pairs = sorted(zip(pair["src"], pair["dst"]), key=lambda x: (x[0], x[1]))
-
-        current_src_segment = []
-        current_dst_segment = []
-
-        last_src = None
-        last_dst = None
-
-        for src, dst in sorted_pairs:
-            if last_src is not None and last_dst is not None:
-                if src == last_src + 1 and dst == last_dst + 1:
-                    # src and dst are continuous
-                    current_src_segment.append(src)
-                    current_dst_segment.append(dst)
-                else:
-                    # Disconnect and save the current segment
-                    groups[node_id].append({"src": current_src_segment, "dst": current_dst_segment})
-                    current_src_segment = [src]
-                    current_dst_segment = [dst]
-            else:
-                current_src_segment.append(src)
-                current_dst_segment.append(dst)
-
-            last_src = src
-            last_dst = dst
-
-        # Save the last segment
-        if current_src_segment:
-            groups[node_id].append({"src": current_src_segment, "dst": current_dst_segment})
-
-    return dict(groups)
 
 class RemoteSSD2HMetaInfo:
     """Metadata for a remote-SSD read, sent from the requester to the SSD owner.

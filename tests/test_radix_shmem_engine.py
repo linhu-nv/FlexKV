@@ -48,6 +48,7 @@ CacheEngineRadixShmem = _engine_mod.CacheEngineRadixShmem
 
 # `flexkv.common.transfer` is pure-Python (no c_ext). DeviceType is fine.
 from flexkv.common.transfer import DeviceType
+from flexkv.common.source import PeerSource
 
 
 @dataclass
@@ -252,6 +253,7 @@ def test_distributed_match_combines_local_and_single_peer():
     engine.peer_enabled = True
     engine._redis_meta = RedisMeta()
     engine._radix_cluster_id = "test-cluster"
+    # Not pre-warmed: exercise the lazy one-time per-rank resolve in match().
     engine._peer_node_ids = {}
 
     seq = FakeSeq(block_hashes=_hashes(seed=9, num=4))
@@ -266,9 +268,8 @@ def test_distributed_match_combines_local_and_single_peer():
     np.testing.assert_array_equal(
         result.remote.physical_blocks, [10, 11, 20, 21]
     )
-    np.testing.assert_array_equal(
-        result.remote.block_node_ids, [-1, -1, 42, 42]
-    )
+    # One peer owns the whole suffix — a scalar PeerSource, not a per-block array.
+    assert result.remote.source == PeerSource(42)
     assert result.remote.num_ready_matched_blocks == 4
     assert engine._tree.result.finalize.calls == 0
 
@@ -277,6 +278,91 @@ def test_distributed_match_combines_local_and_single_peer():
     assert result.remote.pre_locked_node is result.remote.last_ready_node
     engine.unlock(result.remote.pre_locked_node)
     assert engine._tree.result.finalize.calls == 1
+
+
+def test_start_prewarms_all_peer_ranks_and_match_maps_each_peer():
+    """A region spanning many peers: start() pre-resolves every peer rank once,
+    and each match maps its single (varying) peer to the right node id with no
+    per-match Redis."""
+    class Finalize:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self):
+            self.calls += 1
+
+    class QueryResult:
+        total_hit_length = 4
+        ready_prefix_len = 4
+        local_hit_length = 2
+        ready_prefix_slots = np.array([10, 11], dtype=np.int32)
+        remote_slots = np.array([20, 21], dtype=np.int32)
+
+        def __init__(self, remote_node_id):
+            self.remote_node_id = remote_node_id
+            self.finalize = Finalize()
+
+    class Tree:
+        def __init__(self):
+            self._next = None
+
+        def is_distributed(self):
+            return True
+
+        def rank(self):
+            return 0
+
+        def world_size(self):
+            return 3  # own rank 0 + peer ranks 1, 2
+
+        def set_peer(self, rank):
+            self._next = QueryResult(rank)
+
+        def query(self, hashes, *, local_only, lock, update_meta):
+            return self._next
+
+    class RedisMeta:
+        def __init__(self):
+            self.calls = 0
+
+        def resolve_radix_rank(self, cluster_id, rank):
+            self.calls += 1
+            assert cluster_id == "test-cluster"
+            return {1: 42, 2: 43}[rank]  # distinct node id per peer rank
+
+    redis = RedisMeta()
+    engine = CacheEngineRadixShmem.__new__(CacheEngineRadixShmem)
+    tree = Tree()
+    engine._tree = tree
+    engine.peer_enabled = True
+    engine._redis_meta = redis
+    engine._radix_cluster_id = "test-cluster"
+    engine._peer_node_ids = {}
+    engine._trace_peer = False
+
+    # start() pre-resolves BOTH peer ranks once, off the match hot path.
+    engine.start()
+    assert engine._peer_node_ids == {1: 42, 2: 43}
+    assert redis.calls == 2
+
+    # Subsequent matches must not touch Redis, and each must map its own single
+    # peer (qr.remote_node_id) to the correct node id — proving per-rank routing.
+    def _boom(*a, **k):
+        raise AssertionError("match() must not resolve peer via Redis")
+    redis.resolve_radix_rank = _boom
+
+    tree.set_peer(1)
+    r1 = engine.match(FakeSeq(block_hashes=_hashes(seed=9, num=4)))
+    assert r1.remote is not None and r1.remote.source == PeerSource(42)
+    engine.unlock(r1.remote.pre_locked_node)
+
+    tree.set_peer(2)
+    r2 = engine.match(FakeSeq(block_hashes=_hashes(seed=3, num=4)))
+    assert r2.remote is not None and r2.remote.source == PeerSource(43)
+    engine.unlock(r2.remote.pre_locked_node)
+
+    assert redis.calls == 2  # still just the two start-time resolutions
+
 
 if __name__ == "__main__":
     test_take_insert_match_recycle()

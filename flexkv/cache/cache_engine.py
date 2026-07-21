@@ -108,15 +108,8 @@ class CacheEngineAccel:
                                               sequence_meta.num_blocks, True)
         # physical blocks (torch.Tensor -> numpy, zero-copy on CPU)
         phys = match_result.physical_blocks.cpu().numpy()
-        # optional block_node_ids
-        try:
-            bnis = getattr(match_result, "block_node_ids", None)
-            if isinstance(bnis, torch.Tensor) and bnis.numel() > 0:
-                bnids_np = bnis.cpu().numpy()
-            else:
-                bnids_np = None
-        except Exception:
-            bnids_np = None
+        # A single in-process index is purely local — no peer/lake origin, so the
+        # source defaults to LocalSource.
         local = MatchResultAccel(
             num_ready_matched_blocks=match_result.num_ready_matched_blocks,
             num_matched_blocks=match_result.num_matched_blocks,
@@ -124,7 +117,6 @@ class CacheEngineAccel:
             last_node=match_result.last_node,
             last_node_matched_length=match_result.last_node_matched_length,
             physical_blocks=phys,
-            block_node_ids=bnids_np,
         )
         return MatchResult(local=local)
 

@@ -7,6 +7,7 @@ from flexkv.cache.cache_engine import GlobalCacheEngine
 from flexkv.common.transfer import (
     DeviceType, TransferOp, TransferOpGraph, TransferType,
 )
+from flexkv.common.source import PeerSource
 from flexkv.common.type import MatchResult, MatchResultAccel
 from flexkv.transfer.utils import RemoteSSD2HMetaInfo
 
@@ -48,7 +49,7 @@ def _match(blocks, position, node_id=1):
         num_ready_matched_blocks=len(blocks),
         num_matched_blocks=len(blocks),
         physical_blocks=blocks,
-        block_node_ids=np.full(len(blocks), node_id, dtype=np.int64),
+        source=PeerSource(node_id),
     )
     return MatchResult(local=MatchResultAccel(), remote=remote)
 

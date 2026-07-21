@@ -6,6 +6,7 @@ from flexkv.cache.get_planner import (
     plan_routes,
     route_of,
 )
+from flexkv.common.source import LakeSource, LocalSource, PeerSource
 from flexkv.common.transfer import DeviceType, TransferType
 from flexkv.common.type import CacheLocality, MatchResult, MatchResultAccel
 
@@ -18,19 +19,21 @@ def _match(local_blocks,
            peer_node_ids=None):
     """Build a MatchResult(local, remote) from a local prefix + optional peer suffix.
 
-    ``remote`` is the peer-inclusive view indexed by logical block (local slots
-    then peer slots), mirroring what the engines emit; its ``block_node_ids``
-    place the owning ids in the peer tail.  ``local_node_ids`` / ``peer_node_ids``
-    override the per-block ids (used for LAKE PCFS file ids).
+    ``remote``'s physical_blocks are the peer-inclusive view indexed by logical
+    block (local slots then peer slots), mirroring what the engines emit.  Its
+    ``source`` is a per-block :class:`LakeSource` when ``peer_node_ids`` (PCFS
+    file ids) is given, else a scalar :class:`PeerSource` (``peer_node_id``).
+    ``local_node_ids`` makes the local side a :class:`LakeSource` (LAKE local
+    file ids).
     """
     local_blocks = np.asarray(local_blocks, dtype=np.int64)
     local = MatchResultAccel(
         num_ready_matched_blocks=len(local_blocks),
         num_matched_blocks=len(local_blocks),
         physical_blocks=local_blocks,
-        block_node_ids=(
-            np.asarray(local_node_ids, dtype=np.int64)
-            if local_node_ids is not None else None
+        source=(
+            LakeSource(np.asarray(local_node_ids, dtype=np.int64))
+            if local_node_ids is not None else LocalSource()
         ),
     )
     remote = None
@@ -38,17 +41,14 @@ def _match(local_blocks,
         peer_blocks = np.asarray(peer_blocks, dtype=np.int64)
         combined = np.concatenate([local_blocks, peer_blocks])
         if peer_node_ids is not None:
-            ids = np.asarray(peer_node_ids, dtype=np.int64)
+            source = LakeSource(np.asarray(peer_node_ids, dtype=np.int64))
         else:
-            ids = np.concatenate([
-                np.full(len(local_blocks), -1, dtype=np.int64),
-                np.full(len(peer_blocks), peer_node_id, dtype=np.int64),
-            ])
+            source = PeerSource(int(peer_node_id))
         remote = MatchResultAccel(
             num_ready_matched_blocks=len(combined),
             num_matched_blocks=len(combined),
             physical_blocks=combined,
-            block_node_ids=ids,
+            source=source,
         )
     return MatchResult(local=local, remote=remote)
 
@@ -161,8 +161,8 @@ def test_lake_fills_suffix_after_cpu_and_ssd_with_file_node_ids():
         (DeviceType.LAKE, 4, TransferType.LAKE2H),
     ]
     assert num_staging == 5
-    np.testing.assert_array_equal(segments[2].src_block_node_ids, [103])
-    np.testing.assert_array_equal(segments[3].src_block_node_ids, [204, 205])
+    np.testing.assert_array_equal(segments[2].source.file_ids, [103])
+    np.testing.assert_array_equal(segments[3].source.file_ids, [204, 205])
 
     graph, _finished, _h2d = build_transfer_graph(
         segments,
@@ -173,8 +173,8 @@ def test_lake_fills_suffix_after_cpu_and_ssd_with_file_node_ids():
     lake_ops = [op for op in graph._op_map.values()
                 if op.transfer_type == TransferType.LAKE2H]
     assert len(lake_ops) == 2
-    np.testing.assert_array_equal(lake_ops[0].src_block_node_ids, [103])
-    np.testing.assert_array_equal(lake_ops[1].src_block_node_ids, [204, 205])
+    np.testing.assert_array_equal(lake_ops[0].source.file_ids, [103])
+    np.testing.assert_array_equal(lake_ops[1].source.file_ids, [204, 205])
 
 
 def test_mask_can_start_inside_local_span():
