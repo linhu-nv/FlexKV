@@ -457,17 +457,21 @@ class CacheEngineRadixShmem:
                ) -> tuple[Optional[ShmRadixNode], np.ndarray]:
         """Attach `physical_block_ids` as a suffix in the shared radix tree.
 
+        `physical_block_ids` is positionally aligned to the matched prefix the
+        caller observed at match() time: block k of the pool holds the data for
+        logical block `match_result.num_matched_blocks + k`. That base is passed
+        to shmradix so its front-first slot consumption stays aligned even when a
+        concurrent DP has advanced the shared tree's matched prefix past it.
+
         Returns (node, unused_slots) where:
           - `node` is the inserted leaf handle (or None if nothing attached).
             When inserted with is_ready=False it carries the armed finalize
             (= set_ready + dec_ref) — released later via `unlock(node)`.
           - `unused_slots` (int64) is the subset of `physical_block_ids` that
-            shmradix did NOT attach (matched_prefix advanced, or the caller
-            supplied excess slots). The current shmradix `insert_with_slots`
-            consumes the supplied pool front-first and inserts exactly
-            `inserted_count` of them, so unused = slots[inserted_count:]. The
-            caller MUST recycle these only AFTER any in-flight transfer that
-            references them has completed.
+            shmradix did NOT attach: the head slots a concurrent insert made
+            redundant (`result.head_skipped`, because matched_prefix advanced
+            past our base) PLUS any tail excess. The caller MUST recycle these
+            only AFTER any in-flight transfer that references them has completed.
         """
         sequence_meta.gen_hashes()
         hashes = np.ascontiguousarray(sequence_meta.block_hashes).view(np.uint64)
@@ -480,15 +484,32 @@ class CacheEngineRadixShmem:
             target_hashes = hashes
         target_hashes = np.ascontiguousarray(target_hashes)
 
+        # `suffix_slots` is positionally aligned to the matched prefix the
+        # caller observed at match() time: suffix_slots[k] holds the data for
+        # block (base + k). shmradix RE-derives matched_prefix against the live
+        # shared tree, which a concurrent DP may have advanced past `base`.
+        # Passing `base` makes it skip the head slots that race made redundant
+        # instead of consuming the pool front-first (which would shift every
+        # remaining slot and mis-map hash -> physical block).
+        base = int(match_result.num_matched_blocks) if match_result is not None else 0
+
         result = self._tree.insert_with_slots(
-            target_hashes, suffix_slots, is_ready=is_ready
+            target_hashes, suffix_slots, is_ready=is_ready, base=base
         )
 
         inserted = int(result.inserted_count)
         matched_prefix = int(result.matched_prefix)
+        head_skipped = int(result.head_skipped)
 
-        # unused = supplied slots beyond what was actually attached.
-        unused_slots = suffix_slots[inserted:]
+        # Unused = the head slots a concurrent insert made redundant
+        # (suffix_slots[:head_skipped]) PLUS any tail slots shmradix did not
+        # attach (suffix_slots[head_skipped + inserted:]). The attached window is
+        # suffix_slots[head_skipped : head_skipped + inserted]. With no race
+        # head_skipped == 0 and this reduces to suffix_slots[inserted:].
+        unused_slots = np.concatenate([
+            suffix_slots[:head_skipped],
+            suffix_slots[head_skipped + inserted:],
+        ])
         unused_slots_i64 = np.asarray(unused_slots, dtype=np.int64)
 
         # Diagnostics.

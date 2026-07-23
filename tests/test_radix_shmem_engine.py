@@ -203,8 +203,12 @@ def test_prefix_match_returns_unused_slots():
     s2 = engine.take(num_required_blocks=4)  # supply 4, only 2 new needed
     node2, unused2 = engine.insert(seq2, s2, is_ready=True)
     assert node2.size() == 2          # only the 2 new suffix blocks attached
-    assert len(unused2) == 2          # the other 2 supplied slots are unused
-    np.testing.assert_array_equal(np.sort(unused2), np.sort(s2[2:]))
+    # Slots are positionally aligned (slot k -> logical block k), so the 2 HEAD
+    # slots covering the already-matched prefix come back unused (head_skipped);
+    # blocks 2,3 attach with s2[2:]. (Old front-first consumption mis-mapped
+    # hash->slot and returned s2[2:] — the concurrent-DP bug this now fixes.)
+    assert len(unused2) == 2
+    np.testing.assert_array_equal(np.sort(unused2), np.sort(s2[:2]))
     engine.recycle(unused2)
 
     # seq2 fully matches now.
