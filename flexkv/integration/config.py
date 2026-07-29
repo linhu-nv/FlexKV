@@ -383,19 +383,40 @@ class FlexKVConfig:
             page_size: KV block size (tokens per block) used by sglang
             tp_rank: physical tensor parallel rank (runtime, from process group)
             pp_rank: pipeline parallel rank (runtime, from process group)
-            dp_rank: data parallel rank (runtime, from process group)
+            dp_rank: logical DP shard index for this worker.
+                - plain DP (``enable_dp_attention=False``): the regular
+                  ``dp_rank`` passed to the scheduler process (0, 1, …).
+                - DP Attention (``enable_dp_attention=True``): auto-derived
+                  from ``tp_rank`` via the same decomposition sglang uses
+                  in ``compute_dp_attention_world_info``.  The caller may
+                  pass ``None`` or 0; it will be overridden.
             attn_cp_rank: attention-level context parallel rank (runtime)
         """
         # Extract parallelism params from server_args
-        tp_size = server_args.tp_size
-        pp_size = server_args.pp_size
-        dp_size = server_args.dp_size
+        sglang_tp_size = int(server_args.tp_size)
+        pp_size = int(server_args.pp_size)
+        sglang_dp_size = int(server_args.dp_size if server_args.dp_size is not None else 1)
         nnodes = server_args.nnodes
         node_rank = server_args.node_rank
-        enable_dp_attention = server_args.enable_dp_attention
-        attn_cp_size = getattr(server_args, 'attn_cp_size', 1)
+        enable_dp_attention = bool(server_args.enable_dp_attention)
+        attn_cp_size = int(getattr(server_args, 'attn_cp_size', 1))
         kv_cache_dtype = getattr(server_args, 'kv_cache_dtype', None)
+
         dp_rank = 0 if dp_rank is None else int(dp_rank)
+        cp_rank = 0 if attn_cp_rank is None else int(attn_cp_rank)
+
+        # DP Attention decomposition: sglang's composite tp_size encodes
+        # attn_dp_size × attn_cp_size × attn_tp_size.  Extract the true
+        # inner TP dimension so that total_gpus = dp × tp × cp × pp
+        # matches the number of physical GPUs.
+        attn_dp_size = sglang_dp_size if enable_dp_attention else 1
+        attn_tp_size = max(1, sglang_tp_size // (attn_dp_size * attn_cp_size))
+        attn_tp_rank = int(tp_rank) % attn_tp_size
+
+        if enable_dp_attention:
+            # sglang factory passes dp_rank=None; derive from tp_rank
+            # (same formula as compute_dp_attention_world_info).
+            dp_rank = int(tp_rank) // (attn_tp_size * attn_cp_size)
 
         # cache config: use page_size as tokens_per_block so that FlexKV's
         # CPU radix tree manages blocks at page granularity, ensuring that
@@ -421,8 +442,8 @@ class FlexKVConfig:
                     self.model_config.num_kv_heads = int(getattr(sglang_config, "num_key_value_heads", 0))
             elif hasattr(sglang_config, "get_num_kv_heads"):
                 try:
-                    per_rank = int(sglang_config.get_num_kv_heads(tp_size))
-                    self.model_config.num_kv_heads = per_rank * tp_size
+                    per_rank = int(sglang_config.get_num_kv_heads(sglang_tp_size))
+                    self.model_config.num_kv_heads = per_rank * sglang_tp_size
                 except Exception:
                     self.model_config.num_kv_heads = int(getattr(sglang_config, "num_key_value_heads", 0))
             else:
@@ -468,9 +489,17 @@ class FlexKVConfig:
 
         self.model_config.use_mla = use_mla
 
-        self.model_config.tp_size = int(tp_size)
-        self.model_config.dp_size = int(dp_size if dp_size is not None else 1)
+        self.model_config.tp_size = int(attn_tp_size)
+        self.model_config.dp_size = int(sglang_dp_size)
         self.model_config.pp_size = int(pp_size)
+
+        if enable_dp_attention:
+            logger.info(
+                f"[FlexKV sglang] DP Attention enabled: sglang_tp_size={sglang_tp_size} "
+                f"decomposed to attn_tp_size={attn_tp_size}, attn_dp_size={attn_dp_size}, "
+                f"attn_cp_size={attn_cp_size}; dp_rank={dp_rank} (from tp_rank={tp_rank}), "
+                f"attn_tp_rank={attn_tp_rank}"
+            )
 
         if pp_size > 1:
             from sglang.srt.distributed.utils import get_pp_indices as sglang_get_pp_indices
@@ -497,10 +526,10 @@ class FlexKVConfig:
 
         rank_info = RankInfo(
             model_config=self.model_config,
-            tp_rank=tp_rank,
+            tp_rank=attn_tp_rank,
             pp_rank=pp_rank,
             dp_rank=dp_rank,
-            attn_cp_rank=attn_cp_rank,
+            attn_cp_rank=cp_rank,
             node_rank=node_rank,
             instance_id=instance_id,
             pp_start_layer=pp_start_layer,
