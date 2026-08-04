@@ -3,6 +3,7 @@ import time
 
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.config import MooncakeTransferEngineConfig
+from flexkv.common.vmm_handle import is_vmm_sharing_enabled
 from flexkv.transfer.utils import RDMATaskInfo
 from flexkv.transfer.zmqHelper import NotifyMsg, NotifyStatus
 from typing import List
@@ -51,6 +52,19 @@ class MoonCakeTransferEngineWrapper:
             raise ValueError(
                 "Mooncake Configuration error. Currently only support "
                 f" {supported_backend} metadata_backend."
+            )
+
+        # When GPU KV blocks are shared as CUDA VMM allocations, they must be
+        # registered through mooncake's dma-buf path: the nvidia-peermem path
+        # (ibv_reg_mr_iova2) fails with EFAULT on an imported mapping.  Mooncake
+        # picks the branch at runtime from this env var, so no rebuild is needed;
+        # it is read when the engine is constructed, hence the placement here.
+        # An explicit user setting always wins.
+        if is_vmm_sharing_enabled() and "WITH_NVIDIA_PEERMEM" not in os.environ:
+            os.environ["WITH_NVIDIA_PEERMEM"] = "0"
+            flexkv_logger.info(
+                "VMM GPU sharing enabled: set WITH_NVIDIA_PEERMEM=0 so mooncake "
+                "registers GPU buffers via dma-buf"
             )
 
         # transfer engine initialize

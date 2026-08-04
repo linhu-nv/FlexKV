@@ -495,7 +495,7 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("cpu_tp_stride_in_bytes"), py::arg("transfer_num_cta"),
            py::arg("is_host_to_device"), py::arg("use_ce_transfer"),
            py::arg("layer_id"), py::arg("layer_granularity"),
-           py::arg("is_mla"));
+           py::arg("is_mla"), py::arg("single_kv_region"));
 
 #ifdef FLEXKV_ENABLE_GDS
   py::class_<flexkv::TPGDSTransferThreadGroup>(m, "TPGDSTransferThreadGroup")
@@ -519,7 +519,8 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("ssd_block_stride_in_bytes"),
            py::arg("ssd_tp_stride_in_bytes"), py::arg("num_blocks_per_file"),
            py::arg("is_read"), py::arg("layer_id"),
-           py::arg("layer_granularity"), py::arg("is_mla"));
+           py::arg("layer_granularity"), py::arg("is_mla"),
+           py::arg("single_kv_region"));
 #endif
 
   // Add Hasher class binding

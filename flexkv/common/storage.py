@@ -29,6 +29,9 @@ class KVCacheLayout:
     num_head: int
     head_size: int
     is_mla: bool
+    # vLLM >= PR #44455 packs K and V into the content dim, so head_size is
+    # 2 * head_size and there is no separate kv dim to stride over.
+    packed_kv: bool = False
     _kv_shape: Optional[torch.Size] = None
 
     def __eq__(self, other: object) -> bool:
@@ -41,11 +44,24 @@ class KVCacheLayout:
                 self.num_head == other.num_head and
                 self.head_size == other.head_size and
                 self.is_mla == other.is_mla and
+                self.packed_kv == other.packed_kv and
                 self.kv_shape == other.kv_shape)
 
     @property
+    def single_kv_region(self) -> bool:
+        """Whether K and V live in one content region instead of two.
+
+        True for MLA, whose latent KV has no separate V, and for packed
+        layouts, whose V sits inside ``head_size``.  Transfer kernels branch
+        on this rather than on ``is_mla``, which also means "TP replicates
+        the heads instead of splitting them" -- packed MHA still has real
+        heads to split.
+        """
+        return self.is_mla or self.packed_kv
+
+    @property
     def _kv_dim(self) -> int:
-        return 2 if not self.is_mla else 1
+        return 1 if self.single_kv_region else 2
 
     @property
     def kv_shape(self) -> torch.Size:
@@ -91,6 +107,7 @@ class KVCacheLayout:
             num_head=self.num_head,
             head_size=self.head_size,
             is_mla=self.is_mla,
+            packed_kv=self.packed_kv,
         )
         return new_layout
 
@@ -105,6 +122,7 @@ class KVCacheLayout:
             num_head=self.num_head,
             head_size=self.head_size,
             is_mla=self.is_mla,
+            packed_kv=self.packed_kv,
         )
         return new_layout
 
@@ -119,6 +137,7 @@ class KVCacheLayout:
             num_head=self.num_head // num_chunks,
             head_size=self.head_size,
             is_mla=self.is_mla,
+            packed_kv=self.packed_kv,
         )
         return new_layout
 

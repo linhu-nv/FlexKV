@@ -156,7 +156,8 @@ void TPTransferThreadGroup::tp_group_transfer(
     const int64_t cpu_block_stride_in_bytes,
     const int64_t cpu_tp_stride_in_bytes, const int transfer_num_cta,
     const bool is_host_to_device, const bool use_ce_transfer,
-    const int layer_id, const int layer_granularity, const bool is_mla) {
+    const int layer_id, const int layer_granularity, const bool is_mla,
+    const bool single_kv_region) {
 
   std::atomic<bool> failed{false};
   std::string error_msg;
@@ -203,7 +204,8 @@ void TPTransferThreadGroup::tp_group_transfer(
               cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,
               cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
               cpu_startoff_inside_chunks, chunk_size, streams_[i],
-              transfer_num_cta, is_host_to_device, use_ce_transfer, is_mla);
+              transfer_num_cta, is_host_to_device, use_ce_transfer,
+              single_kv_region);
           break;
         case BackendType::TRTLLM:
           flexkv::transfer_kv_blocks<BackendType::TRTLLM>(
@@ -212,7 +214,8 @@ void TPTransferThreadGroup::tp_group_transfer(
               cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,
               cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
               cpu_startoff_inside_chunks, chunk_size, streams_[i],
-              transfer_num_cta, is_host_to_device, use_ce_transfer, is_mla);
+              transfer_num_cta, is_host_to_device, use_ce_transfer,
+              single_kv_region);
           break;
         case BackendType::SGLANG:
           flexkv::transfer_kv_blocks<BackendType::SGLANG>(
@@ -221,7 +224,8 @@ void TPTransferThreadGroup::tp_group_transfer(
               cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,
               cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
               cpu_startoff_inside_chunks, chunk_size, streams_[i],
-              transfer_num_cta, is_host_to_device, use_ce_transfer, is_mla);
+              transfer_num_cta, is_host_to_device, use_ce_transfer,
+              single_kv_region);
           break;
         }
 

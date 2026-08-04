@@ -47,7 +47,8 @@ public:
       const bool is_read,  // true for SSD->GPU, false for GPU->SSD
       const int layer_id,
       const int layer_granularity, 
-      const bool is_mla);
+      const bool is_mla,
+      const bool single_kv_region);
 
 private:
   using Task = std::function<void()>;

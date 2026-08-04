@@ -17,6 +17,9 @@ class ModelConfig:
     num_kv_heads: int = 1
     head_size: int = 1
     use_mla: bool = False
+    # vLLM >= PR #44455 packs K and V into the content dim: head_size then
+    # covers both, so there is no separate kv dim (see KVCacheLayout).
+    packed_kv: bool = False
     dtype: torch.dtype = torch.bfloat16
 
     # parallel configs
@@ -24,9 +27,13 @@ class ModelConfig:
     dp_size: int = 1
 
     @property
+    def kv_dim(self) -> int:
+        return 1 if self.use_mla or self.packed_kv else 2
+
+    @property
     def token_size_in_bytes(self) -> int:
-        kv_dim = 1 if self.use_mla else 2
-        return self.num_layers * self.num_kv_heads * self.head_size * kv_dim * self.dtype.itemsize
+        return (self.num_layers * self.num_kv_heads * self.head_size
+                * self.kv_dim * self.dtype.itemsize)
 
 @dataclass
 class CacheConfig:

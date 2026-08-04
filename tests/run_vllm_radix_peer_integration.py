@@ -231,15 +231,24 @@ def main() -> int:
             for _, log_file in logs:
                 log_file.flush()
             target_log = logs[1][0].read_text(errors="replace")
+            # Assert on the transfer worker's own completion line
+            # ("<TYPE> transfer request: <id> finished ...", emitted by
+            # TransferWorkerBase._log_transfer_performance). Nothing logs a
+            # "[PEER GET PLAN]" line, so matching that never succeeded — and it
+            # only described the *plan*, whereas this proves the peer route
+            # actually ran to completion on the target.
             peer_plan_lines = [
                 line
                 for line in target_log.splitlines()
-                if "[PEER GET PLAN]" in line
+                if "transfer request:" in line and "finished" in line
             ]
-            if not any(expected_route in line for line in peer_plan_lines):
+            if not any(
+                f"{expected_route} transfer request:" in line
+                for line in peer_plan_lines
+            ):
                 raise AssertionError(
-                    f"target request plan did not contain {expected_route}; "
-                    f"peer plans={peer_plan_lines!r}\n"
+                    f"target did not complete a {expected_route} transfer; "
+                    f"completed transfers={peer_plan_lines!r}\n"
                     + target_log[-8000:]
                 )
             source_text = source["choices"][0]["text"]

@@ -12,6 +12,11 @@ import numpy as np
 from flexkv.common.config import ModelConfig, CacheConfig
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
+from flexkv.common.cumem_source import get_vmm_source
+from flexkv.common.vmm_handle import (
+    VMMSharedHandle,
+    is_vmm_sharing_enabled,
+)
 from flexkv.common.storage import KVCacheLayout
 from flexkv.common.request import KVResponseStatus, KVResponse
 from flexkv.server.utils import get_zmq_socket
@@ -263,9 +268,24 @@ class KVTPClient:
         # Use override_device_id if provided, otherwise use self.device_id
         device_id = override_device_id if override_device_id is not None else self.device_id
 
-        handles = []
-        for _, tensor in enumerate(kv_caches):
-            handle = TensorSharedHandle(tensor, device_id)
+        # A VMM-allocated KV cache is shared through VMMSharedHandle so the
+        # transfer worker's imported mapping can be registered for RDMA; see
+        # flexkv/common/vmm_handle.py.  Fall back to CUDA IPC per tensor if the
+        # cache was not allocated in the VMM pool, so a partially-migrated
+        # caller still works.
+        #
+        # get_vmm_source() rather than get_vmm_allocator(): the KV cache is
+        # already VMM memory in vLLM's own cumem pool, so we export from that
+        # instead of allocating a pool (which would also need
+        # $FLEXKV_VMM_ALLOCATOR_LIB that this configuration does not require).
+        allocator = get_vmm_source() if is_vmm_sharing_enabled() else None
+
+        handles: List[TensorSharedHandle] = []
+        for tensor in kv_caches:
+            if allocator is not None and allocator.is_vmm(tensor):
+                handle = VMMSharedHandle(tensor, allocator, device_id)
+            else:
+                handle = TensorSharedHandle(tensor, device_id)
             handles.append(handle)
 
         register_req = RegisterTPClientRequest(

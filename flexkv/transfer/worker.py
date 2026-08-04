@@ -31,6 +31,7 @@ except ImportError:
 
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
+from flexkv.common.vmm_handle import imported_block_range
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.transfer import TransferOp, TransferType, PartitionBlockType
 from flexkv.common.transfer import get_nvtx_range_color
@@ -79,7 +80,7 @@ def _cpu_token_slice_ptr(
     head_start: int,
 ) -> int:
     """Address one contiguous token/head slice in a CPU KV layout."""
-    kv_dim = 1 if layout.is_mla else 2
+    kv_dim = 1 if layout.single_kv_region else 2
     if layout.type == KVCacheLayoutType.LAYERFIRST:
         element_offset = (
             (((layer_id * kv_dim + kv_id) * layout.num_block + block_id)
@@ -580,6 +581,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
 
         self.dtype = dtype
         self.is_mla = gpu_kv_layout.is_mla
+        self.single_kv_region = gpu_kv_layout.single_kv_region
 
         self.num_layers = gpu_kv_layout.num_layer
 
@@ -660,7 +662,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             transfer_num_cta,
             transfer_type == TransferType.H2D,
             use_ce_transfer,
-            self.is_mla,
+            self.single_kv_region,
             self.gpu_block_type_,
         )
 
@@ -688,7 +690,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             )
             end_time = time.time()
 
-            kv_dim = 2 if not self.is_mla else 1
+            kv_dim = 2 if not self.single_kv_region else 1
             transfer_size = self.chunk_size_in_bytes * layer_granularity * transfer_op.valid_block_num * kv_dim
 
             self._log_transfer_performance(
@@ -731,6 +733,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         self.gpu_blocks = imported_gpu_blocks
         self.dtype = dtype # note this should be quantized data type
         self.is_mla = gpu_kv_layouts[0].is_mla
+        self.single_kv_region = gpu_kv_layouts[0].single_kv_region
 
         self.num_gpus = len(self.gpu_blocks)
         self.tp_group_size = tp_group_size
@@ -838,6 +841,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             layer_id,
             layer_granularity,
             self.is_mla,
+            self.single_kv_region,
         )
 
 
@@ -861,7 +865,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         )
         end_time = time.time()
 
-        kv_dim = 2 if not self.is_mla else 1
+        kv_dim = 2 if not self.single_kv_region else 1
         transfer_size = self.cpu_chunk_size_in_bytes * layer_granularity * transfer_op.valid_block_num * kv_dim
 
         self._log_transfer_performance(
@@ -900,6 +904,7 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
         self.cpu_layer_ptrs = self._get_layer_ptrs(cpu_blocks)
 
         self.is_mla = cpu_kv_layout.is_mla
+        self.single_kv_region = cpu_kv_layout.single_kv_region
 
         if cpu_kv_layout.type != ssd_kv_layout.type:
             raise ValueError("no support for different CPU and SSD KV cache layout type")
@@ -961,7 +966,7 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
             num_blocks_per_file=self.num_blocks_per_file,
             round_robin=self.round_robin,
             num_threads_per_device=32,
-            is_mla=self.is_mla,
+            is_mla=self.single_kv_region,
         )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
@@ -984,7 +989,7 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
         )
         end_time = time.time()
 
-        kv_dim = 2 if not self.is_mla else 1
+        kv_dim = 2 if not self.single_kv_region else 1
         transfer_size = self.chunk_size_in_bytes * layer_granularity * transfer_op.valid_block_num * kv_dim
 
         self._log_transfer_performance(
@@ -1036,7 +1041,8 @@ class CPULakeTransferWorker(TransferWorkerBase):
         self.dtype = dtype
 
         self.is_mla = cpu_kv_layout.is_mla
-        kv_dim = 2 if not self.is_mla else 1
+        self.single_kv_region = cpu_kv_layout.single_kv_region
+        kv_dim = 2 if not self.single_kv_region else 1
 
         self.cpu_blocks = cpu_blocks
 
@@ -1170,7 +1176,7 @@ class CPULakeTransferWorker(TransferWorkerBase):
                 cfs_kv_stride_in_bytes=self.lake_kv_stride_in_bytes_per_file,
                 block_size_in_bytes=self.chunk_size_in_bytes,
                 total_layers=self.num_layers,
-                is_mla=self.is_mla,
+                is_mla=self.single_kv_region,
                 num_threads_per_file=32,
             )
         else:
@@ -1193,7 +1199,7 @@ class CPULakeTransferWorker(TransferWorkerBase):
                 num_lake_blocks_per_file=self.num_lake_blocks_per_file,
                 use_mmap=False,  # TODO: fix bug when use mmap
                 num_threads_per_file=32,
-                is_mla=self.is_mla,
+                is_mla=self.single_kv_region,
             )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
@@ -1221,7 +1227,7 @@ class CPULakeTransferWorker(TransferWorkerBase):
         )
         end_time = time.time()
 
-        kv_dim = 2 if not self.is_mla else 1
+        kv_dim = 2 if not self.single_kv_region else 1
         transfer_size = self.chunk_size_in_bytes * layer_granularity * transfer_op.valid_block_num * kv_dim
 
         self._log_transfer_performance(
@@ -1285,6 +1291,7 @@ class GDSTransferWorker(TransferWorkerBase):
 
         self.dtype = dtype
         self.is_mla = gpu_kv_layout.is_mla
+        self.single_kv_region = gpu_kv_layout.single_kv_region
 
         # Layout information
         self.num_layers = gpu_kv_layout.num_layer
@@ -1380,7 +1387,7 @@ class GDSTransferWorker(TransferWorkerBase):
                 self.num_layers,                # Total layers
                 is_read,                        # Read or write
                 False,                          # Verbose logging
-                self.is_mla,                    # MLA
+                self.single_kv_region,          # one KV region
                 self.gpu_block_type_,            # GPU block type
                 self.gpu_device_id              # GPU device ID
             )
@@ -1411,7 +1418,7 @@ class GDSTransferWorker(TransferWorkerBase):
             )
             end_time = time.time()
 
-            kv_dim = 2 if not self.is_mla else 1
+            kv_dim = 2 if not self.single_kv_region else 1
             transfer_size = self.chunk_size_in_bytes * layer_granularity * transfer_op.valid_block_num * kv_dim
 
             self._log_transfer_performance(
@@ -1472,6 +1479,7 @@ class tpGDSTransferWorker(TransferWorkerBase):
 
         self.dtype = dtype
         self.is_mla = gpu_kv_layouts[0].is_mla
+        self.single_kv_region = gpu_kv_layouts[0].single_kv_region
         self.num_gpus = len(self.gpu_blocks)
         self.tp_group_size = tp_group_size
         self.dp_group_id = dp_group_id
@@ -1574,6 +1582,7 @@ class tpGDSTransferWorker(TransferWorkerBase):
             layer_id,
             layer_granularity,
             self.is_mla,
+            self.single_kv_region,
         )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
@@ -1597,7 +1606,7 @@ class tpGDSTransferWorker(TransferWorkerBase):
         )
         end_time = time.time()
 
-        kv_dim = 2 if not self.is_mla else 1
+        kv_dim = 2 if not self.single_kv_region else 1
         transfer_size = self.ssd_chunk_size_in_bytes * layer_granularity * transfer_op.valid_block_num * kv_dim
 
         self._log_transfer_performance(
@@ -1650,9 +1659,11 @@ class NixlTransferWorker(TransferWorkerBase):
         if (
             gpu_kv_layout.num_layer != cpu_kv_layout.num_layer
             or gpu_kv_layout.is_mla != cpu_kv_layout.is_mla
+            or gpu_kv_layout.packed_kv != cpu_kv_layout.packed_kv
         ):
             raise ValueError(
-                "gpu_kv_layout and cpu_kv_layout must match on num_layer and is_mla"
+                "gpu_kv_layout and cpu_kv_layout must match on num_layer, "
+                "is_mla and packed_kv"
             )
 
         self.nixl_backend = be
@@ -1666,6 +1677,7 @@ class NixlTransferWorker(TransferWorkerBase):
 
         self.num_layers = gpu_kv_layout.num_layer
         self.is_mla = gpu_kv_layout.is_mla
+        self.single_kv_region = gpu_kv_layout.single_kv_region
 
         # SSD / file-side layout (same for every NIXL FILE backend).
         ssd_pf = ssd_kv_layout.div_block(self.num_files, padding=True)
@@ -1789,7 +1801,7 @@ class NixlTransferWorker(TransferWorkerBase):
         if n == 0:
             return
 
-        kv_dim = 1 if self.is_mla else 2
+        kv_dim = 1 if self.single_kv_region else 2
         layer_end = layer_id + layer_granularity
 
         file_paths: List[str] = []
@@ -1817,7 +1829,7 @@ class NixlTransferWorker(TransferWorkerBase):
                             self.ssd_layer_stride_in_bytes,
                             self.ssd_kv_stride_in_bytes,
                             self.ssd_block_stride_in_bytes,
-                            self.is_mla,
+                            self.single_kv_region,
                         )
                         gview = gpu_chunk_u8_view(
                             self.gpu_blocks,
@@ -1830,7 +1842,7 @@ class NixlTransferWorker(TransferWorkerBase):
                             self.gpu_block_stride_in_bytes,
                             self.gpu_layer_stride_in_bytes,
                             self.chunk_size_in_bytes,
-                            self.is_mla,
+                            self.single_kv_region,
                         )
                         gpu_tensors.append(gview)
                         file_paths.append(path)
@@ -1865,7 +1877,7 @@ class NixlTransferWorker(TransferWorkerBase):
                             self.mem_layer_stride_in_bytes,
                             self.mem_kv_stride_in_bytes,
                             self.mem_block_stride_in_bytes,
-                            self.is_mla,
+                            self.single_kv_region,
                         )
                         sob = ssd_chunk_byte_offset_in_file(
                             lid,
@@ -1874,7 +1886,7 @@ class NixlTransferWorker(TransferWorkerBase):
                             self.ssd_layer_stride_in_bytes,
                             self.ssd_kv_stride_in_bytes,
                             self.ssd_block_stride_in_bytes,
-                            self.is_mla,
+                            self.single_kv_region,
                         )
                         dram_ptr_len.append((base + cob, self.chunk_size_in_bytes))
                         file_paths.append(path)
@@ -1913,7 +1925,7 @@ class NixlTransferWorker(TransferWorkerBase):
                 lg,
             )
             end_time = time.time()
-            kv_dim = 2 if not self.is_mla else 1
+            kv_dim = 2 if not self.single_kv_region else 1
             transfer_size = (
                 self.chunk_size_in_bytes * lg * transfer_op.valid_block_num * kv_dim
             )
@@ -1949,7 +1961,8 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         self.remote_kv_layout = remote_kv_layout
 
         self.is_mla = cpu_kv_layout.is_mla
-        self.kv_dim = 2 if not self.is_mla else 1
+        self.single_kv_region = cpu_kv_layout.single_kv_region
+        self.kv_dim = 2 if not self.single_kv_region else 1
 
         self.cpu_blocks = cpu_blocks  ## shared memory
         self.cache_config = cache_config
@@ -2039,7 +2052,8 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                 self.cpu_kv_layout.num_head,
                 self.cpu_kv_layout.head_size,
                 self.cpu_kv_layout.is_mla,
-                self.cpu_kv_layout._kv_shape,
+                packed_kv=self.cpu_kv_layout.packed_kv,
+                _kv_shape=self.cpu_kv_layout._kv_shape,
             )
             self.tmp_cpu_buffer = torch.empty(
                 self.tmp_cpu_buffer_layout.get_total_elements(),
@@ -2673,7 +2687,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                 num_blocks_per_file=self.num_blocks_per_file,
                 round_robin=self.round_robin,
                 num_threads_per_device=32,
-                is_mla=self.is_mla,
+                is_mla=self.single_kv_region,
             )
         except Exception as e:
             flexkv_logger.error(f"Copy data from ssd to cpu failed: {e}")
@@ -2973,6 +2987,12 @@ class PEER2GPUTransferWorker(PEER2CPUTransferWorker):
         self.gpu_block_types: Dict[int, List[int]] = {}
         self._registered_gpu_ptrs: List[int] = []
 
+        self._import_and_register_gpu_blocks(gpu_blocks)
+
+    def _import_and_register_gpu_blocks(
+        self, gpu_blocks: Dict[int, List[List[TensorSharedHandle]]]
+    ) -> None:
+        """Rebuild the GPU tensors from ``gpu_blocks`` and register them for RDMA."""
         for dp_id, tp_handles in gpu_blocks.items():
             tp_tensors = [
                 [handle.get_tensor() for handle in handles]
@@ -2998,9 +3018,22 @@ class PEER2GPUTransferWorker(PEER2CPUTransferWorker):
                         f"dp_id={dp_id}, num_layers={layout.num_layer}"
                     )
                 self.gpu_block_types[dp_id].append(block_type)
+        self._register_gpu_blocks_for_rdma()
+
+    def _register_gpu_blocks_for_rdma(self) -> None:
+        """Register the imported GPU regions with mooncake."""
+        for tp_tensors in self.gpu_groups.values():
+            for tensors in tp_tensors:
                 for tensor in tensors:
                     ptr = tensor.data_ptr()
                     size = tensor.numel() * tensor.element_size()
+                    # Tensors imported from a VMM handle often share one block
+                    # (e.g. the per-layer views of a single KV buffer).  Register
+                    # the block once instead of one overlapping region per
+                    # tensor; the RDMA addresses used later still fall inside it.
+                    block = imported_block_range(ptr)
+                    if block is not None:
+                        ptr, size = block
                     if ptr in self._registered_gpu_ptrs:
                         continue
                     ret = self.mooncake_transfer_engine.regist_buffer(ptr, size)
@@ -3161,6 +3194,46 @@ class PEER2GPUTransferWorker(PEER2CPUTransferWorker):
         )
         return [task] if task is not None else []
 
+    def _tokens_per_descriptor(self, gpu_layout: KVCacheLayout) -> int:
+        """How many consecutive tokens one RDMA descriptor may cover.
+
+        Building one descriptor per token is correct but pathologically slow: a
+        26-block / 32-layer / 2-kv / 16-token op is ~26k descriptors of ~2 KB,
+        which Mooncake then issues as 26 sequential 1024-descriptor batches.
+        Merging the innermost token loop cuts the count by tokens_per_block.
+
+        A merge is only valid when the tokens it spans are contiguous on *both*
+        sides, so the whole run is one (src, dst, len) triple:
+
+        * GPU side — every supported block_type lays a block's tokens out
+          consecutively with stride num_head*head_size, and the descriptor never
+          crosses a block/layer/kv boundary, so a full block is always safe.
+        * CPU side (PEERH2D reads from the peer's CPU buffer, PEERSSD2D has the
+          peer write from its staging buffer) — ``_cpu_token_slice_ptr`` puts
+          ``head_start`` *inside* the token: the element offset ends in
+          ``(... * tokens_per_block + token_id) * num_head + head_start``.  So
+          consecutive tokens are only adjacent when the slice spans the CPU
+          buffer's entire head dimension.  Under tensor parallelism each rank
+          owns a head sub-range, so token t's slice ends at head_start+num_head
+          and token t+1's begins at head_start again — a gap.  Merging there
+          would read the neighbouring rank's heads into this rank's GPU blocks
+          with a perfectly valid address, i.e. silent corruption.
+
+        Hence: merge the full block when this rank covers all CPU heads (the
+        common TP=1 and MLA cases), otherwise stay per-token.
+        """
+        # remote_kv_layout is the buffer actually addressed (the peer's CPU
+        # cache for PEERH2D, its staging buffer for PEERSSD2D); cpu_kv_layout is
+        # what the TP head-coverage check above is stated against.  Require both
+        # so a peer with a different head split cannot silently widen the merge.
+        if (
+            gpu_layout.num_head == self.cpu_kv_layout.num_head
+            and gpu_layout.num_head == self.remote_kv_layout.num_head
+            and gpu_layout.tokens_per_block == self.remote_kv_layout.tokens_per_block
+        ):
+            return gpu_layout.tokens_per_block
+        return 1
+
     def _make_gpu_task(
         self,
         node_id: int,
@@ -3200,7 +3273,10 @@ class PEER2GPUTransferWorker(PEER2CPUTransferWorker):
             self.gpu_block_types[dp_id],
         ):
             head_start = 0 if self.is_mla else tp_head_start
-            tp_specs.append((tensors, layout, block_type, head_start))
+            tp_specs.append(
+                (tensors, layout, block_type, head_start,
+                 self._tokens_per_descriptor(layout))
+            )
             if not self.is_mla:
                 tp_head_start += layout.num_head
         if not self.is_mla and tp_head_start != self.cpu_kv_layout.num_head:
@@ -3209,17 +3285,23 @@ class PEER2GPUTransferWorker(PEER2CPUTransferWorker):
                 f"({self.cpu_kv_layout.num_head})"
             )
 
-        kv_dim = 1 if self.is_mla else 2
+        kv_dim = 1 if self.single_kv_region else 2
         for block_pos, (src_block, dst_block) in enumerate(
             zip(src_blocks, dst_blocks)
         ):
             for lid in range(layer_id, layer_id + layer_granularity):
                 for kv_id in range(kv_dim):
-                    for tensors, layout, block_type, head_start in tp_specs:
+                    for (tensors, layout, block_type, head_start,
+                         tokens_per_desc) in tp_specs:
+                        # One descriptor covers tokens_per_desc consecutive
+                        # tokens; see _tokens_per_descriptor.
                         data_len = (
-                            layout.num_head * layout.head_size * self.dtype.itemsize
+                            tokens_per_desc * layout.num_head
+                            * layout.head_size * self.dtype.itemsize
                         )
-                        for token_id in range(layout.tokens_per_block):
+                        for token_id in range(
+                            0, layout.tokens_per_block, tokens_per_desc
+                        ):
                             dst_ptrs.append(
                                 _gpu_token_slice_ptr(
                                     tensors, layout, block_type, int(dst_block),

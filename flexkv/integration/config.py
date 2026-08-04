@@ -107,6 +107,8 @@ class FlexKVConfig:
                 f"vllm model dtype: {self.model_config.dtype}"
             )
         self.model_config.use_mla = vllm_config.model_config.is_deepseek_mla
+        if not self.model_config.use_mla:
+            self._detect_packed_kv(vllm_config, vllm_kv_cache_dtype)
         self.model_config.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.model_config.dp_size = vllm_config.parallel_config.data_parallel_size
         if self.model_config.use_mla:
@@ -117,6 +119,49 @@ class FlexKVConfig:
         self.server_recv_port = GLOBAL_CONFIG_FROM_ENV.server_recv_port
         self.gpu_register_port = self.server_recv_port + "_gpu_register"
 
+    def _detect_packed_kv(
+        self,
+        vllm_config: "VllmConfig",
+        vllm_kv_cache_dtype: str,
+        ) -> None:
+        """Set packed_kv when vLLM keeps K and V in one content dim.
+
+        Asks the attention backend for its cache shape rather than inspecting a
+        tensor, because the layout has to be known before the KV cache exists.
+        A 4D shape means K/V are packed into the last dim, which doubles the
+        effective head_size and removes the kv dim (see
+        :class:`~flexkv.common.storage.KVCacheLayout`).
+
+        Args:
+            vllm_config (VllmConfig): the vLLM config to read the backend from.
+            vllm_kv_cache_dtype (str): vLLM's ``cache_config.cache_dtype``.
+        """
+        try:
+            from vllm.distributed.kv_transfer.kv_connector.utils import (
+                get_current_attn_backend,
+            )
+
+            cache_shape = get_current_attn_backend(vllm_config).get_kv_cache_shape(
+                1,
+                self.cache_config.tokens_per_block,
+                vllm_config.model_config.get_num_kv_heads(vllm_config.parallel_config),
+                self.model_config.head_size,
+                vllm_kv_cache_dtype,
+            )
+        except (AttributeError, ImportError, TypeError, ValueError) as e:
+            logger.debug(
+                f"[FlexKV vllm] packed K/V layout detection unavailable ({e}); "
+                "assuming the legacy split K/V layout"
+            )
+            return
+
+        if len(cache_shape) == 4:
+            self.model_config.packed_kv = True
+            self.model_config.head_size = cache_shape[-1]
+            logger.info(
+                f"[FlexKV vllm] packed K/V layout detected: shape={cache_shape}, "
+                f"head_size folded to {self.model_config.head_size}"
+            )
 
     def post_init_from_sglang_config(
         self,
