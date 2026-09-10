@@ -45,6 +45,7 @@ logger = logging.getLogger(__name__)
 CMD_PUT_META = 2
 CMD_LAYERWISE = 3
 CMD_STORE_COMPLETE = 5
+CMD_LOAD_COMPLETE = 6
 
 
 class FlexKVScatterChannel(str, Enum):
@@ -56,6 +57,7 @@ class FlexKVScatterChannel(str, Enum):
     PREFETCH_START = "prefetch_start"
     PREFETCH_PROGRESS = "prefetch_progress"
     RESET = "reset"
+    LOAD_COMPLETION = "load_completion"
 
 
 _SCATTER_CHANNEL_OFFSETS = {
@@ -65,6 +67,7 @@ _SCATTER_CHANNEL_OFFSETS = {
     FlexKVScatterChannel.PREFETCH_START: 4,
     FlexKVScatterChannel.PREFETCH_PROGRESS: 5,
     FlexKVScatterChannel.RESET: 6,
+    FlexKVScatterChannel.LOAD_COMPLETION: 7,
 }
 _SCATTER_CHANNEL_TYPES = {
     FlexKVScatterChannel.LOOKUP: dict,
@@ -73,6 +76,7 @@ _SCATTER_CHANNEL_TYPES = {
     FlexKVScatterChannel.PREFETCH_START: dict,
     FlexKVScatterChannel.PREFETCH_PROGRESS: dict,
     FlexKVScatterChannel.RESET: dict,
+    FlexKVScatterChannel.LOAD_COMPLETION: dict,
 }
 
 

@@ -41,6 +41,7 @@ import torch
 
 from flexkv.integration.sglang.comm import (
     CMD_LAYERWISE,
+    CMD_LOAD_COMPLETE,
     CMD_PUT_META,
     CMD_STORE_COMPLETE,
     FlexKVComm,
@@ -295,6 +296,11 @@ class FlexKVConnector:
         self._completed_layerwise: List[int] = []
         self._launched_load_tids: List[int] = []  # leader-only, for periodic drain
         self._launched_load_contexts: Dict[int, _CacheOpContext] = {}
+        # Async (launch-now, wait-later) loads. Only the leader can poll FlexKV,
+        # so only it holds the task ids; the other ranks learn which rids
+        # finished from its completion broadcast.
+        self._inflight_loads_by_rid: Dict[str, int] = {}  # leader-only
+        self._inflight_load_contexts: Dict[str, _CacheOpContext] = {}
         # Stores
         self._inflight_stores: Dict[str, int] = {}  # rid -> fkv_task_id
         self._inflight_store_contexts: Dict[str, _CacheOpContext] = {}
@@ -670,6 +676,128 @@ class FlexKVConnector:
         if self._sync_ctx.needs_sync:
             self._sync_ctx.barrier()
         return n
+
+    def start_retrieve_kv(
+        self,
+        rid: str,
+        slot_mapping: torch.Tensor,
+    ) -> int:
+        """Asynchronous load: ``launch`` only.
+
+        Same contract as :meth:`retrieve_kv` for the slot mapping, but the
+        ``wait`` half moves to :meth:`check_completed_loads`. Returns the number
+        of slots the load was launched for (0 if there was nothing to launch),
+        which is a *promise*, not a completion — the caller must not read those
+        slots until ``check_completed_loads`` reports ``rid``.
+        """
+        fkv_task_id = self._pending_lookups.pop(rid, -1)
+        if fkv_task_id < 0:
+            return 0
+        context = self._pop_context(
+            "_pending_lookup_contexts", rid, "load", fkv_task_id
+        )
+
+        slot_mapping_cpu = self._to_cpu_int64(slot_mapping)
+        swa_slot_mapping = self._build_swa_slot_mapping(slot_mapping)
+        swa_slots = 0 if swa_slot_mapping is None else int(swa_slot_mapping.numel())
+
+        if self._sync_ctx.should_send_slot_mapping_to_remote:
+            self._send_slot_mapping_to_remote(fkv_task_id, slot_mapping_cpu)
+
+        n = slot_mapping_cpu.numel()
+        if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
+            try:
+                self.kv_manager.launch(
+                    task_ids=[fkv_task_id],
+                    slot_mappings=[slot_mapping_cpu],
+                    swa_slot_mappings=[swa_slot_mapping],
+                    as_batch=True,
+                    layerwise_transfer=False,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._log_cache_op(
+                    context,
+                    "complete",
+                    "failed",
+                    direction="H2D",
+                    transfer_mode="no-layerwise",
+                    stage="launch",
+                    error=str(exc),
+                )
+                raise
+            self._log_cache_op(
+                context,
+                "launch",
+                "running",
+                direction="H2D",
+                transfer_mode="no-layerwise-async",
+                slots=n,
+                swa_slots=swa_slots,
+            )
+            self._inflight_loads_by_rid[rid] = fkv_task_id
+            self._inflight_load_contexts[rid] = context
+
+        if self._sync_ctx.needs_sync:
+            self._sync_ctx.barrier()
+        return n
+
+    def check_completed_loads(self) -> Dict[str, bool]:
+        """Poll async loads. Returns ``{rid: succeeded}`` for those that
+        finished since the last call.
+
+        The leader is the only rank that can poll FlexKV, so its verdict is
+        broadcast: every rank must retire the same rids on the same tick or the
+        decode queues diverge across TP ranks.
+        """
+        completed: Dict[str, bool] = {}
+
+        if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
+            if self._inflight_loads_by_rid:
+                fk_to_rid = {v: k for k, v in self._inflight_loads_by_rid.items()}
+                try:
+                    responses = (
+                        self.kv_manager.try_wait(task_ids=list(fk_to_rid)) or {}
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    # A poll failure is transient; leave the tasks in flight and
+                    # retry on the next tick rather than failing the requests.
+                    logger.debug("[FlexKV] try_wait on async loads failed: %s", exc)
+                    responses = {}
+                for fk_tid, response in responses.items():
+                    rid = fk_to_rid[fk_tid]
+                    status = _status_value(response)
+                    completed[rid] = status == KVResponseStatus.SUCCESS.value
+                    self._inflight_loads_by_rid.pop(rid, None)
+                    context = self._pop_context(
+                        "_inflight_load_contexts", rid, "load", fk_tid
+                    )
+                    self._log_cache_op(
+                        context,
+                        "complete",
+                        status,
+                        direction="H2D",
+                        transfer_mode="no-layerwise-async",
+                    )
+
+        if self._sync_ctx.is_pp_sender:
+            self._sync_ctx.scatter_pp(
+                {"cmd": CMD_LOAD_COMPLETE, "completed": completed}
+            )
+        elif self._sync_ctx.is_pp_receiver:
+            payload = self._sync_ctx.scatter_pp(None)
+            if payload.get("cmd") != CMD_LOAD_COMPLETE:
+                raise RuntimeError(
+                    f"Tag mismatch: expected CMD_LOAD_COMPLETE, got "
+                    f"{payload.get('cmd')}"
+                )
+            completed = dict(payload.get("completed", {}))
+
+        if self._sync_ctx.needs_sync:
+            completed = self._sync_ctx.scatter(
+                completed,
+                channel=FlexKVScatterChannel.LOAD_COMPLETION,
+            )
+        return completed
 
     def start_load_kv_layerwise(
         self,
@@ -1330,6 +1458,44 @@ class FlexKVConnector:
             )
         return done
 
+    def wait_load(self, rid: str, timeout: float = 30.0) -> bool:
+        """Block until an async load for ``rid`` finishes.
+
+        Abort has to go through here rather than ``cancel``: the H2D writes
+        land in slots this process is about to free, and FlexKV gives no way to
+        prove a cancelled task never started its copy. Draining is the only
+        safe way to hand the slots back.
+        """
+        ok = True
+        if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
+            fkv_task_id = self._inflight_loads_by_rid.pop(rid, -1)
+            if fkv_task_id >= 0:
+                context = self._pop_context(
+                    "_inflight_load_contexts", rid, "load", fkv_task_id
+                )
+                try:
+                    responses = (
+                        self.kv_manager.wait([fkv_task_id], timeout=timeout) or {}
+                    )
+                    status = _status_value(responses.get(fkv_task_id))
+                except Exception as exc:  # noqa: BLE001
+                    status = "failed"
+                    logger.warning(
+                        "[FlexKV] draining aborted async load rid=%s failed: %s",
+                        rid,
+                        exc,
+                    )
+                ok = status == KVResponseStatus.SUCCESS.value
+                self._log_cache_op(
+                    context,
+                    "complete",
+                    status,
+                    direction="H2D",
+                    transfer_mode="no-layerwise-async",
+                    reason="aborted",
+                )
+        return ok
+
     def cancel_prefetch(self, rid: str) -> None:
         self._pending_lookups.pop(rid, None)
         lookup_context = getattr(self, "_pending_lookup_contexts", {}).pop(rid, None)
@@ -1421,6 +1587,16 @@ class FlexKVConnector:
                         "ok": False,
                         "error": f"waiting for layerwise loads during reset failed: {exc}",
                     }
+            # Async MP loads must drain for the same reason: their H2D writes
+            # target slots the pool is about to reuse.
+            for rid in list(self._inflight_loads_by_rid):
+                if not self.wait_load(rid, timeout=30.0) and load_reset_status["ok"]:
+                    load_reset_status = {
+                        "ok": False,
+                        "error": f"async load for rid={rid} did not finish during reset",
+                    }
+        self._inflight_loads_by_rid.clear()
+        self._inflight_load_contexts.clear()
         if self._sync_ctx.needs_sync:
             load_reset_status = self._sync_ctx.scatter(
                 load_reset_status,
