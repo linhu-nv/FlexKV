@@ -169,6 +169,11 @@ class FlexKVConnector:
             pp_rank=pp_rank,
             dp_rank=dp_rank if dp_rank is not None else 0,
             attn_cp_rank=attn_cp_rank,
+            # Hybrid linear-attention models register only their
+            # full-attention layers; the pool is the one source that knows
+            # which those are. ModelConfig freezes inside this call, so the
+            # narrowing has to happen there rather than here.
+            kvcache=kvcache,
         )
         self.model_config = self.flexkv_config.model_config
         self.cache_config = self.flexkv_config.cache_config
@@ -218,7 +223,11 @@ class FlexKVConnector:
         # MLA/MHA models keep the single-layout path.
         self._kvcache = kvcache
         self._swa_kv_pool = getattr(kvcache, "swa_kv_pool", None)
-        self._is_dsv4 = hasattr(kvcache, "c4_kv_pool")
+        # Probe the pool that owns the buffers, not the hybrid wrapper around
+        # it: HybridLinearKVPool forwards DSA scalars but not the pool-shape
+        # attributes these predicates key on.
+        _buffer_pool = self._unwrap_full_attention_pool(kvcache)
+        self._is_dsv4 = hasattr(_buffer_pool, "c4_kv_pool")
         self._dsv4_layer_groups: List[Dict[str, Any]] = []
         self._dsv4_state_groups: List[Dict[str, Any]] = []
         self._deduplicate_indexer_group = os.getenv(
@@ -1868,10 +1877,35 @@ class FlexKVConnector:
             logical_layer_count=len(buffers),
         )
 
+    @staticmethod
+    def _unwrap_full_attention_pool(kvcache: Any) -> Any:
+        """Return the pool that actually owns the token-addressable KV buffers.
+
+        Hybrid linear-attention models (GLM-5.3-Flash, and other
+        ``HybridLinearKVPool`` users) interleave full-attention layers with
+        linear-attention layers that carry recurrent state instead of
+        per-token KV. The wrapper owns the recurrent state and delegates the
+        attention KV to ``full_kv_pool``, forwarding the DSA scalars
+        (``index_head_dim``, ``kv_cache_dim``, ...) but *not* the buffer
+        lists, so buffer discovery has to reach through it.
+
+        Note the layer ids on the wrapper are global model-layer ids while the
+        backing pool is dense over only the full-attention layers; sglang's own
+        ``get_kv_buffer_shape`` delegates here for the same reason.
+        """
+        full_pool = getattr(kvcache, "full_kv_pool", None)
+        if full_pool is None:
+            return kvcache
+        if hasattr(kvcache, "kv_buffer") or hasattr(kvcache, "k_buffer"):
+            # The wrapper exposes the buffers itself; don't second-guess it.
+            return kvcache
+        return full_pool
+
     def _resolve_kv_buffers(
         self, kvcache: Any
     ) -> Tuple[List[torch.Tensor], Optional[_IndexerBufferGroup]]:
         """Resolve the GPU buffers and describe heterogeneous DSv4 pools."""
+        kvcache = self._unwrap_full_attention_pool(kvcache)
         indexer_buffers = getattr(kvcache, "index_k_with_scale_buffer", None)
         if indexer_buffers:
             if self._deduplicate_indexer_group:

@@ -476,6 +476,7 @@ class FlexKVConfig:
         pp_rank: int = 0,
         dp_rank: int = 0,
         attn_cp_rank: int = 0,
+        kvcache=None,
     ) -> RankInfo:
         """Populate ``self.model_config`` / ``self.cache_config`` from a
         sglang ModelConfig + ServerArgs and return the per-worker
@@ -535,6 +536,29 @@ class FlexKVConfig:
         self.cache_config.tokens_per_block = page_size
 
         self.model_config.num_layers = int(getattr(sglang_config, "num_hidden_layers", 0))
+
+        # `num_hidden_layers` counts every layer in the model, but on a hybrid
+        # linear-attention model only the full-attention layers own a
+        # token-addressable KV cache. GLM-5.3-Flash has 11 DSA layers out of
+        # 45; the rest are KDA layers carrying recurrent state, which FlexKV
+        # does not register. `HybridLinearKVPool.full_attention_layer_id_mapping`
+        # maps global model-layer id -> dense index in the backing pool, so its
+        # length is exactly what gets registered. Applied here, before
+        # `freeze()`, because ModelConfig is immutable afterwards.
+        layer_mapping = getattr(kvcache, "full_attention_layer_id_mapping", None)
+        if layer_mapping:
+            full_attention_layers = len(layer_mapping)
+            if full_attention_layers != self.model_config.num_layers:
+                logger.info(
+                    "[FlexKV sglang] hybrid linear-attention model: num_layers "
+                    "%d -> %d (full-attention layer ids %s); the other %d "
+                    "layers carry recurrent state, not per-token KV",
+                    self.model_config.num_layers,
+                    full_attention_layers,
+                    list(layer_mapping),
+                    self.model_config.num_layers - full_attention_layers,
+                )
+                self.model_config.num_layers = full_attention_layers
 
         # Derive kv_dim from the physical KV buffer layout, not from
         # AttentionArch.MLA. Models with qk_nope_head_dim (MLA, etc.)
