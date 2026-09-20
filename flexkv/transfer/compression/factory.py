@@ -40,6 +40,22 @@ def build_compressors(
     if not enable_nvcomp:
         return _null_compressors()
 
+    # Resolve which layer groups get compressed exactly once, here, and carry
+    # the answer into the strategy. check_engine_nvcomp_enable above ran the
+    # same selection to decide accept/decline; doing it again and handing over
+    # the result is what keeps the engine's decision and the worker's binding
+    # from being two independent copies of a constant.
+    layer_groups = getattr(model_config, "layer_groups", None)
+    group_plans = (
+        ans_utils.select_nvcomp_groups(
+            layer_groups,
+            tokens_per_block=cpu_handle.kv_layout.tokens_per_block,
+            default_dtype=getattr(model_config, "dtype", None),
+            has_ssd=ssd_handle is not None,
+        )
+        if layer_groups else []
+    )
+
     (cpu_table, cpu_table_tp,
      ssd_table, ssd_table_tp) = ans_utils.allocate_engine_size_tables(
         cpu_handle=cpu_handle,
@@ -61,7 +77,8 @@ def build_compressors(
     # worker's own shape, so handing it whichever exists is safe.
     compressors = _null_compressors()
     compressors["gpu_cpu"] = NvcompGpuCpuStrategy(
-        cpu_size_table=(cpu_table if cpu_table is not None else cpu_table_tp))
+        cpu_size_table=(cpu_table if cpu_table is not None else cpu_table_tp),
+        group_plans=group_plans)
     compressors["cpu_ssd"] = NvcompCpuSsdStrategy(
         cpu_size_table=cpu_table,
         ssd_size_table=ssd_table,

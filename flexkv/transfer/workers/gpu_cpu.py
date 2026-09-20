@@ -1088,31 +1088,30 @@ class GPUCPUTransferWorker(TransferWorkerBase):
 
         Two callers: it selects the per-group loop in ``_transfer_impl``, and
         in ``launch_transfer`` it selects the per-group dispatch, out of which
-        at most one group is handed to the compressor.
+        some subset of the groups is handed to the compressor.
         """
         return (pool.pool_id is not PoolId.FULL_KV
                 or self.tp_group_transfer_groups is not None)
 
-    def _compressed_group_index(self, pool: "_Pool") -> Optional[int]:
+    def _compressed_group_indices(self, pool: "_Pool") -> List[int]:
         """Which of ``pool``'s groups the compressor handles, if any.
 
         Only the main pool, only when a real compressor is attached, and only
-        the one group that compressor bound to in ``attach``. An SWA or state
+        the groups that compressor bound to in ``attach``. An SWA or state
         sidecar is never compressed: the size table is allocated from the main
         CPU layout's block count, so another pool's block ids would index it
         out of range.
         """
         if pool.pool_id is not PoolId.FULL_KV:
-            return None
-        idx = self._compressor.compressed_group_index()
-        if idx is None:
-            return None
-        if idx >= len(pool.regions):
-            raise RuntimeError(
-                f"[worker {self.worker_id}] the compressor bound to layer "
-                f"group {idx} but the main pool has {len(pool.regions)} "
-                "group(s)")
-        return idx
+            return []
+        indices = self._compressor.compressed_group_indices()
+        for idx in indices:
+            if idx >= len(pool.regions):
+                raise RuntimeError(
+                    f"[worker {self.worker_id}] the compressor bound to layer "
+                    f"group {idx} but the main pool has {len(pool.regions)} "
+                    "group(s)")
+        return list(indices)
 
     @staticmethod
     def _chunk_layer_bytes(pool: "_Pool",
@@ -1418,21 +1417,22 @@ class GPUCPUTransferWorker(TransferWorkerBase):
         src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
         pool = self._pool_for(transfer_op)
         if self._is_per_group(pool):
-            # Compression, when there is any, covers exactly one group of the
-            # main pool (ans_utils.COMPRESSED_GROUP_INDEX -- the MLA latent on
-            # a DSA model; see check_multi_group_nvcomp for why only one). The
-            # rest of the groups, and every group of any other pool, move here
-            # uncompressed. Splitting them like this is what lets the two share
-            # a pool: they address disjoint regions of the same block, so the
-            # order between them does not matter.
-            compressed_group = self._compressed_group_index(pool)
+            # Compression, when there is any, covers the main pool's groups
+            # that ``select_nvcomp_groups`` picked -- on a DSA model the MLA
+            # latent, and the indexer too unless FLEXKV_NVCOMP_GROUPS narrows
+            # it. Whatever is left over, and every group of any other pool,
+            # moves here uncompressed. Splitting them like this is what lets
+            # the two share a pool: they address disjoint regions of the same
+            # block, so the order between them does not matter.
+            compressed_groups = self._compressed_group_indices(pool)
             groups = None
-            if compressed_group is not None:
+            if compressed_groups:
                 self._compressor.run(
                     self, src_block_ids=src_block_ids,
                     dst_block_ids=dst_block_ids, op=transfer_op)
+                remaining = set(compressed_groups)
                 groups = [gi for gi in range(len(pool.regions))
-                          if gi != compressed_group]
+                          if gi not in remaining]
                 if not groups:
                     return True
 
@@ -1448,7 +1448,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):
 
             # Same number the per-group loop used to sum here; precomputed on
             # the pool because thread_groups is empty on the region-batch path.
-            # With a group split out to the compressor its bytes were already
+            # With groups split out to the compressor their bytes were already
             # reported by that call, so they are subtracted rather than
             # double-counted into this line's bandwidth.
             transfer_size = (self._chunk_layer_bytes(pool, groups)

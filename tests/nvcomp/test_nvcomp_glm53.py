@@ -188,6 +188,167 @@ def test_glm53_indexer_roundtrip(cpu_layout_name, num_blocks=2):
     )
 
 
+class _Group:
+    """A ``LayerGroupSpec`` as far as ``group_table_layer_offsets`` is concerned."""
+
+    def __init__(self, num_layers, head_size, dtype=torch.bfloat16):
+        self.num_layers = num_layers
+        self.head_size = head_size
+        self.dtype = dtype
+        self.num_kv_heads = 1
+        self.compress_ratio = 1
+
+
+class _GroupRun:
+    """One layer group's buffers, strides and ANS context, kept across phases.
+
+    Compress and decompress are separate calls here rather than one roundtrip
+    helper, because the ordering is the whole point: a real worker stores every
+    group before it restores any of them. Compressing both and only then
+    restoring both is what turns a table collision into a wrong-length
+    decompress instead of a self-consistent no-op.
+    """
+
+    def __init__(self, spec, size_table, table_ptr, num_blocks, label):
+        self.label = label
+        self.num_layers = spec.num_layers
+        self.table_ptr = table_ptr
+        self.size_table = size_table
+        self.gpu_blocks, self.cpu_blocks = make_kv_cache(
+            spec.num_layers, num_blocks, GLM53_PAGE_SIZE, 1, spec.head_size,
+            spec.dtype, device, "BLOCKFIRST", kv_dim=1, num_kv_heads=1)
+        self.gpu_ptrs = torch.tensor(
+            [b.data_ptr() for b in self.gpu_blocks],
+            dtype=torch.int64).pin_memory()
+        (self.chunk_size,
+         self.gpu_kv_stride, self.gpu_block_stride, self.gpu_layer_stride,
+         self.cpu_kv_stride, self.cpu_layer_stride,
+         self.cpu_block_stride) = compute_strides(
+            spec.num_layers, num_blocks, GLM53_PAGE_SIZE, 1, spec.head_size,
+            spec.dtype, "BLOCKFIRST", kv_dim=1, num_kv_heads=1)
+        assert self.chunk_size >= ans_utils.MIN_CHUNK_BYTES, label
+
+        self.block_ids = torch.arange(num_blocks,
+                                      dtype=torch.int64).pin_memory()
+        self.original = [b.clone() for b in self.gpu_blocks]
+        data_type = ans_utils.data_type(spec.dtype)
+        batch_size, _ = ans_utils.get_nvcomp_batch_size(self.chunk_size,
+                                                       data_type=data_type)
+        self.ctx = ANSTransferContext(batch_size, self.chunk_size, data_type)
+        self.stream = torch.cuda.Stream()
+        self.d2h_bytes = 0
+
+    def _call(self, fn):
+        with torch.cuda.stream(self.stream):
+            # start_layer_id stays 0: each group's layer ids are local and the
+            # table window is expressed as a shifted base pointer. That is
+            # exactly what NvcompGpuCpuStrategy._attach_multi_group builds, so
+            # this exercises the real addressing rather than a rehearsal of it.
+            moved = fn(
+                self.ctx, self.block_ids, self.gpu_ptrs,
+                self.gpu_kv_stride, self.gpu_block_stride, self.gpu_layer_stride,
+                self.block_ids, self.cpu_blocks,
+                self.cpu_kv_stride, self.cpu_layer_stride, self.cpu_block_stride,
+                self.chunk_size, 0, self.num_layers, 1, 0,
+                self.table_ptr,
+                self.size_table.stride(0), self.size_table.stride(1))
+        self.stream.synchronize()
+        return moved
+
+    def store(self):
+        self.d2h_bytes = self._call(transfer_kv_blocks_ans_comp)
+        assert self.d2h_bytes > 0, f"{self.label}: nothing compressed"
+        # Zero now, not just before the restore: from here until restore() the
+        # only surviving copy of this group's data is the compressed CPU one,
+        # so a no-op H2D cannot masquerade as a passing roundtrip.
+        for b in self.gpu_blocks:
+            b.zero_()
+
+    def restore(self):
+        moved = self._call(transfer_kv_blocks_ans_decomp)
+        assert moved == self.d2h_bytes, (
+            f"{self.label}: H2D read {moved}B for a {self.d2h_bytes}B payload; "
+            "the size table this group restored from is not the one it stored "
+            "to")
+
+    def assert_intact(self):
+        for li in range(self.num_layers):
+            assert torch.equal(self.gpu_blocks[li], self.original[li]), (
+                f"{self.label}: mismatch at layer {li} after both groups "
+                "transferred through the shared size table")
+
+    def destroy(self):
+        self.ctx.destroy()
+
+
+@pytest.mark.unit
+def test_two_groups_share_one_table_without_aliasing():
+    """The multi-group invariant, at the bytes.
+
+    Both of GLM-5.3's groups are compressed now, and they share one size table
+    whose layer dimension is ``sum(num_layers)``. Each gets a private stretch
+    of rows at the prefix-sum offset, handed to the kernel as a shifted base
+    pointer. Drop that offset -- the pre-change behaviour, where the table was
+    sized from a single group's layer count -- and both groups write the same
+    rows: the second store overwrites the first's lengths, and the first
+    group's restore then decompresses at a length that belongs to different
+    data. Neither a per-group roundtrip nor the engine-guard cells can see
+    that; only both groups against one table, stored before either is
+    restored, can.
+
+    The groups deliberately differ in layer count as well as head size, so an
+    off-by-one in the offset lands somewhere observable.
+    """
+    if not NVCOMP_AVAILABLE:
+        pytest.skip("nvcomp not available")
+
+    num_blocks = 2
+    groups = [
+        _Group(num_layers=GLM53_NUM_FULL_ATTN_LAYERS,
+               head_size=GLM53_KV_LORA_RANK + GLM53_QK_ROPE_HEAD_DIM),
+        _Group(num_layers=GLM53_NUM_FULL_ATTN_LAYERS - 3,
+               head_size=GLM53_INDEX_HEAD_DIM),
+    ]
+    offsets = ans_utils.group_table_layer_offsets(groups)
+    assert offsets == [0, GLM53_NUM_FULL_ATTN_LAYERS]
+
+    total_layers = sum(g.num_layers for g in groups)
+    size_table = torch.zeros(
+        (num_blocks, total_layers, 1), dtype=torch.uint32).pin_memory()
+    elem = size_table.element_size()
+
+    runs = [
+        _GroupRun(spec, size_table,
+                  size_table.data_ptr() + off * size_table.stride(1) * elem,
+                  num_blocks, f"group{gi}")
+        for gi, (spec, off) in enumerate(zip(groups, offsets))
+    ]
+    try:
+        runs[0].store()
+        # Group 1's rows must still be untouched, so a collision is reported as
+        # "group 0 wrote outside its window" rather than as corrupt data three
+        # steps later.
+        assert (size_table.to(torch.int64)[:, offsets[1]:] == 0).all(), (
+            "group0 wrote into group1's table rows")
+        group0_rows = size_table[:, :offsets[1]].clone()
+
+        runs[1].store()
+        assert torch.equal(size_table[:, :offsets[1]], group0_rows), (
+            "group1's store overwrote group0's table rows")
+        assert (size_table.to(torch.int64) > 0).all(), (
+            "both groups stored but some table rows are still zero")
+
+        # Only now restore, in the same order. Under the aliasing bug group 0
+        # reads lengths that group 1 wrote.
+        for run in runs:
+            run.restore()
+        for run in runs:
+            run.assert_intact()
+    finally:
+        for run in runs:
+            run.destroy()
+
+
 @pytest.mark.unit
 def test_glm53_chunk_clears_min_chunk_bytes():
     """A page of GLM-5.3 latent KV must stay above the nvcomp floor.

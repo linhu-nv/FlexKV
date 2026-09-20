@@ -1,6 +1,6 @@
 import os
 import uuid
-from typing import Tuple, List, Dict, Optional, Any
+from typing import Tuple, List, Dict, NamedTuple, Optional, Any, Sequence, Union
 
 import torch
 
@@ -28,9 +28,18 @@ MIN_CHUNK_BYTES = 4096
 RATIO_PLATEAU_BYTES = 16 * 1024
 SSD_PACKED_IO_ALIGN = 512
 
-# On a multi-group (heterogeneous KV) model, only this group is compressed;
-# every other group transfers uncompressed. See ``check_multi_group_nvcomp``.
-COMPRESSED_GROUP_INDEX = 0
+# Which layer groups of a heterogeneous-KV model ANS compresses.
+#   "auto" (default) -- every group that passes
+#                       ``group_nvcomp_ineligible_reason``
+#   "0" / "0,1"      -- exactly those ordinals; a named group that is
+#                       ineligible is an error, not a silent drop
+#   "none"           -- nothing, which disables nvcomp
+# The list is resolved once, in the engine process, and handed to the worker
+# strategy; it is never re-read inside a worker. See ``select_nvcomp_groups``.
+NVCOMP_GROUPS_ENV = "FLEXKV_NVCOMP_GROUPS"
+
+# Sentinel for "read the env"; ``None`` already means "auto" on the wire.
+_FROM_ENV = object()
 
 
 def check_dtype(dtype) -> None:
@@ -88,8 +97,9 @@ def check_engine_nvcomp_enable(
 
     # Heterogeneous (multi-group) KV: a DSA model (DeepSeek-V4, GLM-5.3) splits
     # its layers into groups with different geometry -- group 0 is the MLA
-    # latent, group 1 the indexer. Only group 0 is compressed; see
-    # ``check_multi_group_nvcomp`` for why, and for the per-group checks.
+    # latent, group 1 the indexer. Which of them get compressed is decided by
+    # ``select_nvcomp_groups``; an empty selection means nvcomp has nothing to
+    # do and the whole feature is declined.
     #
     # This has to be decided here rather than in the strategy, which is where
     # the refusal used to live: by the time a strategy attaches it is already
@@ -104,8 +114,6 @@ def check_engine_nvcomp_enable(
             tokens_per_block=getattr(cpu_handle.kv_layout, "tokens_per_block",
                                      None) if cpu_handle is not None else None,
             default_dtype=getattr(model_config, "dtype", None),
-            cpu_num_layers=getattr(cpu_handle.kv_layout, "num_layer", None)
-            if cpu_handle is not None else None,
             has_ssd=ssd_handle is not None):
         return False
 
@@ -147,35 +155,131 @@ def check_engine_nvcomp_enable(
     return True
 
 
-def check_multi_group_nvcomp(
-    layer_groups: List[Any],
+class GroupPlan(NamedTuple):
+    """One compressed layer group, as the engine hands it to a worker.
+
+    ``table_layer_offset`` is the group's first row in the size table's layer
+    dimension. Every group -- compressed or not -- owns a private stretch of
+    ``num_layers`` rows at the running prefix sum, so two compressed groups can
+    never alias each other's lengths. Offsets are computed over *all* groups,
+    not just the selected ones, so a table allocated under one selection is
+    still addressed correctly under another.
+    """
+    group_index: int
+    table_layer_offset: int
+    num_layers: int
+
+
+def group_table_layer_offsets(layer_groups: Sequence[Any]) -> List[int]:
+    """Per-group first row in the size table's layer dimension (prefix sum)."""
+    offsets: List[int] = []
+    running = 0
+    for group in layer_groups:
+        offsets.append(running)
+        running += int(group.num_layers)
+    return offsets
+
+
+def group_nvcomp_ineligible_reason(
+    group: Any,
     *,
     tokens_per_block: Optional[int],
     default_dtype: Optional[torch.dtype],
-    cpu_num_layers: Optional[int] = None,
+) -> Optional[str]:
+    """Why ANS cannot compress this layer group, or ``None`` if it can.
+
+    Every check here is about whether the *kernels* can address the group, not
+    about whether compressing it is a good idea -- a group that is merely
+    unrewarding (already-quantized fp8, say) is still eligible, and the caller
+    decides via ``FLEXKV_NVCOMP_GROUPS``.
+    """
+    dtype = getattr(group, "dtype", None) or default_dtype
+    if dtype not in SUPPORTED_DTYPES:
+        return f"dtype {dtype} is not one ANS supports"
+
+    if tokens_per_block is not None:
+        chunk = group_chunk_bytes(
+            group, tokens_per_block=tokens_per_block, default_dtype=default_dtype)
+        if chunk % (getattr(group, "num_kv_heads", 1) or 1):
+            # Unreachable arithmetically; kept so a future geometry change
+            # trips here rather than in the kernel.
+            return f"chunk={chunk}B does not divide by the head count"
+        if chunk < MIN_CHUNK_BYTES:
+            return f"chunk={chunk}B is below the {MIN_CHUNK_BYTES}B ANS minimum"
+    return None
+
+
+def group_chunk_bytes(
+    group: Any, *, tokens_per_block: int,
+    default_dtype: Optional[torch.dtype],
+) -> int:
+    """Bytes of one (layer, kv) slot of one block of this group.
+
+    Same formula as ``flexkv.transfer.template.group_chunk_bytes``; duplicated
+    rather than imported because that module pulls in the storage layer and
+    this one is imported from the engine before any layout exists.
+    ``compress_ratio`` shrinks the token dimension on both sides of the
+    transfer, so it is a smaller chunk rather than a ratio between the two.
+    """
+    dtype = getattr(group, "dtype", None) or default_dtype
+    tokens = tokens_per_block // getattr(group, "compress_ratio", 1)
+    return (tokens * group.num_kv_heads * group.head_size * dtype.itemsize)
+
+
+def _parse_groups_env(raw: str, num_groups: int) -> Optional[List[int]]:
+    """``FLEXKV_NVCOMP_GROUPS`` -> requested ordinals, or None for "auto"."""
+    value = raw.strip().lower()
+    if value in ("", "auto"):
+        return None
+    if value == "none":
+        return []
+    requested: List[int] = []
+    for piece in value.replace(" ", "").split(","):
+        if not piece:
+            continue
+        try:
+            idx = int(piece)
+        except ValueError:
+            raise ValueError(
+                f"{NVCOMP_GROUPS_ENV}={raw!r}: {piece!r} is not an integer, "
+                "'auto', or 'none'.")
+        if not 0 <= idx < num_groups:
+            raise ValueError(
+                f"{NVCOMP_GROUPS_ENV}={raw!r}: group {idx} is out of range for "
+                f"a model with {num_groups} layer group(s).")
+        if idx not in requested:
+            requested.append(idx)
+    return requested
+
+
+def select_nvcomp_groups(
+    layer_groups: Sequence[Any],
+    *,
+    tokens_per_block: Optional[int],
+    default_dtype: Optional[torch.dtype],
     has_ssd: bool = False,
-) -> bool:
-    """Whether nvcomp can run on a heterogeneous-KV model, compressing group 0.
+    env: Union[str, None, Any] = _FROM_ENV,
+) -> List[GroupPlan]:
+    """Which layer groups ANS compresses, and where each one's table rows are.
 
-    Only ``COMPRESSED_GROUP_INDEX`` is compressed; the other groups move
-    uncompressed on the ordinary per-group path. That asymmetry is deliberate,
-    not a staging point:
+    Resolved once in the engine process and handed to the worker strategy, so
+    the engine's accept decision and the worker's binding can never disagree --
+    they are the same list, not two copies of a constant.
 
-    * On a DSA model group 0 is the MLA latent -- the large, bf16, entropy-rich
-      group nvcomp was sized for (GLM-5.3: 73728 B/chunk, DeepSeek-V4 the same
-      family) and ~90% of the bytes. Group 1 is the indexer, whose payload is
-      *already quantized* fp8 index-k; ANS over quantized data buys little,
-      while each additional compressed group costs a size-table dimension the
-      table does not currently have.
-    * Both groups' local layer ids start at 0, so two compressed groups would
-      alias in the ``[blocks, layers, kv]`` size table and overwrite each
-      other's lengths -- a silent wrong-length decompress. Compressing exactly
-      one group sidesteps that: group 0's ``num_layers`` *is* the CPU layout's
-      ``num_layer``, so the existing table already addresses it correctly with
-      no offsetting.
+    ``FLEXKV_NVCOMP_GROUPS`` selects:
 
-    Requiring group 0 to span the whole PP stage is what makes that last claim
-    true, so it is checked rather than assumed.
+    * ``auto`` (default) -- every group the kernels can address. Groups whose
+      data is already quantized still qualify; ANS may barely shrink them, and
+      a group that does not shrink *at all* raises "compressed payload exceeded
+      the CPU chunk slot" rather than corrupting anything, so the failure mode
+      of an over-eager auto is loud. Set ``FLEXKV_NVCOMP_GROUPS=0`` to get the
+      conservative single-group behaviour back.
+    * ``0`` / ``0,1`` -- exactly those ordinals. Naming an ineligible group is
+      a configuration error, so it declines nvcomp outright rather than
+      quietly compressing a subset of what was asked for.
+    * ``none`` -- nothing, which disables nvcomp.
+
+    Returns an empty list when nvcomp should not run.
     """
     # The SSD tier cannot carry a compressed CPU block on this layout.
     # CPUSSDDiskTransferWorker moves a multi-group block as one opaque blob
@@ -193,57 +297,96 @@ def check_multi_group_nvcomp(
             "moves these blocks as opaque blobs and cannot carry the "
             "compressed-size table, so a DISK2H restore would decompress at a "
             "stale length. Disabling nvcomp.")
-        return False
+        return []
 
-    group = layer_groups[COMPRESSED_GROUP_INDEX]
+    raw = os.environ.get(NVCOMP_GROUPS_ENV, "auto") if env is _FROM_ENV else (
+        "auto" if env is None else str(env))
+    try:
+        requested = _parse_groups_env(raw, len(layer_groups))
+    except ValueError as exc:
+        flexkv_logger.warning(f"[nvcomp-fallback] {exc} Disabling nvcomp.")
+        return []
 
-    dtype = getattr(group, "dtype", None) or default_dtype
-    if dtype not in SUPPORTED_DTYPES:
-        flexkv_logger.warning(
-            f"[nvcomp-fallback] multi-group KV: group {COMPRESSED_GROUP_INDEX} "
-            f"has dtype {dtype}, which ANS does not support; disabling nvcomp.")
-        return False
+    if requested == []:
+        flexkv_logger.info(
+            f"[nvcomp-multi-group] {NVCOMP_GROUPS_ENV}={raw!r} selects no "
+            "layer groups; disabling nvcomp.")
+        return []
 
-    # Group 0 must cover the full PP stage for the size table to be addressed
-    # without a per-group offset: the table's layer dimension is sized from the
-    # CPU layout's num_layer, and the kernel walks local layer ids 0..n-1. The
-    # strategy re-checks this in the worker against the *realized* geometry,
-    # but a raise there kills a spawned process and hangs the engine on a
-    # `ready` that never comes, so the declared shape is checked here first.
-    if (cpu_num_layers is not None
-            and group.num_layers != cpu_num_layers):
-        flexkv_logger.warning(
-            f"[nvcomp-fallback] multi-group KV: group {COMPRESSED_GROUP_INDEX} "
-            f"covers {group.num_layers} layers but the CPU size table is sized "
-            f"for {cpu_num_layers}; compressing it would index the table out "
-            "of step. Disabling nvcomp.")
-        return False
+    offsets = group_table_layer_offsets(layer_groups)
+    reasons = [
+        group_nvcomp_ineligible_reason(
+            group, tokens_per_block=tokens_per_block,
+            default_dtype=default_dtype)
+        for group in layer_groups
+    ]
 
-    # compress_ratio shrinks the token dimension, which would make this group's
-    # chunk disagree with the table's stride.
-    if getattr(group, "compress_ratio", 1) != 1:
-        flexkv_logger.warning(
-            f"[nvcomp-fallback] multi-group KV: group {COMPRESSED_GROUP_INDEX} "
-            f"has compress_ratio={group.compress_ratio}; nvcomp only handles "
-            "an uncompressed leading group. Disabling nvcomp.")
-        return False
-
-    if tokens_per_block is not None:
-        chunk = (tokens_per_block * group.num_kv_heads * group.head_size
-                 * dtype.itemsize)
-        if chunk < MIN_CHUNK_BYTES:
+    if requested is None:
+        chosen = [gi for gi, reason in enumerate(reasons) if reason is None]
+        for gi, reason in enumerate(reasons):
+            if reason is not None:
+                flexkv_logger.info(
+                    f"[nvcomp-multi-group] layer group {gi} transfers "
+                    f"uncompressed: {reason}.")
+    else:
+        # An explicitly named group that cannot be compressed is a config
+        # error. Silently dropping it would leave the operator believing a
+        # measurement covered a group it never touched.
+        rejected = [(gi, reasons[gi]) for gi in requested
+                    if reasons[gi] is not None]
+        if rejected:
+            detail = "; ".join(f"group {gi}: {r}" for gi, r in rejected)
             flexkv_logger.warning(
-                f"[nvcomp-fallback] multi-group KV: group "
-                f"{COMPRESSED_GROUP_INDEX} chunk={chunk}B is below the "
-                f"{MIN_CHUNK_BYTES}B ANS minimum; disabling nvcomp.")
-            return False
+                f"[nvcomp-fallback] {NVCOMP_GROUPS_ENV}={raw!r} names "
+                f"group(s) ANS cannot compress ({detail}). Disabling nvcomp "
+                "rather than compressing a subset of what was requested.")
+            return []
+        chosen = list(requested)
 
-    skipped = len(layer_groups) - 1
+    if not chosen:
+        flexkv_logger.warning(
+            "[nvcomp-fallback] multi-group KV: no layer group can be "
+            "compressed; disabling nvcomp.")
+        return []
+
+    plans = [
+        GroupPlan(group_index=gi,
+                  table_layer_offset=offsets[gi],
+                  num_layers=int(layer_groups[gi].num_layers))
+        for gi in sorted(chosen)
+    ]
+    described = ", ".join(
+        f"{p.group_index}({p.num_layers}L, "
+        f"dtype={getattr(layer_groups[p.group_index], 'dtype', None) or default_dtype}, "
+        f"rows {p.table_layer_offset}..{p.table_layer_offset + p.num_layers - 1})"
+        for p in plans)
+    skipped = len(layer_groups) - len(plans)
     flexkv_logger.info(
-        f"[nvcomp-multi-group] compressing layer group "
-        f"{COMPRESSED_GROUP_INDEX} ({group.num_layers} layers, dtype={dtype}); "
+        f"[nvcomp-multi-group] {NVCOMP_GROUPS_ENV}={raw!r} -> compressing "
+        f"layer group(s) {described}; "
         f"{skipped} other group(s) transfer uncompressed.")
-    return True
+    return plans
+
+
+def check_multi_group_nvcomp(
+    layer_groups: List[Any],
+    *,
+    tokens_per_block: Optional[int],
+    default_dtype: Optional[torch.dtype],
+    has_ssd: bool = False,
+) -> bool:
+    """Whether nvcomp can run on a heterogeneous-KV model at all.
+
+    Thin wrapper so the engine's accept/decline is literally
+    ``select_nvcomp_groups`` finding something to do, rather than a second
+    predicate that could drift from it.
+    """
+    return bool(select_nvcomp_groups(
+        layer_groups,
+        tokens_per_block=tokens_per_block,
+        default_dtype=default_dtype,
+        has_ssd=has_ssd,
+    ))
 
 
 def check_worker_nvcomp_enable(
@@ -329,7 +472,19 @@ def allocate_engine_size_tables(
     Optional[torch.Tensor],
 ]:
     layout = cpu_handle.kv_layout
-    num_layers = layout.num_layer
+    # On a heterogeneous-KV model every group gets a private stretch of the
+    # table's layer dimension, at the prefix sum of the groups' layer counts
+    # (``group_table_layer_offsets``). Sizing from ``layout.num_layer`` instead
+    # would give one group's worth of rows for all of them: two groups whose
+    # local layer ids both start at 0 would write each other's lengths, and the
+    # restore would decompress at the wrong length with no error. Offsets cover
+    # every group, not just the compressed ones, so the table stays valid when
+    # FLEXKV_NVCOMP_GROUPS changes without reallocating.
+    layer_groups = getattr(model_config, "layer_groups", None)
+    if layer_groups:
+        num_layers = sum(int(g.num_layers) for g in layer_groups)
+    else:
+        num_layers = layout.num_layer
     # Read the region count off the layout rather than recomputing it from
     # the legacy flag, so the table always matches what the kernels stride over.
     kv_dim = layout.kv_dim

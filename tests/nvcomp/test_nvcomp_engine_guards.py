@@ -12,10 +12,12 @@ so unlike the roundtrip tests in this directory they run anywhere.
 
 The multi-group cells cover DSA models (DeepSeek-V4, GLM-5.3), which split
 their layers into an MLA-latent group and an indexer group with different
-geometry. Those are *supported*, but only by compressing the latent group and
-moving the rest uncompressed -- so what has to be pinned down here is both that
-a well-shaped one is accepted and that each way the shape can go wrong is
-declined rather than raised.
+geometry. Those are *supported*: ``select_nvcomp_groups`` picks whichever
+groups the ANS kernels can address, ``FLEXKV_NVCOMP_GROUPS`` narrows that, and
+anything not picked moves uncompressed. What has to be pinned down here is that
+a well-shaped model is accepted with the right groups selected, that an
+unusable group is dropped rather than raised on, and that nvcomp declines
+outright only when *nothing* is left to compress.
 """
 
 import logging
@@ -61,6 +63,17 @@ def flexkv_log():
     finally:
         logger.removeHandler(handler)
         logger.setLevel(previous)
+
+
+@pytest.fixture(autouse=True)
+def _clean_group_selection(monkeypatch):
+    """``FLEXKV_NVCOMP_GROUPS`` set in the ambient shell must not steer a cell.
+
+    Every cell here either asserts the default or sets the variable itself, so
+    inheriting an operator's value would silently change what is under test --
+    and the "auto" cells would fail in a way that looks like a code regression.
+    """
+    monkeypatch.delenv(ans_utils.NVCOMP_GROUPS_ENV, raising=False)
 
 
 @pytest.mark.unit
@@ -113,9 +126,8 @@ def _glm53_groups(**latent_overrides):
     """GLM-5.3's real pair: 78-layer bf16 MLA latent + fp8 indexer.
 
     Latent chunk = 64 tokens * 1 head * (512 + 64) * 2 B = 73728 B; the indexer
-    is page-packed at compress_ratio=64. Only the latent is ever inspected --
-    the indexer's shape is the *reason* it is not compressed, not something the
-    guard has to accept.
+    is page-packed at compress_ratio=64, giving 1 * 1 * 8448 * 1 B = 8448 B --
+    both above the ANS floor, so on ``auto`` both are selected.
     """
     latent = dict(num_layers=78, num_kv_heads=1, head_size=576,
                   dtype=torch.bfloat16, compress_ratio=1)
@@ -125,6 +137,13 @@ def _glm53_groups(**latent_overrides):
         _Group(num_layers=78, num_kv_heads=1, head_size=8448,
                dtype=torch.float8_e4m3fn, compress_ratio=64),
     ]
+
+
+def _plans(groups, *, env="auto", tokens_per_block=64,
+           default_dtype=torch.bfloat16, has_ssd=False):
+    return ans_utils.select_nvcomp_groups(
+        groups, tokens_per_block=tokens_per_block,
+        default_dtype=default_dtype, has_ssd=has_ssd, env=env)
 
 
 def _gpu_groups(dtype=torch.bfloat16, chunk_size=36864):
@@ -269,11 +288,135 @@ def test_glm53_shape_is_accepted(monkeypatch, flexkv_log):
     """
     assert _enable(monkeypatch,
                    model_config=_ModelConfig(_glm53_groups())) is True
-    # Says which group it took and that the others are not compressed, because
-    # "nvcomp is on" reads very differently from "nvcomp is on for 90% of the
-    # bytes" to someone looking at a ratio in the logs.
+    # Says which groups it took and how many it left alone, because "nvcomp is
+    # on" reads very differently from "nvcomp is on for 90% of the bytes" to
+    # someone looking at a ratio in the logs.
     assert "[nvcomp-multi-group]" in flexkv_log.text
-    assert "1 other group(s) transfer uncompressed" in flexkv_log.text
+    assert "0 other group(s) transfer uncompressed" in flexkv_log.text
+
+
+@pytest.mark.unit
+def test_glm53_auto_selects_both_groups():
+    """Both of GLM-5.3's groups clear the ANS floor, so ``auto`` takes both.
+
+    This is the behaviour change: the indexer used to be excluded by fiat.
+    Pinned as ordinals *and* table rows, because the row assignment is what
+    keeps two compressed groups from overwriting each other's lengths.
+    """
+    plans = _plans(_glm53_groups())
+    assert [p.group_index for p in plans] == [0, 1]
+    assert [p.table_layer_offset for p in plans] == [0, 78]
+    assert [p.num_layers for p in plans] == [78, 78]
+
+
+@pytest.mark.unit
+@pytest.mark.skipif(not ans_utils.AVAILABLE,
+                    reason="extension not built with nvcomp")
+def test_accept_is_the_same_fact_as_the_selection(monkeypatch):
+    """The engine's accept and the worker's binding must not be two decisions.
+
+    The strategy no longer re-derives which groups to compress; the factory
+    resolves ``select_nvcomp_groups`` once and injects the result. This pins
+    the other half of that: the engine accepts exactly when that same call
+    finds something to do. If the two ever drift, the engine would enable
+    nvcomp for a worker that then binds nothing -- or binds a group the engine
+    never checked.
+    """
+    cases = [
+        _glm53_groups(),                       # both usable
+        _glm53_groups(dtype=torch.float32),    # only group 1
+        _glm53_groups(head_size=8),            # only group 1, via the floor
+        [_Group(dtype=torch.float32),
+         _Group(dtype=torch.float64, head_size=8448)],   # none
+    ]
+    for groups in cases:
+        accepted = _enable(monkeypatch, model_config=_ModelConfig(groups))
+        assert accepted is bool(_plans(groups)), groups
+
+
+@pytest.mark.unit
+def test_table_rows_never_overlap():
+    """The invariant the whole multi-group design rests on.
+
+    Two groups sharing a row would silently decompress at each other's
+    lengths. Checked over every group, not just the selected ones, because the
+    table is sized and offset for all of them so a later selection change does
+    not need a reallocation.
+    """
+    groups = _glm53_groups()
+    groups.append(_Group(num_layers=12, head_size=576))
+    offsets = ans_utils.group_table_layer_offsets(groups)
+    spans = [range(o, o + g.num_layers) for o, g in zip(offsets, groups)]
+    seen = set()
+    for span in spans:
+        assert not (seen & set(span)), "layer-group table rows overlap"
+        seen |= set(span)
+    assert max(seen) + 1 == sum(g.num_layers for g in groups)
+
+
+@pytest.mark.unit
+def test_env_can_narrow_to_one_group():
+    """``FLEXKV_NVCOMP_GROUPS=0`` restores the old single-group behaviour."""
+    plans = _plans(_glm53_groups(), env="0")
+    assert [p.group_index for p in plans] == [0]
+    assert plans[0].table_layer_offset == 0
+
+
+@pytest.mark.unit
+def test_env_can_name_several_groups():
+    plans = _plans(_glm53_groups(), env="0,1")
+    assert [p.group_index for p in plans] == [0, 1]
+
+
+@pytest.mark.unit
+@pytest.mark.skipif(not ans_utils.AVAILABLE,
+                    reason="extension not built with nvcomp")
+def test_env_none_disables(monkeypatch, flexkv_log):
+    """``none`` is a kill switch, so it has to reach the engine's decision.
+
+    Asserted through ``check_engine_nvcomp_enable`` rather than
+    ``select_nvcomp_groups`` because that is the call whose False keeps a
+    worker from ever binding a strategy.
+    """
+    monkeypatch.setenv(ans_utils.NVCOMP_GROUPS_ENV, "none")
+    assert _enable(monkeypatch,
+                   model_config=_ModelConfig(_glm53_groups())) is False
+    assert "selects no layer groups" in flexkv_log.text
+
+
+@pytest.mark.unit
+def test_env_is_read_when_not_passed(monkeypatch):
+    """The env is the live knob; ``env=`` exists only so tests need not set it."""
+    monkeypatch.setenv(ans_utils.NVCOMP_GROUPS_ENV, "1")
+    plans = ans_utils.select_nvcomp_groups(
+        _glm53_groups(), tokens_per_block=64, default_dtype=torch.bfloat16)
+    assert [p.group_index for p in plans] == [1]
+    assert plans[0].table_layer_offset == 78
+
+
+@pytest.mark.unit
+def test_env_naming_an_ineligible_group_declines(flexkv_log):
+    """Asked for a group ANS cannot take -> decline, do not silently narrow.
+
+    Quietly dropping it would leave an operator believing a measurement
+    covered a group it never touched, which is the failure mode this whole
+    selection path exists to make impossible.
+    """
+    groups = _glm53_groups(dtype=torch.float32)
+    assert _plans(groups, env="0") == []
+    assert "names group(s) ANS cannot compress" in flexkv_log.text
+
+
+@pytest.mark.unit
+def test_env_out_of_range_declines(flexkv_log):
+    assert _plans(_glm53_groups(), env="5") == []
+    assert "out of range" in flexkv_log.text
+
+
+@pytest.mark.unit
+def test_env_garbage_declines(flexkv_log):
+    assert _plans(_glm53_groups(), env="latent") == []
+    assert "not an integer" in flexkv_log.text
 
 
 @pytest.mark.unit
@@ -282,113 +425,100 @@ def test_glm53_shape_is_accepted(monkeypatch, flexkv_log):
 def test_three_groups_are_accepted(monkeypatch, flexkv_log):
     """Two groups is GLM-5.3's shape, not the supported limit.
 
-    What matters is that exactly one group is compressed, whatever the total
-    -- DSv4 registers more than two.
+    DSv4 registers more than two, and all three here are addressable, so all
+    three are taken.
     """
     groups = _glm53_groups()
     groups.append(_Group(head_size=8448, dtype=torch.float8_e4m3fn,
                          compress_ratio=4))
     assert _enable(monkeypatch, model_config=_ModelConfig(groups)) is True
-    assert "2 other group(s) transfer uncompressed" in flexkv_log.text
+    assert "0 other group(s) transfer uncompressed" in flexkv_log.text
+    assert [p.group_index for p in _plans(groups)] == [0, 1, 2]
 
 
 @pytest.mark.unit
 @pytest.mark.skipif(not ans_utils.AVAILABLE,
                     reason="extension not built with nvcomp")
-def test_compressed_group_is_the_first_one(monkeypatch):
-    """The accept path inspects group 0, not "whichever group happens to fit".
+def test_ineligible_group_is_dropped_not_fatal(monkeypatch, flexkv_log):
+    """One unusable group no longer costs the whole model its compression.
 
-    Pinned because the worker-side strategy binds ``COMPRESSED_GROUP_INDEX``
-    independently. If this check ever started scanning for a compressible
-    group while the strategy kept taking group 0, a model whose group 0 was
-    unsupported would be accepted here and then compressed there -- with the
-    engine having no way to know.
+    Under the old single-group rule a broken group 0 declined nvcomp outright
+    even when group 1 was perfectly compressible. Now the usable group is
+    taken and the other is reported as skipped -- which is the *only* reason
+    it is safe for the strategy to bind more than one group.
     """
-    groups = _glm53_groups(dtype=torch.float32)
-    # Group 1 is untouched and looks perfectly compressible; only group 0 is
-    # broken. A scanning implementation would return True here.
-    groups[1] = _Group(dtype=torch.bfloat16, compress_ratio=1)
+    groups = _glm53_groups(dtype=torch.float32)  # group 0 unusable
+    assert _enable(monkeypatch, model_config=_ModelConfig(groups)) is True
+    assert [p.group_index for p in _plans(groups)] == [1]
+    assert "transfers uncompressed" in flexkv_log.text
+    assert "1 other group(s) transfer uncompressed" in flexkv_log.text
+
+
+@pytest.mark.unit
+@pytest.mark.skipif(not ans_utils.AVAILABLE,
+                    reason="extension not built with nvcomp")
+def test_all_groups_unsupported_falls_back(monkeypatch, flexkv_log):
+    """Nothing left to compress is the one case that still declines."""
+    groups = [_Group(dtype=torch.float32),
+              _Group(dtype=torch.float64, head_size=8448)]
     assert _enable(monkeypatch, model_config=_ModelConfig(groups)) is False
+    assert "no layer group can be compressed" in flexkv_log.text
 
 
 @pytest.mark.unit
-@pytest.mark.skipif(not ans_utils.AVAILABLE,
-                    reason="extension not built with nvcomp")
-def test_unsupported_group_dtype_falls_back(monkeypatch, flexkv_log):
-    result = _enable(
-        monkeypatch,
-        model_config=_ModelConfig(_glm53_groups(dtype=torch.float32)))
-    assert result is False
-    assert "[nvcomp-fallback]" in flexkv_log.text
-    assert "does not support" in flexkv_log.text
-
-
-@pytest.mark.unit
-@pytest.mark.skipif(not ans_utils.AVAILABLE,
-                    reason="extension not built with nvcomp")
-def test_group_dtype_falls_back_to_model_dtype(monkeypatch):
+def test_group_dtype_falls_back_to_model_dtype():
     """``LayerGroupSpec.dtype`` is None until resolved; inherit, don't refuse.
 
     Both directions are checked, so that reading the model dtype cannot be
-    mistaken for ignoring the field.
+    mistaken for ignoring the field. Group 1 keeps its own fp8, so the
+    unsupported case is asserted on group 0's selection rather than on the
+    model being declined outright.
     """
     groups = _glm53_groups(dtype=None)
-    assert _enable(monkeypatch,
-                   model_config=_ModelConfig(groups,
-                                             dtype=torch.bfloat16)) is True
-    assert _enable(monkeypatch,
-                   model_config=_ModelConfig(groups,
-                                             dtype=torch.float32)) is False
+    assert 0 in [p.group_index for p in
+                 _plans(groups, default_dtype=torch.bfloat16)]
+    assert 0 not in [p.group_index for p in
+                     _plans(groups, default_dtype=torch.float32)]
 
 
 @pytest.mark.unit
-@pytest.mark.skipif(not ans_utils.AVAILABLE,
-                    reason="extension not built with nvcomp")
-def test_compressed_group_with_compress_ratio_falls_back(monkeypatch,
-                                                         flexkv_log):
-    """A token-compressed leading group would disagree with the table stride."""
-    result = _enable(
-        monkeypatch,
-        model_config=_ModelConfig(_glm53_groups(compress_ratio=64)))
-    assert result is False
-    assert "compress_ratio" in flexkv_log.text
+def test_compress_ratio_no_longer_excludes_a_group():
+    """A token-compressed group is compressible now that rows are per-group.
 
-
-@pytest.mark.unit
-@pytest.mark.skipif(not ans_utils.AVAILABLE,
-                    reason="extension not built with nvcomp")
-def test_group_layer_count_must_match_cpu_table(monkeypatch, flexkv_log):
-    """Group 0 spanning fewer layers than the CPU layout is declined here.
-
-    The strategy raises on the same mismatch, but it runs inside a spawned
-    worker where raising hangs the engine on a ``ready`` that never comes --
-    the exact failure this guard function exists to avoid. So the declared
-    shape has to be rejected in-process first; the worker-side raise stays as
-    a backstop against the realized post-TP geometry.
+    It used to be refused because its chunk disagreed with a table stride
+    shared across groups. With each group owning its own rows, the only thing
+    compress_ratio changes is the chunk size -- which is checked on its own.
     """
-    result = _enable(
-        monkeypatch,
-        cpu_handle=_Handle(num_layer=78),
-        model_config=_ModelConfig(_glm53_groups(num_layers=40)))
-    assert result is False
-    assert "out of step" in flexkv_log.text
+    plans = _plans(_glm53_groups(compress_ratio=2, head_size=576))
+    assert 0 in [p.group_index for p in plans]
 
 
 @pytest.mark.unit
-@pytest.mark.skipif(not ans_utils.AVAILABLE,
-                    reason="extension not built with nvcomp")
-def test_small_group_chunk_falls_back(monkeypatch, flexkv_log):
+def test_group_layer_count_no_longer_has_to_match_cpu_table():
+    """A group narrower than the PP stage gets its own rows, not a refusal.
+
+    The old rule required group 0 to span every layer, because the table had
+    one layer dimension sized from the CPU layout. The table is now sized from
+    the summed group layer counts, so a 40-layer group simply occupies 40 rows.
+    """
+    groups = _glm53_groups(num_layers=40)
+    plans = _plans(groups)
+    assert [(p.group_index, p.table_layer_offset, p.num_layers)
+            for p in plans] == [(0, 0, 40), (1, 40, 78)]
+
+
+@pytest.mark.unit
+def test_small_group_chunk_is_dropped(flexkv_log):
     """The group's own chunk is checked, not just the GPU handles'.
 
     The handle-level ``min(chunk_sizes)`` guard reads the primary layout,
-    which on a multi-group model need not be the group being compressed, so a
+    which on a multi-group model need not be a group being compressed, so a
     latent group below the ANS floor could otherwise slip past it.
     ``_gpu_groups()`` is left at its healthy 73728 B here precisely so this
     cell can only pass via the per-group check.
     """
-    result = _enable(monkeypatch,
-                     model_config=_ModelConfig(_glm53_groups(head_size=8)))
-    assert result is False
+    groups = _glm53_groups(head_size=8)  # 64 * 1 * 8 * 2 = 1024 B
+    assert [p.group_index for p in _plans(groups)] == [1]
     assert f"{ans_utils.MIN_CHUNK_BYTES}B ANS minimum" in flexkv_log.text
 
 
