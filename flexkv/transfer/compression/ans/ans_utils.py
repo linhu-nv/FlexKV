@@ -28,6 +28,10 @@ MIN_CHUNK_BYTES = 4096
 RATIO_PLATEAU_BYTES = 16 * 1024
 SSD_PACKED_IO_ALIGN = 512
 
+# On a multi-group (heterogeneous KV) model, only this group is compressed;
+# every other group transfers uncompressed. See ``check_multi_group_nvcomp``.
+COMPRESSED_GROUP_INDEX = 0
+
 
 def check_dtype(dtype) -> None:
     if dtype not in SUPPORTED_DTYPES:
@@ -54,6 +58,7 @@ def check_engine_nvcomp_enable(
     layerwise_enabled: bool,
     cpu_handle: Optional[Any],
     model_config: Optional[Any] = None,
+    ssd_handle: Optional[Any] = None,
 ) -> bool:
     """Engine-level enable/fallback policy for nvcomp ANS."""
     if os.environ.get("FLEXKV_ENABLE_NVCOMP", "0") != "1":
@@ -81,11 +86,10 @@ def check_engine_nvcomp_enable(
             "disabling nvcomp.")
         return False
 
-    # TODO(nvcomp-guard): heterogeneous (multi-group) KV is not supported yet.
-    # Such a model splits its layers into groups with different geometry -- on
-    # a DSA model (DeepSeek-V4, GLM-5.3-Flash) group 0 is the MLA latent and
-    # group 1 the indexer -- and those per-group transfers take a path that
-    # never reaches the compressor.
+    # Heterogeneous (multi-group) KV: a DSA model (DeepSeek-V4, GLM-5.3) splits
+    # its layers into groups with different geometry -- group 0 is the MLA
+    # latent, group 1 the indexer. Only group 0 is compressed; see
+    # ``check_multi_group_nvcomp`` for why, and for the per-group checks.
     #
     # This has to be decided here rather than in the strategy, which is where
     # the refusal used to live: by the time a strategy attaches it is already
@@ -95,12 +99,14 @@ def check_engine_nvcomp_enable(
     # other guard in this function. `layer_groups` is the same condition the
     # worker keys on -- it is what makes `tp_group_transfer_groups` non-None.
     layer_groups = getattr(model_config, "layer_groups", None)
-    if layer_groups:
-        flexkv_logger.warning(
-            "[nvcomp-fallback] FLEXKV_ENABLE_NVCOMP=1 but this model has "
-            f"{len(layer_groups)} heterogeneous KV layer groups, whose "
-            "per-group transfers bypass the ANS compressor; "
-            "disabling nvcomp.")
+    if layer_groups and not check_multi_group_nvcomp(
+            layer_groups,
+            tokens_per_block=getattr(cpu_handle.kv_layout, "tokens_per_block",
+                                     None) if cpu_handle is not None else None,
+            default_dtype=getattr(model_config, "dtype", None),
+            cpu_num_layers=getattr(cpu_handle.kv_layout, "num_layer", None)
+            if cpu_handle is not None else None,
+            has_ssd=ssd_handle is not None):
         return False
 
     # TODO(nvcomp-guard): layerwise transfer is not supported yet
@@ -138,6 +144,105 @@ def check_engine_nvcomp_enable(
             "Disabling nvcomp for GPU<->CPU and CPU<->SSD so all "
             "paths use uncompressed transfers consistently.")
         return False
+    return True
+
+
+def check_multi_group_nvcomp(
+    layer_groups: List[Any],
+    *,
+    tokens_per_block: Optional[int],
+    default_dtype: Optional[torch.dtype],
+    cpu_num_layers: Optional[int] = None,
+    has_ssd: bool = False,
+) -> bool:
+    """Whether nvcomp can run on a heterogeneous-KV model, compressing group 0.
+
+    Only ``COMPRESSED_GROUP_INDEX`` is compressed; the other groups move
+    uncompressed on the ordinary per-group path. That asymmetry is deliberate,
+    not a staging point:
+
+    * On a DSA model group 0 is the MLA latent -- the large, bf16, entropy-rich
+      group nvcomp was sized for (GLM-5.3: 73728 B/chunk, DeepSeek-V4 the same
+      family) and ~90% of the bytes. Group 1 is the indexer, whose payload is
+      *already quantized* fp8 index-k; ANS over quantized data buys little,
+      while each additional compressed group costs a size-table dimension the
+      table does not currently have.
+    * Both groups' local layer ids start at 0, so two compressed groups would
+      alias in the ``[blocks, layers, kv]`` size table and overwrite each
+      other's lengths -- a silent wrong-length decompress. Compressing exactly
+      one group sidesteps that: group 0's ``num_layers`` *is* the CPU layout's
+      ``num_layer``, so the existing table already addresses it correctly with
+      no offsetting.
+
+    Requiring group 0 to span the whole PP stage is what makes that last claim
+    true, so it is checked rather than assumed.
+    """
+    # The SSD tier cannot carry a compressed CPU block on this layout.
+    # CPUSSDDiskTransferWorker moves a multi-group block as one opaque blob
+    # (``_init_multi_group_ssd``: CPU and SSD share a byte-identical BLOCKFIRST
+    # block, so there is no per-chunk addressing to hang a table off), which
+    # means the compressed *lengths* never travel with the bytes. The uniform
+    # path avoids this by packing through NvcompCpuSsdStrategy, which keeps
+    # ssd_size_table[s] alongside and restores cpu_size_table[c'] on DISK2H.
+    # Blob-copying instead would restore a CPU block into a slot whose table
+    # row still holds some earlier block's lengths -- decompressed at the wrong
+    # length, with no error. Decline rather than half-support it.
+    if has_ssd:
+        flexkv_logger.warning(
+            "[nvcomp-fallback] multi-group KV with an SSD tier: CPU<->SSD "
+            "moves these blocks as opaque blobs and cannot carry the "
+            "compressed-size table, so a DISK2H restore would decompress at a "
+            "stale length. Disabling nvcomp.")
+        return False
+
+    group = layer_groups[COMPRESSED_GROUP_INDEX]
+
+    dtype = getattr(group, "dtype", None) or default_dtype
+    if dtype not in SUPPORTED_DTYPES:
+        flexkv_logger.warning(
+            f"[nvcomp-fallback] multi-group KV: group {COMPRESSED_GROUP_INDEX} "
+            f"has dtype {dtype}, which ANS does not support; disabling nvcomp.")
+        return False
+
+    # Group 0 must cover the full PP stage for the size table to be addressed
+    # without a per-group offset: the table's layer dimension is sized from the
+    # CPU layout's num_layer, and the kernel walks local layer ids 0..n-1. The
+    # strategy re-checks this in the worker against the *realized* geometry,
+    # but a raise there kills a spawned process and hangs the engine on a
+    # `ready` that never comes, so the declared shape is checked here first.
+    if (cpu_num_layers is not None
+            and group.num_layers != cpu_num_layers):
+        flexkv_logger.warning(
+            f"[nvcomp-fallback] multi-group KV: group {COMPRESSED_GROUP_INDEX} "
+            f"covers {group.num_layers} layers but the CPU size table is sized "
+            f"for {cpu_num_layers}; compressing it would index the table out "
+            "of step. Disabling nvcomp.")
+        return False
+
+    # compress_ratio shrinks the token dimension, which would make this group's
+    # chunk disagree with the table's stride.
+    if getattr(group, "compress_ratio", 1) != 1:
+        flexkv_logger.warning(
+            f"[nvcomp-fallback] multi-group KV: group {COMPRESSED_GROUP_INDEX} "
+            f"has compress_ratio={group.compress_ratio}; nvcomp only handles "
+            "an uncompressed leading group. Disabling nvcomp.")
+        return False
+
+    if tokens_per_block is not None:
+        chunk = (tokens_per_block * group.num_kv_heads * group.head_size
+                 * dtype.itemsize)
+        if chunk < MIN_CHUNK_BYTES:
+            flexkv_logger.warning(
+                f"[nvcomp-fallback] multi-group KV: group "
+                f"{COMPRESSED_GROUP_INDEX} chunk={chunk}B is below the "
+                f"{MIN_CHUNK_BYTES}B ANS minimum; disabling nvcomp.")
+            return False
+
+    skipped = len(layer_groups) - 1
+    flexkv_logger.info(
+        f"[nvcomp-multi-group] compressing layer group "
+        f"{COMPRESSED_GROUP_INDEX} ({group.num_layers} layers, dtype={dtype}); "
+        f"{skipped} other group(s) transfer uncompressed.")
     return True
 
 

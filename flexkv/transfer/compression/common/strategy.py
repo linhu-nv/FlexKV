@@ -17,6 +17,20 @@ class CompressionStrategy(ABC):
     # a strategy that needs it has to say so before ``attach`` runs.
     needs_gpu_cpu_thread_group: bool = False
 
+    def compressed_group_index(self) -> "int | None":
+        """Which layer group of a multi-group worker this strategy moves.
+
+        ``None`` -- the default, and what every uniform-KV strategy returns --
+        means the worker transfers all of its groups itself. A strategy that
+        returns an ordinal takes that one group and leaves the rest to the
+        worker's ordinary uncompressed path; the two address disjoint regions
+        of the same block, so they may run in either order.
+
+        This is asked rather than assumed so the worker does not have to know
+        which compression backend it was handed.
+        """
+        return None
+
     @abstractmethod
     def attach(self, worker: "TransferWorkerBase") -> None:
         ...

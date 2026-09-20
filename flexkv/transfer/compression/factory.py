@@ -35,6 +35,7 @@ def build_compressors(
         layerwise_enabled=layerwise_enabled,
         cpu_handle=cpu_handle,
         model_config=model_config,
+        ssd_handle=ssd_handle,
     )
     if not enable_nvcomp:
         return _null_compressors()

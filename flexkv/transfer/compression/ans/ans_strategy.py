@@ -45,28 +45,111 @@ class NvcompGpuCpuStrategy(CompressionStrategy):
         self._table_rank_stride = 0
         self._table_block_stride = 0
         self._table_layer_stride = 0
+        # Set on a multi-group worker: the group dict (strides, chunk, layer
+        # count, thread group) for the one compressed group. None on a uniform
+        # worker, where those numbers live on the worker itself.
+        self._group: Optional[Dict[str, Any]] = None
+        self._group_index: Optional[int] = None
+
+    def compressed_group_index(self) -> Optional[int]:
+        """The group ``_attach_multi_group`` bound to, or None if uniform.
+
+        Set in ``attach`` rather than read from ``ans_utils`` on demand, so the
+        worker splits its transfer on the group this instance actually holds
+        strides for.
+        """
+        return self._group_index
+
+    def _geometry(self, worker) -> Dict[str, Any]:
+        """The strides/chunk/layers this transfer compresses over.
+
+        Uniform worker: the worker's own scalars, published by
+        ``_init_uniform(expose_on_self=True)``. Multi-group worker: the
+        compressed group's entry, because those scalars are never set there --
+        a group carries its own base offset and stride set.
+        """
+        if self._group is None:
+            return {
+                'thread_group': worker.tp_transfer_thread_group,
+                'cpu_kv_stride': worker.cpu_kv_stride_in_bytes,
+                'cpu_layer_stride': worker.cpu_layer_stride_in_bytes,
+                'cpu_block_stride': worker.cpu_block_stride_in_bytes,
+                'cpu_tp_stride': worker.cpu_tp_stride_in_bytes,
+                'num_layers': worker.num_layers,
+                'chunk_size': worker.chunk_size_in_bytes,
+            }
+        g = self._group
+        return {
+            'thread_group': g['tp_thread_group'],
+            'cpu_kv_stride': g['cpu_kv_stride'],
+            'cpu_layer_stride': g['cpu_layer_stride'],
+            'cpu_block_stride': g['cpu_block_stride'],
+            'cpu_tp_stride': g['cpu_tp_stride'],
+            'num_layers': g['num_layers'],
+            'chunk_size': g['chunk_size'],
+        }
 
     def attach(self, worker) -> None:
-        if getattr(worker, "tp_group_transfer_groups", None) is not None:
-            # Unreachable in normal operation: `check_engine_nvcomp_enable`
-            # declines multi-group models in the engine process, before any
-            # worker is spawned, so a nvcomp strategy should never reach a
-            # worker that has layer groups. Kept as a backstop for a future
-            # caller that builds a strategy without going through the factory.
-            # Raising here is a poor failure mode -- it kills the worker and
-            # the engine then blocks forever on a `ready` that never comes --
-            # which is exactly why the real guard lives upstream.
+        groups = getattr(worker, "tp_group_transfer_groups", None)
+        if groups is not None:
+            self._attach_multi_group(worker, groups)
+            return
+        self._attach_uniform(worker)
+
+    def _attach_multi_group(self, worker, groups) -> None:
+        """Bind to the one compressed group of a heterogeneous-KV worker.
+
+        The engine already decided this model is compressible -- see
+        ``ans_utils.check_multi_group_nvcomp``, which runs before any worker is
+        spawned. Re-checking the *shape* here is still worth it: this process
+        is the first place the group's realized geometry (after TP sharding and
+        the IPC import) is visible, and a mismatch would otherwise surface as a
+        wrong-length decompress rather than an error.
+        """
+        idx = ans_utils.COMPRESSED_GROUP_INDEX
+        if idx >= len(groups):
             raise RuntimeError(
-                "nvcomp is not supported for multi-group (heterogeneous KV) "
-                "layouts: the per-group transfers bypass the compressor. "
-                "This should have been declined by "
-                "check_engine_nvcomp_enable(); a nvcomp strategy was built "
-                "for a multi-group model without consulting it.")
+                f"nvcomp: compressed group index {idx} is out of range for a "
+                f"worker with {len(groups)} layer groups.")
+        group = groups[idx]
+        # Group 0 spanning the whole PP stage is what lets the existing
+        # [blocks, layers, kv] size table address it with no per-group offset.
+        # check_multi_group_nvcomp asserts the declared shape; this asserts the
+        # realized one, which is the one the kernel will actually stride over.
+        if group['num_layers'] != worker._num_original_layers:
+            raise RuntimeError(
+                f"nvcomp: compressed layer group {idx} covers "
+                f"{group['num_layers']} layers but the CPU size table is sized "
+                f"for {worker._num_original_layers}; compressing it would "
+                "index the table out of step with the uncompressed groups.")
+        self._group = group
+        self._group_index = idx
+        self._bind_table(worker)
+        # The group's own dtype and per-device chunk, not the worker's. A DSA
+        # model pairs a bf16 latent group with an fp8 indexer, so the ANS
+        # symbol type has to come from the group being compressed;
+        # ``worker.dtype`` is the registration-wide dtype and happens to match
+        # group 0 today, which is exactly the kind of coincidence that breaks
+        # silently if COMPRESSED_GROUP_INDEX ever moves. The chunk must be
+        # per-device: ``chunk_size`` is the whole-group chunk the host strides
+        # over, tp_size times what one rank holds.
+        group['tp_thread_group'].init_nvcomp(
+            *ans_utils.tp_worker_config(
+                gpu_chunk_sizes_in_bytes=group['gpu_chunk_sizes'],
+                dtype=group['dtype'],
+                tp_size=worker.num_gpus,
+            ))
+
+    def _attach_uniform(self, worker) -> None:
         batch_size, data_type = ans_utils.tp_worker_config(
             gpu_chunk_sizes_in_bytes=worker.gpu_chunk_sizes_in_bytes,
             dtype=worker.dtype,
             tp_size=worker.num_gpus,
         )
+        self._bind_table(worker)
+        worker.tp_transfer_thread_group.init_nvcomp(batch_size, data_type)
+
+    def _bind_table(self, worker) -> None:
         # A 4-D per-rank table is required exactly when the ranks hold
         # different bytes: head-sharded KV spread over more than one GPU.
         needs_rank_stride = worker.num_kv_heads > 1 and worker.num_gpus > 1
@@ -82,16 +165,20 @@ class NvcompGpuCpuStrategy(CompressionStrategy):
             raise RuntimeError(
                 "GPUCPUTransferWorker: nvcomp is enabled but "
                 "cpu_size_table was not supplied.")
-        worker.tp_transfer_thread_group.init_nvcomp(batch_size, data_type)
 
     def run(self, worker, op, src_block_ids, dst_block_ids) -> None:
+        geom = self._geometry(worker)
         start_time = time.time()
         compressed_bytes = self._dispatch(
-            worker, src_block_ids, dst_block_ids, op.transfer_type)
+            worker, src_block_ids, dst_block_ids, op.transfer_type, geom)
         end_time = time.time()
+        # Only the compressed group's bytes. On a multi-group worker the other
+        # groups moved separately, on the uncompressed path, and reported their
+        # own sizes -- folding them in here would understate the ratio for the
+        # group that was actually compressed.
         uncomp_size = (
-            worker.chunk_size_in_bytes
-            * worker.num_layers
+            geom['chunk_size']
+            * geom['num_layers']
             * op.valid_block_num
             * worker.kv_dim
         )
@@ -99,7 +186,8 @@ class NvcompGpuCpuStrategy(CompressionStrategy):
             op, int(compressed_bytes), start_time, end_time,
             uncompressed_size=uncomp_size)
 
-    def _dispatch(self, worker, src_block_ids, dst_block_ids, transfer_type) -> int:
+    def _dispatch(self, worker, src_block_ids, dst_block_ids, transfer_type,
+                  geom) -> int:
         assert src_block_ids.dtype == torch.int64
         assert dst_block_ids.dtype == torch.int64
         assert len(src_block_ids) == len(dst_block_ids)
@@ -131,17 +219,17 @@ class NvcompGpuCpuStrategy(CompressionStrategy):
             # and comes up one short -- a TypeError before any byte moves.  The
             # unit tests are the only other caller and they pass it; this is
             # the live TP+nvcomp path.
-            return int(worker.tp_transfer_thread_group.tp_group_transfer_ans(
+            return int(geom['thread_group'].tp_group_transfer_ans(
                 gpu_block_id_list, cpu_block_id_list,
-                cpu_kv_stride_in_bytes=worker.cpu_kv_stride_in_bytes,
-                cpu_layer_stride_in_bytes=worker.cpu_layer_stride_in_bytes,
-                cpu_block_stride_in_bytes=worker.cpu_block_stride_in_bytes,
-                cpu_tp_stride_in_bytes=worker.cpu_tp_stride_in_bytes,
+                cpu_kv_stride_in_bytes=geom['cpu_kv_stride'],
+                cpu_layer_stride_in_bytes=geom['cpu_layer_stride'],
+                cpu_block_stride_in_bytes=geom['cpu_block_stride'],
+                cpu_tp_stride_in_bytes=geom['cpu_tp_stride'],
                 transfer_num_cta=transfer_num_cta,
                 is_host_to_device=transfer_type == TransferType.H2D,
                 use_ce_transfer=use_ce_transfer,
                 layer_id=0,
-                layer_granularity=worker.num_layers,
+                layer_granularity=geom['num_layers'],
                 kv_dim=worker.kv_dim,
                 num_kv_heads=worker.num_kv_heads,
                 cpu_size_table_tp_ptr=self._table_ptr,
