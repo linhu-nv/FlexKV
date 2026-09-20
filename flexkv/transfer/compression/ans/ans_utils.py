@@ -53,6 +53,7 @@ def check_engine_nvcomp_enable(
     *,
     layerwise_enabled: bool,
     cpu_handle: Optional[Any],
+    model_config: Optional[Any] = None,
 ) -> bool:
     """Engine-level enable/fallback policy for nvcomp ANS."""
     if os.environ.get("FLEXKV_ENABLE_NVCOMP", "0") != "1":
@@ -77,6 +78,28 @@ def check_engine_nvcomp_enable(
         flexkv_logger.warning(
             "[nvcomp-fallback] FLEXKV_ENABLE_NVCOMP=1 but the KV cache uses "
             "the packed 4D layout, which the ANS kernels cannot address yet; "
+            "disabling nvcomp.")
+        return False
+
+    # TODO(nvcomp-guard): heterogeneous (multi-group) KV is not supported yet.
+    # Such a model splits its layers into groups with different geometry -- on
+    # a DSA model (DeepSeek-V4, GLM-5.3-Flash) group 0 is the MLA latent and
+    # group 1 the indexer -- and those per-group transfers take a path that
+    # never reaches the compressor.
+    #
+    # This has to be decided here rather than in the strategy, which is where
+    # the refusal used to live: by the time a strategy attaches it is already
+    # inside a spawned worker process, so raising there kills the worker and
+    # the engine waits on a `ready` that can never arrive. Declining at the
+    # engine level degrades to uncompressed transfers instead, matching every
+    # other guard in this function. `layer_groups` is the same condition the
+    # worker keys on -- it is what makes `tp_group_transfer_groups` non-None.
+    layer_groups = getattr(model_config, "layer_groups", None)
+    if layer_groups:
+        flexkv_logger.warning(
+            "[nvcomp-fallback] FLEXKV_ENABLE_NVCOMP=1 but this model has "
+            f"{len(layer_groups)} heterogeneous KV layer groups, whose "
+            "per-group transfers bypass the ANS compressor; "
             "disabling nvcomp.")
         return False
 

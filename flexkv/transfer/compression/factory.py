@@ -34,6 +34,7 @@ def build_compressors(
         gpu_handle_groups,
         layerwise_enabled=layerwise_enabled,
         cpu_handle=cpu_handle,
+        model_config=model_config,
     )
     if not enable_nvcomp:
         return _null_compressors()

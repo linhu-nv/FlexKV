@@ -48,9 +48,20 @@ class NvcompGpuCpuStrategy(CompressionStrategy):
 
     def attach(self, worker) -> None:
         if getattr(worker, "tp_group_transfer_groups", None) is not None:
+            # Unreachable in normal operation: `check_engine_nvcomp_enable`
+            # declines multi-group models in the engine process, before any
+            # worker is spawned, so a nvcomp strategy should never reach a
+            # worker that has layer groups. Kept as a backstop for a future
+            # caller that builds a strategy without going through the factory.
+            # Raising here is a poor failure mode -- it kills the worker and
+            # the engine then blocks forever on a `ready` that never comes --
+            # which is exactly why the real guard lives upstream.
             raise RuntimeError(
                 "nvcomp is not supported for multi-group (heterogeneous KV) "
-                "layouts: the per-group transfers bypass the compressor.")
+                "layouts: the per-group transfers bypass the compressor. "
+                "This should have been declined by "
+                "check_engine_nvcomp_enable(); a nvcomp strategy was built "
+                "for a multi-group model without consulting it.")
         batch_size, data_type = ans_utils.tp_worker_config(
             gpu_chunk_sizes_in_bytes=worker.gpu_chunk_sizes_in_bytes,
             dtype=worker.dtype,
