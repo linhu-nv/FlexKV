@@ -127,7 +127,10 @@ def _glm53_groups(**latent_overrides):
 
     Latent chunk = 64 tokens * 1 head * (512 + 64) * 2 B = 73728 B; the indexer
     is page-packed at compress_ratio=64, giving 1 * 1 * 8448 * 1 B = 8448 B --
-    both above the ANS floor, so on ``auto`` both are selected.
+    both above the ANS floor, so the kernels can address both. ``auto`` still
+    takes only the latent: the indexer is already quantized, and compressing
+    it overflowed the CPU chunk slot on every store of a live GLM-5.3 run.
+    Pass ``env="all"`` to get both.
     """
     latent = dict(num_layers=78, num_kv_heads=1, head_size=576,
                   dtype=torch.bfloat16, compress_ratio=1)
@@ -292,21 +295,63 @@ def test_glm53_shape_is_accepted(monkeypatch, flexkv_log):
     # on" reads very differently from "nvcomp is on for 90% of the bytes" to
     # someone looking at a ratio in the logs.
     assert "[nvcomp-multi-group]" in flexkv_log.text
-    assert "0 other group(s) transfer uncompressed" in flexkv_log.text
+    assert "1 other group(s) transfer uncompressed" in flexkv_log.text
 
 
 @pytest.mark.unit
-def test_glm53_auto_selects_both_groups():
-    """Both of GLM-5.3's groups clear the ANS floor, so ``auto`` takes both.
+def test_glm53_all_selects_both_groups():
+    """Both of GLM-5.3's groups are addressable, so ``all`` takes both.
 
-    This is the behaviour change: the indexer used to be excluded by fiat.
-    Pinned as ordinals *and* table rows, because the row assignment is what
-    keeps two compressed groups from overwriting each other's lengths.
+    This is the behaviour change: the indexer used to be excluded by fiat and
+    could not be requested at all. Pinned as ordinals *and* table rows,
+    because the row assignment is what keeps two compressed groups from
+    overwriting each other's lengths.
     """
-    plans = _plans(_glm53_groups())
+    plans = _plans(_glm53_groups(), env="all")
     assert [p.group_index for p in plans] == [0, 1]
     assert [p.table_layer_offset for p in plans] == [0, 78]
     assert [p.num_layers for p in plans] == [78, 78]
+
+
+@pytest.mark.unit
+def test_auto_skips_a_quantized_group_that_all_takes():
+    """The heuristic that keeps GLM-5.3 working, and its override.
+
+    Regression for a live defect: ``auto`` took the uint8 DSA indexer, ANS
+    inflated it past the CPU chunk slot, and *every* D2H store failed with
+    "compressed payload exceeded the CPU chunk slot" -- failing the transfer
+    graph and the request, so the cache never held anything. Both halves are
+    pinned here because the skip is only defensible if it stays overridable.
+    """
+    groups = _glm53_groups()
+    assert [p.group_index for p in _plans(groups)] == [0]
+    assert [p.group_index for p in _plans(groups, env="all")] == [0, 1]
+    assert [p.group_index for p in _plans(groups, env="1")] == [1]
+
+
+@pytest.mark.unit
+def test_auto_skip_names_the_dtype(flexkv_log):
+    """A group silently missing from a ratio is the thing to avoid.
+
+    The log has to say *which* group and *why*, because "nvcomp is on" and
+    "nvcomp is on for one of two groups" look identical otherwise.
+    """
+    _plans(_glm53_groups())
+    assert "layer group 1 transfers uncompressed" in flexkv_log.text
+    assert "already quantized" in flexkv_log.text
+
+
+@pytest.mark.unit
+def test_all_still_drops_an_unaddressable_group(flexkv_log):
+    """``all`` overrides the headroom heuristic, not the kernel's reach.
+
+    An explicit ordinal declines nvcomp outright when the group is
+    unaddressable; ``all`` is a bulk request, so it drops that group the way
+    ``auto`` does instead of turning compression off for the whole model.
+    """
+    groups = _glm53_groups(dtype=torch.float32)  # group 0 unaddressable
+    assert [p.group_index for p in _plans(groups, env="all")] == [1]
+    assert [p.group_index for p in _plans(groups, env="0")] == []
 
 
 @pytest.mark.unit
@@ -323,11 +368,12 @@ def test_accept_is_the_same_fact_as_the_selection(monkeypatch):
     never checked.
     """
     cases = [
-        _glm53_groups(),                       # both usable
-        _glm53_groups(dtype=torch.float32),    # only group 1
-        _glm53_groups(head_size=8),            # only group 1, via the floor
+        _glm53_groups(),                       # group 0 only, under auto
+        _glm53_groups(dtype=torch.float32),    # none: 0 unaddressable, 1 quantized
+        _glm53_groups(head_size=8),            # none: 0 under the floor
         [_Group(dtype=torch.float32),
          _Group(dtype=torch.float64, head_size=8448)],   # none
+        [_Group(), _Group(head_size=8448)],    # both, neither quantized
     ]
     for groups in cases:
         accepted = _enable(monkeypatch, model_config=_ModelConfig(groups))
@@ -428,12 +474,13 @@ def test_three_groups_are_accepted(monkeypatch, flexkv_log):
     DSv4 registers more than two, and all three here are addressable, so all
     three are taken.
     """
+    monkeypatch.setenv(ans_utils.NVCOMP_GROUPS_ENV, "all")
     groups = _glm53_groups()
     groups.append(_Group(head_size=8448, dtype=torch.float8_e4m3fn,
                          compress_ratio=4))
     assert _enable(monkeypatch, model_config=_ModelConfig(groups)) is True
     assert "0 other group(s) transfer uncompressed" in flexkv_log.text
-    assert [p.group_index for p in _plans(groups)] == [0, 1, 2]
+    assert [p.group_index for p in _plans(groups, env="all")] == [0, 1, 2]
 
 
 @pytest.mark.unit
@@ -447,7 +494,10 @@ def test_ineligible_group_is_dropped_not_fatal(monkeypatch, flexkv_log):
     taken and the other is reported as skipped -- which is the *only* reason
     it is safe for the strategy to bind more than one group.
     """
-    groups = _glm53_groups(dtype=torch.float32)  # group 0 unusable
+    # Group 1 is bf16 here rather than GLM-5.3's fp8 indexer, so that what
+    # survives is a group ``auto`` genuinely wants -- otherwise the cell would
+    # pass on the headroom heuristic instead of the drop it is about.
+    groups = [_Group(dtype=torch.float32), _Group(head_size=8448)]
     assert _enable(monkeypatch, model_config=_ModelConfig(groups)) is True
     assert [p.group_index for p in _plans(groups)] == [1]
     assert "transfers uncompressed" in flexkv_log.text
@@ -502,7 +552,7 @@ def test_group_layer_count_no_longer_has_to_match_cpu_table():
     the summed group layer counts, so a 40-layer group simply occupies 40 rows.
     """
     groups = _glm53_groups(num_layers=40)
-    plans = _plans(groups)
+    plans = _plans(groups, env="all")
     assert [(p.group_index, p.table_layer_offset, p.num_layers)
             for p in plans] == [(0, 0, 40), (1, 40, 78)]
 
@@ -518,7 +568,10 @@ def test_small_group_chunk_is_dropped(flexkv_log):
     cell can only pass via the per-group check.
     """
     groups = _glm53_groups(head_size=8)  # 64 * 1 * 8 * 2 = 1024 B
-    assert [p.group_index for p in _plans(groups)] == [1]
+    # ``all`` so the surviving group is decided by the floor alone; under
+    # ``auto`` group 1 would also drop, on headroom, and the cell would pass
+    # without the chunk check ever running.
+    assert [p.group_index for p in _plans(groups, env="all")] == [1]
     assert f"{ans_utils.MIN_CHUNK_BYTES}B ANS minimum" in flexkv_log.text
 
 

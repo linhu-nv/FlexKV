@@ -29,8 +29,9 @@ RATIO_PLATEAU_BYTES = 16 * 1024
 SSD_PACKED_IO_ALIGN = 512
 
 # Which layer groups of a heterogeneous-KV model ANS compresses.
-#   "auto" (default) -- every group that passes
-#                       ``group_nvcomp_ineligible_reason``
+#   "auto" (default) -- every group the kernels can address AND that ANS has
+#                       headroom to shrink; see ``select_nvcomp_groups``
+#   "all"            -- every addressable group, headroom or not
 #   "0" / "0,1"      -- exactly those ordinals; a named group that is
 #                       ineligible is an error, not a silent drop
 #   "none"           -- nothing, which disables nvcomp
@@ -38,8 +39,27 @@ SSD_PACKED_IO_ALIGN = 512
 # strategy; it is never re-read inside a worker. See ``select_nvcomp_groups``.
 NVCOMP_GROUPS_ENV = "FLEXKV_NVCOMP_GROUPS"
 
+# Element types ANS can address but has no headroom on: already-quantized KV
+# is close to maximum entropy, so the compressed chunk routinely comes out
+# LARGER than the slot the CPU tier reserved for it -- which is not a silent
+# corruption but a hard failure ("compressed payload exceeded the CPU chunk
+# slot") that fails the whole transfer graph and the request with it.
+#
+# Measured on GLM-5.3: group 0 (bf16 MLA latent) compresses 1.42x, while
+# group 1 (the uint8 DSA indexer, fp8 scales packed in) overflowed on every
+# single store. So "auto" skips these, and ``FLEXKV_NVCOMP_GROUPS=all`` or an
+# explicit ordinal is how you ask for one anyway.
+LOW_HEADROOM_DTYPES = (
+    torch.float8_e4m3fn, torch.float8_e5m2, torch.uint8,
+)
+
 # Sentinel for "read the env"; ``None`` already means "auto" on the wire.
 _FROM_ENV = object()
+
+# Sentinel for "all": every addressable group, skipping the headroom
+# heuristic. Distinct from an explicit ordinal list, which treats an
+# unaddressable group as a configuration error rather than dropping it.
+_ALL_GROUPS = object()
 
 
 def check_dtype(dtype) -> None:
@@ -180,6 +200,23 @@ def group_table_layer_offsets(layer_groups: Sequence[Any]) -> List[int]:
     return offsets
 
 
+def group_low_headroom_reason(
+    group: Any, *, default_dtype: Optional[torch.dtype],
+) -> Optional[str]:
+    """Why ``auto`` should not pick this group even though ANS can address it.
+
+    Separate from ``group_nvcomp_ineligible_reason`` because the two answer
+    different questions: that one is "would this even run", this one is "is it
+    worth running". Only ``auto`` consults this; an explicitly named group is
+    compressed regardless, which is how you override the heuristic.
+    """
+    dtype = getattr(group, "dtype", None) or default_dtype
+    if dtype in LOW_HEADROOM_DTYPES:
+        return (f"dtype {dtype} is already quantized, so ANS is likely to "
+                "overflow the CPU chunk slot rather than shrink it")
+    return None
+
+
 def group_nvcomp_ineligible_reason(
     group: Any,
     *,
@@ -189,9 +226,9 @@ def group_nvcomp_ineligible_reason(
     """Why ANS cannot compress this layer group, or ``None`` if it can.
 
     Every check here is about whether the *kernels* can address the group, not
-    about whether compressing it is a good idea -- a group that is merely
-    unrewarding (already-quantized fp8, say) is still eligible, and the caller
-    decides via ``FLEXKV_NVCOMP_GROUPS``.
+    about whether compressing it is a good idea. Whether it is worthwhile is
+    ``group_low_headroom_reason``, which only ``auto`` consults -- so an
+    operator naming a group explicitly still gets it.
     """
     dtype = getattr(group, "dtype", None) or default_dtype
     if dtype not in SUPPORTED_DTYPES:
@@ -226,11 +263,22 @@ def group_chunk_bytes(
     return (tokens * group.num_kv_heads * group.head_size * dtype.itemsize)
 
 
-def _parse_groups_env(raw: str, num_groups: int) -> Optional[List[int]]:
-    """``FLEXKV_NVCOMP_GROUPS`` -> requested ordinals, or None for "auto"."""
+def _parse_groups_env(
+    raw: str, num_groups: int,
+) -> Union[None, List[int], object]:
+    """``FLEXKV_NVCOMP_GROUPS`` -> requested ordinals.
+
+    Returns ``None`` for "auto" and the ``_ALL_GROUPS`` sentinel for "all".
+    "all" is not just ``range(num_groups)``: naming an ordinal the kernels
+    cannot address is a configuration error and declines nvcomp, whereas "all"
+    means "every group you can address" and drops the ones you cannot -- it
+    overrides the headroom heuristic, not the addressability check.
+    """
     value = raw.strip().lower()
     if value in ("", "auto"):
         return None
+    if value == "all":
+        return _ALL_GROUPS
     if value == "none":
         return []
     requested: List[int] = []
@@ -242,7 +290,7 @@ def _parse_groups_env(raw: str, num_groups: int) -> Optional[List[int]]:
         except ValueError:
             raise ValueError(
                 f"{NVCOMP_GROUPS_ENV}={raw!r}: {piece!r} is not an integer, "
-                "'auto', or 'none'.")
+                "'auto', 'all', or 'none'.")
         if not 0 <= idx < num_groups:
             raise ValueError(
                 f"{NVCOMP_GROUPS_ENV}={raw!r}: group {idx} is out of range for "
@@ -268,15 +316,18 @@ def select_nvcomp_groups(
 
     ``FLEXKV_NVCOMP_GROUPS`` selects:
 
-    * ``auto`` (default) -- every group the kernels can address. Groups whose
-      data is already quantized still qualify; ANS may barely shrink them, and
-      a group that does not shrink *at all* raises "compressed payload exceeded
-      the CPU chunk slot" rather than corrupting anything, so the failure mode
-      of an over-eager auto is loud. Set ``FLEXKV_NVCOMP_GROUPS=0`` to get the
-      conservative single-group behaviour back.
-    * ``0`` / ``0,1`` -- exactly those ordinals. Naming an ineligible group is
-      a configuration error, so it declines nvcomp outright rather than
-      quietly compressing a subset of what was asked for.
+    * ``auto`` (default) -- every group the kernels can address *and* that ANS
+      has headroom to shrink. A group whose data is already quantized is
+      skipped: it does not merely compress badly, it overflows the CPU chunk
+      slot and fails the whole transfer graph (see ``LOW_HEADROOM_DTYPES``).
+      That failure is loud rather than corrupting, but a default that makes
+      every store fail is still the wrong default.
+    * ``all`` -- every addressable group, headroom or not. This is the escape
+      hatch for measuring the heuristic rather than trusting it.
+    * ``0`` / ``0,1`` -- exactly those ordinals, headroom or not. Naming a
+      group the kernels cannot address is a configuration error, so it
+      declines nvcomp outright rather than quietly compressing a subset of
+      what was asked for.
     * ``none`` -- nothing, which disables nvcomp.
 
     Returns an empty list when nvcomp should not run.
@@ -322,6 +373,24 @@ def select_nvcomp_groups(
     ]
 
     if requested is None:
+        # "auto" answers two questions per group, and they are deliberately
+        # separate: can the kernels address it, and is compressing it worth
+        # doing. Only auto asks the second one -- "all" and an explicit
+        # ordinal take the group regardless, so the heuristic is overridable.
+        skips = [
+            reason or group_low_headroom_reason(
+                group, default_dtype=default_dtype)
+            for reason, group in zip(reasons, layer_groups)
+        ]
+        chosen = [gi for gi, reason in enumerate(skips) if reason is None]
+        for gi, reason in enumerate(skips):
+            if reason is not None:
+                flexkv_logger.info(
+                    f"[nvcomp-multi-group] layer group {gi} transfers "
+                    f"uncompressed: {reason}.")
+    elif requested is _ALL_GROUPS:
+        # "all" overrides the headroom heuristic but not addressability: a
+        # group the kernels cannot reach is dropped, same as under auto.
         chosen = [gi for gi, reason in enumerate(reasons) if reason is None]
         for gi, reason in enumerate(reasons):
             if reason is not None:

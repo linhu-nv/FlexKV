@@ -1419,8 +1419,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):
         if self._is_per_group(pool):
             # Compression, when there is any, covers the main pool's groups
             # that ``select_nvcomp_groups`` picked -- on a DSA model the MLA
-            # latent, and the indexer too unless FLEXKV_NVCOMP_GROUPS narrows
-            # it. Whatever is left over, and every group of any other pool,
+            # latent by default, plus the indexer if FLEXKV_NVCOMP_GROUPS asks
+            # for it. Whatever is left over, and every group of any other pool,
             # moves here uncompressed. Splitting them like this is what lets
             # the two share a pool: they address disjoint regions of the same
             # block, so the order between them does not matter.
