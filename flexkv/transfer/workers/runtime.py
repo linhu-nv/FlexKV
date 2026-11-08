@@ -327,7 +327,9 @@ class TransferWorkerBase(ABC):
         )
         process.start()
 
-        return WorkerHandle(worker_id, parent_conn, process, ready_event)
+        handle = WorkerHandle(worker_id, parent_conn, process, ready_event)
+        handle.kind = cls.__name__
+        return handle
 
     @classmethod
     def _worker_process(cls, worker_id: int, transfer_conn: Connection, finished_ops_queue: MPQueue,
