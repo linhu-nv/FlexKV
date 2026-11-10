@@ -218,6 +218,7 @@ class KVManager:
                   slot_mapping: Union[torch.Tensor, np.ndarray],
                   token_mask: Optional[Union[torch.Tensor, np.ndarray]] = None,
                   namespace: Optional[List[str]] = None,
+                  block_hashes: Optional[np.ndarray] = None,
                   ) -> int:
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.numpy()
@@ -229,7 +230,8 @@ class KVManager:
             task_id = self.dp_client.get_async(token_ids,
                                                slot_mapping,
                                                token_mask,
-                                               namespace=namespace)
+                                               namespace=namespace,
+                                               block_hashes=block_hashes)
         else:
             task_id, _ = self.kv_task_engine.get_async(
                 token_ids=token_ids,
@@ -237,6 +239,7 @@ class KVManager:
                 token_mask=token_mask,
                 dp_client_id=self.dp_client_id,
                 namespace=namespace,
+                block_hashes=block_hashes,
             )
         return task_id
 
@@ -246,6 +249,7 @@ class KVManager:
                   cpu_only: bool = False,
                   namespace: Optional[List[str]] = None,
                   swa_aware: bool = False,
+                  block_hashes: Optional[np.ndarray] = None,
                   ) -> Tuple[int, np.ndarray]:
         """Match a prefix and build the load graph; return (task_id, mask).
 
@@ -263,6 +267,7 @@ class KVManager:
                                                      token_mask,
                                                      cpu_only=cpu_only,
                                                      namespace=namespace,
+                                                     block_hashes=block_hashes,
                                                      swa_aware=swa_aware)
         else:
             task_id, mask = self.kv_task_engine.get_match(
@@ -271,6 +276,7 @@ class KVManager:
                 cpu_only=cpu_only,
                 dp_client_id=self.dp_client_id,
                 namespace=namespace,
+                block_hashes=block_hashes,
                 swa_aware=swa_aware,
             )
         return task_id, mask
@@ -280,6 +286,7 @@ class KVManager:
                   slot_mapping: Union[torch.Tensor, np.ndarray],
                   token_mask: Optional[Union[torch.Tensor, np.ndarray]] = None,
                   namespace: Optional[List[str]] = None,
+                  block_hashes: Optional[np.ndarray] = None,
                   ) -> int:
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.numpy()
@@ -289,7 +296,8 @@ class KVManager:
             token_mask = token_mask.numpy()
         if self.server_client_mode:
             task_id = self.dp_client.put_async(token_ids, slot_mapping, token_mask,
-                                               namespace=namespace)
+                                               namespace=namespace,
+                                               block_hashes=block_hashes)
         else:
             task_id, _ = self.kv_task_engine.put_async(
                 token_ids=token_ids,
@@ -297,6 +305,7 @@ class KVManager:
                 token_mask=token_mask,
                 dp_client_id=self.dp_client_id,
                 namespace=namespace,
+                block_hashes=block_hashes,
             )
         return task_id
 
@@ -305,6 +314,7 @@ class KVManager:
                   token_mask: Optional[Union[torch.Tensor, np.ndarray]] = None,
                   namespace: Optional[List[str]] = None,
                   swa: bool = True,
+                  block_hashes: Optional[np.ndarray] = None,
                   ) -> Tuple[int, np.ndarray]:
         """``swa=False`` stores Full KV only (no SWA/state snapshot)."""
         if isinstance(token_ids, torch.Tensor):
@@ -313,7 +323,8 @@ class KVManager:
             token_mask = token_mask.numpy()
         if self.server_client_mode:
             task_id, mask = self.dp_client.put_match(token_ids, token_mask,
-                                                     namespace=namespace, swa=swa)
+                                                     namespace=namespace, swa=swa,
+                                                     block_hashes=block_hashes)
         else:
             task_id, mask = self.kv_task_engine.put_match(
                 token_ids=token_ids,
@@ -321,13 +332,15 @@ class KVManager:
                 dp_client_id=self.dp_client_id,
                 namespace=namespace,
                 swa=swa,
+                block_hashes=block_hashes,
             )
         return task_id, mask
 
     def prefetch_async(self,
                        token_ids: np.ndarray,
                        namespace: Optional[List[str]] = None,
-                       swa_aware: bool = False) -> int:
+                       swa_aware: bool = False,
+                       block_hashes: Optional[np.ndarray] = None) -> int:
         """Launch prefetch; return the task_id.
 
         The prefetch is fire-and-forget at launch time. Callers poll progress
@@ -345,12 +358,13 @@ class KVManager:
             token_ids = token_ids.numpy()
         if self.server_client_mode:
             task_id = self.dp_client.prefetch_async(
-                token_ids, namespace=namespace, swa_aware=swa_aware)
+                token_ids, namespace=namespace, block_hashes=block_hashes, swa_aware=swa_aware)
         else:
             task_id = self.kv_task_engine.prefetch_async(
                 token_ids,
                 dp_client_id=self.dp_client_id,
                 namespace=namespace,
+                block_hashes=block_hashes,
                 swa_aware=swa_aware,
             )
         return task_id
@@ -363,13 +377,15 @@ class KVManager:
     def start_prefetch(
         self, token_ids: Union[np.ndarray, torch.Tensor], options: Optional[PrefetchOptions] = None,
         namespace: Optional[List[str]] = None,
+        block_hashes: Optional[np.ndarray] = None,
     ) -> PrefetchHandle:
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.numpy()
         if self.server_client_mode:
             return self.dp_client.prefetch_control(
-                "start", token_ids=token_ids, options=options, namespace=namespace)
-        return self.kv_task_engine.start_prefetch(token_ids, options, namespace)
+                "start", token_ids=token_ids, options=options, namespace=namespace, block_hashes=block_hashes)
+        return self.kv_task_engine.start_prefetch(token_ids, options, namespace,
+                                                  block_hashes=block_hashes)
 
     def progress_prefetch(
         self, handles: Sequence[PrefetchHandle], demand_handles: Sequence[PrefetchHandle] = (),
