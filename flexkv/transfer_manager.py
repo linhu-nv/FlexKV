@@ -435,13 +435,16 @@ class TransferManager:
 
         radix_client = None
         if GLOBAL_CONFIG_FROM_ENV.enable_radixshmem:
-            from flexkv.server.shm_radix_bootstrap import (adopt_geometry, attach_radix_client,
-                                                           check_geometry, expected_geometry)
+            from flexkv.server.shm_radix_bootstrap import (adopt_geometry, adopt_ssd_server,
+                                                           attach_radix_client, check_geometry,
+                                                           expected_geometry, radix_ssd_server_name)
             geometry = expected_geometry(self.model_config, self.cache_config)
             radix_client = attach_radix_client(geometry=geometry, attach_index=True,
                                                label="TransferManager")
             check_geometry(radix_client, geometry, label="TransferManager")
             adopt_geometry(self.cache_config, radix_client, label="TransferManager")
+            if self.cache_config.enable_ssd and radix_ssd_server_name() is not None:
+                adopt_ssd_server(self.model_config, self.cache_config, label="TransferManager-SSD")
             self._radix_client = radix_client
         self.storage_engine = StorageEngine(
             self.model_config,
@@ -558,7 +561,7 @@ class TransferManager:
             # Peers read this node's SSD blocks by the radixshmem SSD index:
             # tell them where the files are.
             from flexkv.transfer.workers.peer_ssd import publish_ssd_manifest
-            publish_ssd_manifest(self.cache_config, ssd_handle, swa_ssd_handle)
+            publish_ssd_manifest(self.model_config, self.cache_config, ssd_handle, swa_ssd_handle)
 
         self.transfer_engine = TransferEngine(
             gpu_handles=grouped_gpu_handles,

@@ -898,11 +898,35 @@ class SSDAllocator(BaseStorageAllocator):
 
     @classmethod
     def from_raw_data(cls,
-                      data: Union[str, List[str]],  # type: ignore
+                      data: Dict[str, Any],  # type: ignore
                       layout: KVCacheLayout,
                       dtype: torch.dtype,
                       **kwargs: Any) -> StorageHandle:
-        raise NotImplementedError
+        """SSD files another process created and owns (the SSD radix-server):
+        ``data`` is ``{"files": [[path, ...] per directory], "blocks_per_file": n}``,
+        laid out the way :meth:`allocate` lays out its own."""
+        files = [list(paths) for paths in data["files"]]
+        per_file = int(data["blocks_per_file"])
+        block_size = layout.get_elements_per_block() * dtype.itemsize
+        if not files or any(len(paths) != len(files[0]) for paths in files):
+            raise ValueError(f"SSD files {files}: every directory needs the same number of files")
+        if layout.num_block != len(files) * len(files[0]) * per_file:
+            raise ValueError(f"{layout.num_block} SSD blocks do not fill {len(files)} x "
+                             f"{len(files[0])} files of {per_file} blocks")
+        for path in (p for paths in files for p in paths):
+            size = os.path.getsize(path)
+            if size != per_file * block_size:
+                raise ValueError(f"SSD file {path} has {size} B, FlexKV expects {per_file} blocks "
+                                 f"of {block_size} B")
+        flexkv_logger.info(f"SSD allocator: using {len(files) * len(files[0])} existing files, "
+                           f"{per_file} blocks of {block_size} B each")
+        return StorageHandle(
+            handle_type=AccessHandleType.FILE,
+            data={i: paths for i, paths in enumerate(files)},
+            kv_layout=layout,
+            dtype=dtype,
+            num_blocks_per_file=per_file,
+        )
 
     @staticmethod
     def get_file_size_limit(file_path: str) -> int:

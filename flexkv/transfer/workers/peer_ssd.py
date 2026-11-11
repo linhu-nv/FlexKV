@@ -28,7 +28,7 @@ from typing import Any, Dict, Optional, Protocol
 import torch
 
 from flexkv import c_ext
-from flexkv.common.config import CacheConfig, GLOBAL_CONFIG_FROM_ENV
+from flexkv.common.config import CacheConfig, GLOBAL_CONFIG_FROM_ENV, ModelConfig
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.pool import PoolId
 from flexkv.common.storage import StorageHandle
@@ -78,7 +78,7 @@ def _handle_entry(handle: Optional[StorageHandle]) -> Optional[Dict[str, Any]]:
             "num_blocks": int(handle.kv_layout.num_block)}
 
 
-def publish_ssd_manifest(cache_config: CacheConfig,
+def publish_ssd_manifest(model_config: ModelConfig, cache_config: CacheConfig,
                          ssd_handle: Optional[StorageHandle],
                          swa_ssd_handle: Optional[StorageHandle]) -> Optional[str]:
     """Write this node's SSD file manifest (``<dir>/<node_name>.json``), where
@@ -88,7 +88,8 @@ def publish_ssd_manifest(cache_config: CacheConfig,
     configured (a custom reader brings its own discovery)."""
     from flexkv.server.shm_radix_bootstrap import attach_ssd_index_client
 
-    client = attach_ssd_index_client(cache_config, attach_index=False, label="TransferManager-SSD")
+    client = attach_ssd_index_client(model_config, cache_config, attach_index=False,
+                                     label="TransferManager-SSD")
     try:
         node_name = client.info.node_name or f"rank{client.info.rank}"
         pools = (client.info.geometry or {}).get("pools", {})

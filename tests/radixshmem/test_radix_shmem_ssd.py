@@ -59,9 +59,10 @@ def _sweep(name: str) -> None:
 
 @contextlib.contextmanager
 def _engine(swa: bool = False, ssd_blocks: int = SSD_BLOCKS, reuse_ssd_server=None,
-            tag: str = ""):
+            tag: str = "", ssd_dir=None):
     """A `RadixShmemCacheEngine` on a data-mode CPU server and an index-only
-    SSD server (both in-process). Yields (engine, ssd_server)."""
+    SSD server (both in-process; with ``ssd_dir`` the SSD server owns SSD
+    files there). Yields (engine, ssd_server)."""
     pid = os.getpid()
     cpu_name, ssd_name = f"/ssdtcpu{pid}{tag}", f"/ssdtssd{pid}"
     saved = {k: getattr(GLOBAL_CONFIG_FROM_ENV, k) for k in
@@ -91,7 +92,10 @@ def _engine(swa: bool = False, ssd_blocks: int = SSD_BLOCKS, reuse_ssd_server=No
             swa_ratio=(swa_slots * geo.swa_slot_bytes / data_bytes) if swa else 0.0)).start())
         if reuse_ssd_server is None:
             _sweep(ssd_name)
-            ssd_server = radixshmem.RadixServer(radixshmem.ServerConfig(name=ssd_name)).start()
+            ssd_kw = {}
+            if ssd_dir is not None:
+                ssd_kw = {"ssd_dirs": [str(ssd_dir)], "ssd_bytes": 100 * geo.full_slot_bytes}
+            ssd_server = radixshmem.RadixServer(radixshmem.ServerConfig(name=ssd_name, **ssd_kw)).start()
             servers.append(ssd_server)
         else:
             ssd_server = reuse_ssd_server
@@ -334,6 +338,39 @@ def test_stale_ssd_index_is_cleared_at_attach():
         engine.ssd_cache_engine = None
         with _engine(reuse_ssd_server=ssd_server, tag="b") as (engine2, _):
             assert _hit(engine2.ssd_cache_engine, tok) == 0
+
+
+def test_ssd_index_on_server_owned_files_takes_their_layout_and_survives_a_restart(tmp_path):
+    with _engine(ssd_dir=tmp_path) as (engine, ssd_server):
+        files = bootstrap.server_ssd_files(engine.cache_config)
+        assert engine.cache_config.num_ssd_blocks == 100
+        assert files["full"]["blocks_per_file"] == 100 and os.path.exists(files["full"]["files"][0][0])
+        tok, mask, sm = _request(6)
+        _put(engine, tok, mask, sm)
+        assert _hit(engine.ssd_cache_engine, tok) == 6
+        engine.ssd_cache_engine.close()
+        engine.ssd_cache_engine = None
+        with _engine(reuse_ssd_server=ssd_server, tag="b") as (engine2, _):
+            assert _hit(engine2.ssd_cache_engine, tok) == 6     # the blocks are still in the files
+
+
+def test_ssd_allocator_takes_files_it_did_not_create(tmp_path):
+    from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
+    from flexkv.storage.allocator import SSDAllocator
+
+    layout = KVCacheLayout(type=KVCacheLayoutType.BLOCKFIRST, num_layer=2, num_block=8,
+                           tokens_per_block=TPB, num_head=4, head_size=64, kv_dim=2)
+    block = layout.get_elements_per_block() * 2
+    files = [[str(tmp_path / f"d{i}_{j}.bin") for j in range(2)] for i in range(2)]
+    for path in (p for paths in files for p in paths):
+        with open(path, "wb") as f:
+            f.truncate(2 * block)
+    h = SSDAllocator.from_raw_data({"files": files, "blocks_per_file": 2}, layout, torch.float16)
+    assert h.num_blocks_per_file == 2 and h.get_file_list() == {0: files[0], 1: files[1]}
+    with open(files[1][1], "wb") as f:
+        f.truncate(block)
+    with pytest.raises(ValueError, match="expects 2 blocks"):
+        SSDAllocator.from_raw_data({"files": files, "blocks_per_file": 2}, layout, torch.float16)
 
 
 def test_a_replaced_radix_server_segment_turns_the_tiers_off():
