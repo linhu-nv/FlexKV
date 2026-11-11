@@ -66,7 +66,8 @@ from flexkv.common.debug import flexkv_logger
 from flexkv.common.pool import PoolId
 from flexkv.server.shm_radix_bootstrap import (PREFETCH_MAX_INFLIGHT, PREFETCH_TIMEOUT_MS,
                                                attach_ssd_index_client, expected_geometry,
-                                               radix_server_name, radix_ssd_server_name)
+                                               radix_server_name, radix_ssd_server_name,
+                                               server_ssd_files)
 from flexkv.common.transfer import (
     CompletedOp,
     CompletionAwareCallback,
@@ -348,11 +349,6 @@ def _check_cache_config(cache_config: CacheConfig) -> None:
                 "/flexkv_ssd` without --data-bytes)")
         if cache_config.enable_gds:
             raise ValueError("radix_shmem with the SSD tier does not support GDS")
-        if GLOBAL_CONFIG_FROM_ENV.instance_num > 1:
-            raise ValueError(
-                "radix_shmem with the SSD tier needs one FlexKV per node "
-                f"(FLEXKV_INSTANCE_NUM={GLOBAL_CONFIG_FROM_ENV.instance_num}): the SSD index "
-                "names this FlexKV's own SSD files")
     if cache_config.enable_p2p_cpu or cache_config.enable_p2p_ssd or cache_config.enable_kv_sharing:
         raise ValueError(
             "radix_shmem does its own peer reuse (etcd + RDMA inside the "
@@ -463,11 +459,21 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
                                 event_collector: Optional[KVEventCollector]):
         """Attach to this node's index-only SSD radix-server.
 
-        Its slot ids are the SSD blocks of this FlexKV's TE, whose files carry
-        nothing an earlier run left: an index that survived a FlexKV restart
-        (the server outlives FlexKV) would hand out stale blocks, so a
+        Its slot ids are SSD blocks. When the server owns the SSD files, every
+        FlexKV of the node shares them and the index stays valid across FlexKV
+        restarts. Otherwise they are blocks of this FlexKV's own files, which
+        carry nothing an earlier run left: an index that survived a FlexKV
+        restart (the server outlives FlexKV) would hand out stale blocks, so a
         non-empty index is cleared here, before the TE writes anything."""
-        client = attach_ssd_index_client(cache_config, label="RadixShmemCacheEngine-SSD")
+        client = attach_ssd_index_client(self.model_config, cache_config,
+                                         label="RadixShmemCacheEngine-SSD")
+        shared = server_ssd_files(cache_config) is not None
+        if not shared and (GLOBAL_CONFIG_FROM_ENV.instance_num > 1 or GLOBAL_CONFIG_FROM_ENV.dp_direct):
+            client.close()
+            raise ValueError(
+                "several FlexKVs on a node (FLEXKV_INSTANCE_NUM > 1 or FLEXKV_DP_DIRECT) share the "
+                "SSD tier only through SSD files the SSD radix-server owns: start it with "
+                "--ssd-dir/--ssd-bytes")
         engine = CacheEngineRadixShmem(
             client.name,
             tokens_per_block=cache_config.tokens_per_block,
@@ -477,7 +483,7 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
             client=client,
             device_type=DeviceType.SSD,
         )
-        stale = int(client.total_blocks())
+        stale = 0 if shared else int(client.total_blocks())
         if stale > 0:
             flexkv_logger.warning(
                 f"radixshmem SSD index {engine.shm_name} holds {stale} blocks from an "

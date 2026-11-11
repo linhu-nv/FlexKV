@@ -88,33 +88,80 @@ def radix_ssd_server_name() -> Optional[str]:
     return name
 
 
-def ssd_index_geometry(cache_config: CacheConfig) -> "radixshmem.Geometry":
-    """Geometry of the index-only SSD server: slot id == FlexKV SSD block id, so
-    the counts are FlexKV's SSD block / SWA slot counts and the bytes are 0 (the
-    data lives in FlexKV's SSD files)."""
+def ssd_index_geometry(model_config: ModelConfig, cache_config: CacheConfig) -> "radixshmem.Geometry":
+    """Geometry of the index-only SSD server: slot id == FlexKV SSD block id.
+    A server that owns the SSD files (``radix-server --ssd-bytes``) plans the
+    counts from the block bytes; one that does not takes FlexKV's own SSD
+    block / SWA slot counts (the data then lives in FlexKV's files)."""
     _ensure_radixshmem()
     swa = swa_pool_config(cache_config)
     swa_slots = int(swa.num_ssd_slots) if swa is not None else 0
     return radixshmem.Geometry(
         block_size=int(cache_config.tokens_per_block),
+        full_slot_bytes=cpu_block_bytes(model_config, cache_config),
         full_slots=int(cache_config.num_ssd_blocks),
+        swa_slot_bytes=swa_block_bytes(model_config, cache_config) if swa_slots > 0 else 0,
         swa_slots=swa_slots,
         swa_window_blocks=int(swa.window_blocks) if swa_slots > 0 else 0,
     )
 
 
-def attach_ssd_index_client(cache_config: CacheConfig,
+def server_ssd_files(cache_config: CacheConfig) -> Optional[Dict[str, Any]]:
+    """The SSD file layout the SSD radix-server published (``{"full": {"files":
+    [[path, ...] per directory], "blocks_per_file": n}, "swa": ...}``) once
+    :func:`adopt_ssd_server` ran, or None when FlexKV owns its SSD files."""
+    return getattr(cache_config, "_radix_ssd_files", None)
+
+
+def ssd_server_owns_files(label: str = "radixshmem-ssd") -> bool:
+    """Whether this node's SSD radix-server was started with ``--ssd-bytes``.
+    Asks without configuring it; waits for the server to answer."""
+    _ensure_radixshmem()
+    name = radix_ssd_server_name()
+    deadline = time.monotonic() + SSD_READY_TIMEOUT_S
+    while True:
+        try:
+            client = radixshmem.RadixClient(name, endpoint=default_endpoint(name))
+        except Exception as e:  # noqa: BLE001 - retried below while nothing answers
+            if not _nothing_answers(e) or time.monotonic() > deadline:
+                raise RuntimeError(f"{label}: SSD radix-server {name} does not answer: {e}") from e
+            time.sleep(1.0)
+            continue
+        try:
+            return int(getattr(client.info, "ssd_bytes", 0)) > 0
+        finally:
+            client.close()
+
+
+def adopt_ssd_server(model_config: ModelConfig, cache_config: CacheConfig,
+                     label: str = "radixshmem-ssd") -> Optional[Dict[str, Any]]:
+    """When this node's SSD radix-server owns the SSD files, configure it with
+    FlexKV's SSD block sizes and take over its counts (``num_ssd_blocks``,
+    ``swa.num_ssd_slots``) and file layout. Every process that sizes the SSD
+    tier runs it first. Returns the layout, or None when FlexKV owns its SSD
+    files (then the counts stay FlexKV's own)."""
+    if not ssd_server_owns_files(label):
+        return None
+    client = attach_ssd_index_client(model_config, cache_config, attach_index=False, label=label)
+    client.close()
+    return server_ssd_files(cache_config)
+
+
+def attach_ssd_index_client(model_config: ModelConfig,
+                            cache_config: CacheConfig,
                             *,
                             attach_index: bool = True,
                             label: str = "radixshmem-ssd") -> "radixshmem.RadixClient":
     """A ready client on this node's index-only SSD radix-server, configured with
-    FlexKV's SSD counts. Fails closed when the server has a data plane (its
-    slots would not be FlexKV's SSD blocks) or published other counts (another
-    FlexKV configured it with a different SSD size)."""
+    FlexKV's SSD geometry. A server that owns the SSD files hands its counts
+    and layout to ``cache_config``; otherwise its counts must be FlexKV's. Fails
+    closed when the server has a data plane (its slots would not be FlexKV's
+    SSD blocks) or published other counts (another FlexKV configured it with a
+    different SSD size)."""
     name = radix_ssd_server_name()
     if name is None:
         raise ValueError(f"{label}: FLEXKV_RADIXSHMEM_SSD_SERVER_NAME is not set")
-    geometry = ssd_index_geometry(cache_config)
+    geometry = ssd_index_geometry(model_config, cache_config)
     # An index-only server joins its cluster only once this node's FlexKV
     # configured it, and waits for every peer's FlexKV to do the same: allow
     # for nodes that come up far apart (a slow model load on another node).
@@ -125,7 +172,11 @@ def attach_ssd_index_client(cache_config: CacheConfig,
             raise ValueError(
                 f"{label}: radix-server {name} has a data plane (--data-bytes); the SSD tier "
                 f"needs an index-only server (slot ids are FlexKV's SSD blocks)")
-        pools = _published_geometry(client, label)["pools"]
+        published = _published_geometry(client, label)
+        pools = published["pools"]
+        if published.get("ssd"):
+            _adopt_ssd_files(cache_config, published, label)
+            return client
         diffs = []
         if int(pools["full"]["num_slots"]) != int(cache_config.num_ssd_blocks):
             diffs.append(f"FULL slots server={pools['full']['num_slots']} "
@@ -141,6 +192,23 @@ def attach_ssd_index_client(cache_config: CacheConfig,
         client.close()
         raise
     return client
+
+
+def _adopt_ssd_files(cache_config: CacheConfig, g: Dict[str, Any], label: str) -> None:
+    pools = g["pools"]
+    swa = swa_pool_config(cache_config)
+    if swa is not None and int(swa.num_ssd_slots) > 0 and "swa" not in pools:
+        raise ValueError(f"{label}: FlexKV's SWA SSD tier is on but the SSD radix-server planned "
+                         f"no SWA pool; start it with --ssd-swa-ratio")
+    if getattr(cache_config, "_radix_ssd_files", None) is None:
+        note = f"FULL {pools['full']['num_slots']} blocks (ssd_cache_gb had given {cache_config.num_ssd_blocks})"
+        if "swa" in pools:
+            note += f", SWA {pools['swa']['num_slots']} slots"
+        flexkv_logger.info(f"{label}: the SSD radix-server owns the SSD files; adopted {note}")
+    cache_config.num_ssd_blocks = int(pools["full"]["num_slots"])
+    if swa is not None and "swa" in pools:
+        swa.num_ssd_slots = int(pools["swa"]["num_slots"])
+    cache_config._radix_ssd_files = g["ssd"]
 
 
 def cpu_sizing_notice(cache_config: CacheConfig, server_name: str) -> Tuple[str, str]:
@@ -621,6 +689,8 @@ def adopt_radix_server(model_config: ModelConfig, cache_config: CacheConfig,
     try:
         counts = adopt_geometry(cache_config, client, label=label)
         cache_config.distributed_node_id = radix_cluster_rank(client)
+        if cache_config.enable_ssd and radix_ssd_server_name() is not None:
+            adopt_ssd_server(model_config, cache_config, label=f"{label}-SSD")
         flexkv_logger.info(
             f"{label}: radix-server {client.name}: cluster rank "
             f"{cache_config.distributed_node_id}/{client.info.world_size}, "

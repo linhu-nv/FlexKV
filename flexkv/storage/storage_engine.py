@@ -179,6 +179,7 @@ class StorageEngine:
                 device_type=DeviceType.SSD,
                 layout=self._ssd_layout,
                 dtype=buffer_dtype,
+                raw_data=self._server_ssd_files("full"),
                 cache_dir=self._cache_config.ssd_cache_dir,
                 max_file_size_gb=GLOBAL_CONFIG_FROM_ENV.max_file_size_gb
             )
@@ -272,7 +273,7 @@ class StorageEngine:
                     layout=self._swa_ssd_layout,
                     dtype=torch.uint8,
                     device_id=0,
-                    raw_data=None,
+                    raw_data=self._server_ssd_files("swa"),
                     pool_id=PoolId.SWA,
                     cache_dir=self._cache_config.ssd_cache_dir,
                     max_file_size_gb=GLOBAL_CONFIG_FROM_ENV.max_file_size_gb,
@@ -321,6 +322,11 @@ class StorageEngine:
                         remote_config_custom=self._cache_config.remote_config_custom,
                     )
 
+
+    def _server_ssd_files(self, kind: str) -> Optional[Dict[str, Any]]:
+        """The SSD radix-server's files of pool ``kind`` when it owns them."""
+        files = getattr(self._cache_config, "_radix_ssd_files", None)
+        return None if files is None else files.get(kind)
 
     def _attach_radix_pool(self,
                            layout: KVCacheLayout,
@@ -512,9 +518,6 @@ class StorageEngine:
             cache_dir = kwargs.get('cache_dir')
             max_file_size_gb = kwargs.get('max_file_size_gb', -1)
             if raw_data is not None:
-                assert isinstance(raw_data, str) or \
-                    (isinstance(raw_data, list) and all(isinstance(x, str) for x in raw_data)), \
-                    "raw_data for SSDAllocator must be str or List[str]"
                 storage_handle = SSDAllocator.from_raw_data(
                     data=raw_data,  # type: ignore
                     layout=layout,
