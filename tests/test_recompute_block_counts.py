@@ -120,7 +120,8 @@ def test_compact_indexer_reclaims_capacity_at_fixed_bytes() -> None:
     ]
 
     assert recompute_cache_block_counts(model_config, cache_config) is True
-    compact_bytes = 4 * (8 * 64 * 576 * 2 + 3 * 8448)
-    aliased_bytes = 4 * (8 * 64 * 576 * 2 + 8 * 8448)
+    # One copy for all TP ranks: they hold the same (one-head) KV.
+    compact_bytes = 8 * 64 * 576 * 2 + 3 * 8448
+    aliased_bytes = 8 * 64 * 576 * 2 + 8 * 8448
     assert cache_config.num_cpu_blocks == (1 << 30) // compact_bytes
     assert cache_config.num_cpu_blocks > (1 << 30) // aliased_bytes
