@@ -17,6 +17,13 @@ CPU KV pool and one SSD KV pool across the cluster. Chinese version: [cpu_ssd_po
   index. If a peer already holds the prefix, the write is skipped; if a peer holds the first part, only the
   remainder is written to that peer's SSD. This avoids keeping the same KV on several nodes' SSDs (for example
   P and D both storing the same conversation).
+- **Attention-DP direct mode** (optional, `FLEXKV_DP_DIRECT=1`): every DP rank runs its own FlexKV engine on the
+  radixshmem index instead of queueing behind one KVServer per node. Needs SSD files owned by the radix-server (next).
+- **SSD files owned by the radix-server** (optional, required for direct mode): with `--ssd-dir/--ssd-bytes` the SSD
+  index server creates the node's SSD files and plans their block counts; every FlexKV engine of the node shares one
+  SSD tier, and the SSD index stays valid across FlexKV restarts.
+- **KV events for the dynamo router** (optional): the CPU-pool radix-server publishes the node's block placement;
+  the dynamo KV router (`--shared-cache-type radixshmem`) learns which node's CPU pool holds a prefix and prefers it.
 
 ```
             node A (P)                                   node B (D)
@@ -37,17 +44,22 @@ peer SSD, dedup writes).
 
 | Component | Branch | Notes |
 |---|---|---|
-| FlexKV | `linhu-nv/FlexKV` `linhu/rsm-ssd-pool-main` | this branch (upstream main + this work) |
-| SGLang | `linhu-nv/sglang` `linhu/flexkv-1026-pd-ssdpool` (based on `rebase_main_1026`) | FlexKV PD decode integration, decode store stride, batched layerwise restore, two fixes (see section 9) |
-| radixshmem | `feat/pd-support` (validated at `5e32312`) | build with RDMA and the Mooncake transfer backend |
+| FlexKV | `linhu-nv/FlexKV` `linhu/rsm-ssd-pool-dpdirect-1116` | this branch (upstream main + this work) |
+| SGLang | `linhu-nv/sglang` `linhu/flexkv-1116-xing-pd-ssdpool-kvevent` (upstream main + XingLiu1 `agent/flexkv-dsv4-main`) | FlexKV PD decode integration, decode store stride, hybrid batched layerwise restore, caller block hashes, a sync before non-layerwise restores, fixes (see section 9) |
+| radixshmem | `linhu-nv/radixshmem` `linhu/kvevent-ssdpool-dpdirect-1116` (based on `main`) | KV events, SSD files owned by the server; build with RDMA, gRPC and the Mooncake transfer backend |
+| dynamo (optional) | `linhu-nv/dynamo` `linhu/radixshmem-shared-cache-1116` (based on `main`) | only for the dynamo KV router with KV events |
 | NIXL | 1.4 or 1.5 Python wheel with the UCX and POSIX plugins | used for peer SSD reads and writes |
 
 Use the same NIXL / Mooncake / UCX versions on all nodes.
 
 ## 3. Prerequisites
 
-- RDMA NICs (InfiniBand or RoCE) between all nodes. For RoCE set the GID index (`--gid-idx 3` for radixshmem,
-  `MC_GID_INDEX=3` for Mooncake, `UCX_IB_GID_INDEX` if UCX does not pick it).
+- RDMA NICs (InfiniBand or RoCE) between all nodes. For RoCE set the GID index (`MC_GID_INDEX=3` for Mooncake,
+  `UCX_IB_GID_INDEX` if UCX does not pick it). The radixshmem index runs on gRPC and the Redis RHT by default and
+  opens no RDMA device; only an RDMA index needs `RADIXSHMEM_INDEX_DEV` / `RADIXSHMEM_INDEX_GID_IDX` (the old
+  `--index-dev` / `--gid-idx` flags are gone).
+- A Redis Cluster for radixshmem's global route table (RHT, `RADIXSHMEM_RHT_BACKEND=redis`; see the Redis Cluster
+  guide under radixshmem `docs/`).
 - One etcd endpoint reachable from all nodes.
 - A local NVMe filesystem for the SSD files on every node.
 - A directory **shared by all nodes** for FlexKV's SSD manifests and NIXL contact files
@@ -79,22 +91,30 @@ node; it is also the name FlexKV publishes its manifest under.
 # On node A (repeat on every node with its own --node-name / --rpc-address / NIC)
 # CPU pool: data mode. --data-bytes is the CPU tier capacity of this node.
 # --swa-ratio is required for SWA models (e.g. DeepSeek-V4.x); 0 otherwise.
+# Every radix-server process carries the Redis RHT settings (rank 0's take effect, the others read them from etcd):
+export RADIXSHMEM_RHT_BACKEND=redis RADIXSHMEM_REDIS_ADDRS=10.0.0.10:7001,10.0.0.10:7002,10.0.0.10:7003
 radix-server --name /kv_cpu --data-bytes 200G --swa-ratio 0.2 \
   --expected-min-nodes 2 --bootstrap-timeout 3600 \
   --registry etcd://10.0.0.10:2379 --cluster-id kv_cpu --node-name nodeA \
-  --rpc-address 10.0.0.10 --index-dev mlx5_0 --gid-idx 3 \
-  --transfer-dev mlx5_0 --transfer-backend mooncake
+  --rpc-address 10.0.0.10 --rpc-port 24610 \
+  --transfer-dev mlx5_0 --transfer-backend mooncake \
+  --kv-events-endpoint 'tcp://*:5691'            # optional: KV events for the dynamo router (4.7)
 
-# SSD index: index-only mode (no --data-bytes). Slot ids are FlexKV SSD block ids.
+# SSD index: index-only mode (no --data-bytes). Slot ids are SSD block ids.
+# With --ssd-dir/--ssd-bytes the server creates and owns the node's SSD files (required with FLEXKV_DP_DIRECT,
+# recommended anyway); the SSD capacity is then --ssd-bytes, and ssd_cache_gb / ssd_cache_dir in the FlexKV config
+# no longer set its size or location.
 radix-server --name /kv_ssd \
   --expected-min-nodes 2 --bootstrap-timeout 3600 \
   --registry etcd://10.0.0.10:2379 --cluster-id kv_ssd --node-name nodeA \
-  --rpc-address 10.0.0.10 --index-dev mlx5_0 --gid-idx 3
+  --rpc-address 10.0.0.10 --rpc-port 24611 \
+  --ssd-dir /nvme/flexkv --ssd-bytes 1000G --ssd-swa-ratio 0.2 --ssd-file-bytes 64G
 ```
 
-(`radix-server` is `python -m radixshmem.cli`.) The SSD index server gets its geometry (number of SSD blocks and SWA
-slots) from the FlexKV process on its node, so the SSD cluster becomes ready only after FlexKV has started on all
-`N` nodes. Do not start decode-side radix-servers with `--decode` for this pipeline; that mode (prefill eviction
+(`radix-server` is `python -m radixshmem.cli`.) The SSD index server gets its geometry (block sizes; without
+`--ssd-dir` also the number of SSD blocks and SWA slots) from the FlexKV process on its node, so the SSD cluster
+becomes ready only after FlexKV has started on all `N` nodes. `--ssd-swa-ratio` is the share of the SSD space for
+SWA (SWA models only); `--ssd-file-bytes` caps the size of one file. Do not start decode-side radix-servers with `--decode` for this pipeline; that mode (prefill eviction
 write-back to decode) was not validated together with it.
 
 ### 4.3 FlexKV config file
@@ -175,6 +195,41 @@ endpoints as usual. Other models work the same way; drop the DSv4-specific flags
    tokens and FlexKV logs `DISK2H` / `PEERSSD2H` / peer pulls; the answer is the same as the first time.
 4. Metrics: `flexkv_py_transfer_blocks_total{transfer_type=...}` grows for the transfer types in use.
 
+### 4.7 Optional: attention-DP direct mode, KV-event routing (dynamo)
+
+Either can be turned on alone.
+
+**Direct mode** (`FLEXKV_DP_DIRECT=1` in each SGLang instance's environment): with attention DP every DP rank runs
+its own FlexKV engine instead of going through one KVServer per node. It needs the SSD index radix-server started
+with `--ssd-dir/--ssd-bytes` (FlexKV refuses to start otherwise), and a DP instance spanning nodes must run its own
+DP ranks on every node. Each rank serves its own NIXL peer-SSD endpoint: rank k takes ports `PORT+2k` and
+`PORT+2k+1` from `FLEXKV_NIXL_SSD_PORT`.
+
+**KV-event routing**: needs the dynamo branch; start workers with `python -m dynamo.sglang` and the router with
+`python -m dynamo.frontend`.
+
+```bash
+# CPU-pool radix-server with --kv-events-endpoint 'tcp://*:5691' (4.2)
+
+# environment of every dynamo.sglang worker
+export FLEXKV_HASH_SCHEME=sglang-sha256-i64-v1                  # FlexKV names blocks by SGLang's page hashes, which the router recomputes
+export DYN_RADIXSHMEM_KV_EVENTS_ENDPOINT=tcp://10.0.0.10:5691   # this node's CPU-pool radix-server event endpoint, as the router reaches it
+# an attention-DP instance spanning nodes sets DYN_RADIXSHMEM_KV_EVENTS_ENDPOINTS=<one per node, in node-rank order>
+
+python3 -m dynamo.sglang <the SGLang arguments of 4.5> \
+  --kv-events-config '{"publisher":"zmq","endpoint":"tcp://*:24710","topic":"kv"}'
+
+# router (frontend)
+export DYN_RADIXSHMEM_REMOTE_HIT_WEIGHT=0.9   # credit of a block only another node holds, relative to one on the worker's node (default 0.5)
+python3 -m dynamo.frontend --http-port 8000 --router-mode kv --router-kv-events \
+  --router-track-prefill-tokens --shared-cache-type radixshmem
+```
+
+It works when the router logs `subscribed to radixshmem` and `worker nodes`, and `shared-cache lookup ... held=N` with
+N > 0. `FLEXKV_HASH_SCHEME` is part of the radixshmem geometry: every FlexKV of a cluster must use the same value or
+it is refused at attach. Do not give the SSD index radix-server `--kv-events-endpoint` (the router reads the CPU pool
+only).
+
 ## 5. Configuration guide
 
 Three levels: get the **minimal configuration** running, deploy with the **recommended configuration**, then **tune per scenario**. Each switch lists its cost and how to observe it.
@@ -201,7 +256,7 @@ The deployment steps in section 4 are the minimal configuration: two radix-serve
 | SSD O_DIRECT | automatic (default) | reads and writes bypass the page cache at the device alignment (512 B on most NVMe); Applies when the block size is a multiple of that alignment: DeepSeek-V4.1 SWA blocks (5990400 B) and FULL blocks under TP (1671680 B) read cold at 18-22 GB/s locally instead of 5; with attention DP the FULL block is 417920 B (not 512-aligned) and stays on the page cache (peer reads use aligned O_DIRECT spans either way). Override with `FLEXKV_NIXL_SSD_DIRECT_READ=0` / `FLEXKV_NIXL_SSD_DIRECT_ALIGN` when debugging |
 | radixshmem CPU dedup after pulls (`RADIXSHMEM_DISABLE_AUTO_DEDUP`) | default (on) | validated with the default |
 | radix-server `--decode` (prefill eviction written back to decode) | off | not validated with this pipeline yet |
-| FlexKV process mode | default (`dp_size>1`: one KVServer per node, DP ranks are clients) | with the SSD tier a node runs one FlexKV backend (`FLEXKV_INSTANCE_NUM>1` is rejected) |
+| FlexKV process mode | direct mode `FLEXKV_DP_DIRECT=1` at high, prefill-heavy request rates; otherwise default (`dp_size>1`: one KVServer per node, DP ranks are clients) | direct mode removes the KVServer queue: on Qwen3-8B DP8 a FlexKV call's p90 dropped from 3-11 ms to 0.3 ms, prefill-heavy throughput +3%-10%, decode-heavy unchanged. Direct mode and several instances per node (`FLEXKV_INSTANCE_NUM>1`) both need the SSD index radix-server started with `--ssd-dir/--ssd-bytes` |
 | Routing | session-sticky if available | sticky routing cuts cross-node traffic to about 1/3 of random routing; peer SSD reads near 0 |
 | Startup timeouts `FLEXKV_READY_TIMEOUT_S` / `SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT` / `SGLANG_DISAGGREGATION_WAITING_TIMEOUT` | 3600 | the first start waits for every node |
 | SGLang (DeepSeek-V4.1) | `--mem-fraction-static 0.93 --chunked-prefill-size 4096 --page-size 256` | do not use `--disaggregation-enable-kv-checksum` (not supported for DeepSeek-V4.x) |
@@ -241,7 +296,11 @@ The deployment steps in section 4 are the minimal configuration: two radix-serve
 | `FLEXKV_LAYERWISE_EVENTFD_SOCKET` | — | eventfd socket of layerwise transfer; unique per instance on a host |
 | `FLEXKV_BATCH_LAYERWISE_RESTORE` | 0 | merge the layerwise restores of the requests admitted in one batch |
 | `FLEXKV_RADIXSHMEM_SSD_READY_TIMEOUT_S` | 3600 | how long FlexKV waits for the SSD cluster to become ready |
-| `SGLANG_FLEXKV_DECODE_OFFLOAD_STRIDE` | 0 | D also stores every N generated tokens (page-aligned); 0 = store at finish only. SWA models store FULL KV only mid-decode |
+| `SGLANG_FLEXKV_DECODE_OFFLOAD_STRIDE` | 0 | D also stores every N generated tokens (page-aligned); 0 = store at finish only. SWA models store FULL KV only mid-decode. A PD decode server counts from the end of the prompt, so its first store carries the prompt with new output |
+| `FLEXKV_DP_DIRECT` | 0 | 1 = one FlexKV engine per DP rank under attention DP (see 4.7) |
+| `FLEXKV_HASH_SCHEME` | unset | `sglang-sha256-i64-v1` = name blocks by SGLang's page hashes (needed for KV-event routing) |
+| `DYN_RADIXSHMEM_KV_EVENTS_ENDPOINT(S)` | unset | dynamo worker: the event endpoint of this node's (or each node's, in node order) CPU-pool radix-server |
+| `DYN_RADIXSHMEM_REMOTE_HIT_WEIGHT` | 0.5 | dynamo frontend: credit of a block only another node holds |
 
 ## 7. Sizing and operations
 
@@ -267,6 +326,13 @@ DP4 + MoE EP4): 1 h and 4 h runs with random and sticky routing, 20% client abor
 NIXL endpoint stall, 64k-100k contexts, layerwise on/off (including batched restore across machines), forced retraction, decode store stride, dedup on/off. All
 with 0 unexpected request errors, correct needle answers and no garbled outputs on cache hits.
 
+
+The branch set of section 2 (2026-11-16, on upstream main) was re-run on the same kind of H20 nodes with DeepSeek-V4.1
+on two nodes (TP4/DP4/EP4): direct mode + server-owned SSD files + peer SSD + `global_dedup` + KV-event routing
+(dynamo) and the server-client mode, 952 requests each, and PD 1P1D (layerwise off, overlap on), 2875 requests; all
+with 0 errors, every needle answer right and no garbled output; the router's per-node block counts matched the
+radix-servers exactly.
+
 | Metric | Result |
 |---|---|
 | Cross-node duplicate SSD blocks, local vs `global_dedup` | DeepSeek-V4.1 2P1D 60.6% -> 1.7%; Qwen3-8B 1P1D 37-41% -> 0-14% |
@@ -282,6 +348,9 @@ with 0 unexpected request errors, correct needle answers and no garbled outputs 
 - With `global_dedup`, P and D writing the same new prefix at the same moment can still both write it (a few
   percent duplicates); prefixes concentrate on the node that first stored them, which shifts some SSD reads from
   local to peer.
-- The SGLang branch also fixes two SGLang issues found under this pipeline: a SWA double free when a chunked
-  prefill is aborted after a FlexKV load-back, and the PD retract re-bootstrap reusing the original request id and
-  bootstrap room (upstream issue, also without FlexKV).
+- The SGLang branch also fixes SGLang issues found under this pipeline: the PD retract re-bootstrap reusing the
+  original request id and bootstrap room (upstream issue, also without FlexKV); under the overlap scheduler, a
+  non-layerwise restore's H2D racing the previous batch's unfinished kernels on the same slots (rare garbled output;
+  the restore now syncs first); the detokenizer crashing at start when `SGLANG_LOGGING_CONFIG_PATH` is set (upstream
+  did not import `logging.config`). The fix for the SWA double free when a chunked prefill is aborted after a load-back
+  is part of XingLiu1's branch.
