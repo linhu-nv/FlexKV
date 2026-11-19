@@ -375,10 +375,11 @@ void transfer_kv_blocks_ssd(
     if (!warned.exchange(true)) {
       FLEXKV_LOG_WARNING(
           "operation=ssd_transfer act=open status=degraded mode=buffered "
-          "reason=not_4k_aligned block_stride=%ld chunk=%ld base_aligned=%d "
-          "hint=\"O_DIRECT needs a 4096-byte aligned block stride; SSD I/O goes "
-          "through the page cache (multi-group layouts: set "
-          "FLEXKV_HOST_BLOCK_ALIGN=4096)\"",
+          "reason=not_aligned align=%ld block_stride=%ld chunk=%ld "
+          "base_aligned=%d hint=\"O_DIRECT needs a block stride aligned to the "
+          "device's direct-I/O alignment; SSD I/O goes through the page cache "
+          "(multi-group layouts: set FLEXKV_HOST_BLOCK_ALIGN=4096)\"",
+          static_cast<long>(direct_align),
           static_cast<long>(block_stride_in_bytes),
           static_cast<long>(chunk_size_in_bytes), base_aligned ? 1 : 0);
     }

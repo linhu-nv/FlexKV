@@ -242,7 +242,7 @@ radix-server 不要加 `--kv-events-endpoint`（路由只看 CPU 池）。
 | 批量 layerwise 恢复 `FLEXKV_BATCH_LAYERWISE_RESTORE` | 1 | 同一 batch 的多个请求合并成少量传输，而不是逐个请求串行恢复。TP>1 且命中较短时最多快 1.8 倍，其他情况持平 |
 | decode 分段存储 `SGLANG_FLEXKV_DECODE_OFFLOAD_STRIDE` | 输出较短：0；agentic / 长输出（数千 token）：512-1024 | 让 D 生成的 KV 更早可被复用，结束时只存尾部；代价是 decode 期间多一些 D2H |
 | 对端退避 `FLEXKV_SSD_DEDUP_PEER_BACKOFF_S` / `FLEXKV_NIXL_SSD_RETRY_S` | 10 / 10 | 一般不改 |
-| SSD O_DIRECT | 自动（默认） | 按设备对齐（NVMe 一般 512 B）读写都绕过页缓存。块大小是对齐值的整数倍时生效：DeepSeek-V4.1 的 SWA 块（5990400 B）以及 TP 部署下的 FULL 块（1671680 B）本地冷读 5 -> 18-22 GB/s；attention-DP 部署下 FULL 块是 417920 B（不满足 512 对齐），仍走页缓存（对端读用对齐区间 O_DIRECT，不受影响）。排查问题时可用 `FLEXKV_NIXL_SSD_DIRECT_READ=0`、`FLEXKV_NIXL_SSD_DIRECT_ALIGN` 覆盖 |
+| SSD O_DIRECT | 自动（默认）+ `FLEXKV_HOST_BLOCK_ALIGN=4096` | 按设备对齐（NVMe 一般 512 B）读写都绕过页缓存，块大小是对齐值的整数倍时才生效。DeepSeek-V4.1 的 FULL 块不论 TP 还是 attention-DP 都只存一份（417920 B，不满足 512 对齐），设 `FLEXKV_HOST_BLOCK_ALIGN=4096` 把每块补齐到 4 KiB（多占 <1%）后 FULL 和 SWA 块都走 O_DIRECT（本地冷读 5 -> 18-22 GB/s）；不设则 FULL 池走页缓存（对端读用对齐区间 O_DIRECT，不受影响），日志有一条 `mode=buffered` 告警。排查问题时可用 `FLEXKV_NIXL_SSD_DIRECT_READ=0`、`FLEXKV_NIXL_SSD_DIRECT_ALIGN` 覆盖 |
 | radixshmem CPU 层拉取后去重（`RADIXSHMEM_DISABLE_AUTO_DEDUP`） | 默认（开） | 已在默认值下验证 |
 | radix-server `--decode`（prefill 淘汰写回 decode） | 不开 | 尚未与本方案一起验证 |
 | FlexKV 进程模式 | 请求率高、prefill 偏重时用直连 `FLEXKV_DP_DIRECT=1`；否则默认（`dp_size>1` 时每节点一个 KVServer，各 DP rank 为 client） | 直连去掉了 KVServer 的排队：Qwen3-8B DP8 上 FlexKV 每次调用 p90 从 3-11 ms 降到 0.3 ms，prefill 偏重时吞吐 +3%~10%，decode 偏重时持平。直连和同机多实例（`FLEXKV_INSTANCE_NUM>1`）都要求 SSD 索引 radix-server 带 `--ssd-dir/--ssd-bytes` |
