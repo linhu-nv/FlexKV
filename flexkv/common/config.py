@@ -445,10 +445,11 @@ class ModelConfig:
     @property
     def host_tp_copies(self) -> int:
         """TP ranks a CPU/SSD block of layer groups keeps a slot for: every rank
-        when the KV heads are split across TP, one when all ranks hold the
-        same KV (``num_kv_heads == 1``, MLA), which they also read and write
-        as one copy."""
-        return self.tp_size if self.num_kv_heads > 1 else 1
+        on the node when the KV heads are split across TP (a node's pool holds
+        only its own ranks' KV), one when all ranks hold the same KV
+        (``num_kv_heads == 1``, MLA), which they also read and write as one
+        copy."""
+        return self.tp_size_per_node if self.num_kv_heads > 1 else 1
 
     @property
     def token_size_in_bytes(self) -> int:
@@ -456,7 +457,7 @@ class ModelConfig:
         kv_dim = self.kv_dim
         if self.layer_groups:
             # layer_groups store per-GPU num_kv_heads; multiply by the TP slots
-            # to get full-model per-token size (matching CPU/SSD block sizing).
+            # of a host block (matching CPU/SSD block sizing).
             # Each group may carry its own dtype (None = inherit ModelConfig.dtype),
             # so indexer-as-group (fp8/uint8) and main KV (bf16) sum correctly.
             # ``compress_ratio`` shrinks the per-token contribution. This

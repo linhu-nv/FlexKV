@@ -44,7 +44,7 @@ class KVCacheLayout:
     # Requires type == BLOCKFIRST (enforced in __post_init__).
     layer_groups: Optional[List[LayerGroupSpec]] = None
     # TP slots: when > 1 and layer_groups is set, elements_per_block is scaled
-    # so that each CPU/SSD block can hold data for all TP ranks
+    # so that each CPU/SSD block can hold data for the TP ranks on its node
     # (ModelConfig.host_tp_copies).
     tp_size: int = 1
 
@@ -101,8 +101,8 @@ class KVCacheLayout:
                 # bytes.  kv_dim and tokens_per_block are taken from the layout
                 # top level (uniform across groups in supported configs).
                 # layer_groups store per-GPU num_kv_heads (after TP split);
-                # tp_size multiplies so each block holds data for ALL TP ranks
-                # whose KV heads differ.
+                # tp_size multiplies so each block holds data for the node's TP
+                # ranks whose KV heads differ.
                 if any(g.dtype is None for g in self.layer_groups):
                     raise ValueError(
                         "Multi-group KVCacheLayout requires LayerGroupSpec.dtype "
