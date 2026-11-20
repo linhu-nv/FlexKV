@@ -9,6 +9,7 @@ from flexkv.common.config import (
     ModelConfig,
     RankInfo,
     UserConfig,
+    block_size_in_bytes_for_cache,
     convert_to_block_num,
     recompute_cache_block_counts,
     update_default_config_from_user_config,
@@ -120,7 +121,34 @@ def test_compact_indexer_reclaims_capacity_at_fixed_bytes() -> None:
     ]
 
     assert recompute_cache_block_counts(model_config, cache_config) is True
-    compact_bytes = 4 * (8 * 64 * 576 * 2 + 3 * 8448)
-    aliased_bytes = 4 * (8 * 64 * 576 * 2 + 8 * 8448)
+    # One copy for all TP ranks: they hold the same (one-head) KV.
+    compact_bytes = 8 * 64 * 576 * 2 + 3 * 8448
+    aliased_bytes = 8 * 64 * 576 * 2 + 8 * 8448
     assert cache_config.num_cpu_blocks == (1 << 30) // compact_bytes
     assert cache_config.num_cpu_blocks > (1 << 30) // aliased_bytes
+
+
+@pytest.mark.parametrize("tp_size,nnodes", [(8, 1), (16, 2)])
+def test_split_kv_host_block_has_a_slot_per_tp_rank_on_its_node(tp_size, nnodes) -> None:
+    page = 4096
+    model_config = ModelConfig(
+        num_layers=2,
+        num_kv_heads=tp_size,
+        head_size=page,
+        kv_dim=1,
+        tp_size=tp_size,
+        nnodes=nnodes,
+        dtype=torch.uint8,
+        layer_groups=[LayerGroupSpec(
+            num_layers=2,
+            num_kv_heads=1,
+            head_size=page,
+            layer_indices=[0, 1],
+            compress_ratio=16,
+            dtype=torch.uint8,
+        )],
+    )
+    cache_config = CacheConfig(tokens_per_block=16)
+
+    assert model_config.host_tp_copies == 8
+    assert block_size_in_bytes_for_cache(model_config, cache_config) == 8 * 2 * page

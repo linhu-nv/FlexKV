@@ -22,6 +22,7 @@ from flexkv.common.transfer import (
     DeviceType,
     TransferOpGraph,
     TransferType,
+    batch_mergeable,
     get_nvtx_default_color,
     invoke_op_callback,
     merge_to_batch_graph,
@@ -562,6 +563,12 @@ class KVTaskManager:
                         transfer_handle.submit(transfer_graph, task_end_op_id=self.tasks[task_id].task_end_op_id)
                 else:
                     transfer_handle.submit(transfer_graph, task_end_op_id=self.tasks[task_id].task_end_op_id)
+
+    def has_running_graphs(self) -> bool:
+        """Whether a submitted graph still runs; its completion (e.g. a PUT's
+        SSD insert after the task was returned) happens only when polled."""
+        return any(self.tasks[tid].status == TaskStatus.RUNNING
+                   for tid in self.graph_to_task.values())
 
     def _update_tasks(self, timeout: float = 0.001) -> None:
         self._poll_prefetch_jobs()
@@ -1292,8 +1299,7 @@ class KVTaskEngine(KVTaskManager):
     def _next_runtime_wakeup(self, poll_s):
         # Held GET plans have no submitted I/O. Only RUNNING graphs require
         # completion polling, including async PUT tails after request return.
-        if any(self.tasks[tid].status == TaskStatus.RUNNING
-               for tid in self.graph_to_task.values()):
+        if self.has_running_graphs():
             return poll_s
         delay = self._prefetch.next_wakeup(poll_s)
         if self._terminal_tasks:
@@ -1813,7 +1819,12 @@ class KVTaskEngine(KVTaskManager):
 
         all_get = all(self.tasks[tid].task_type == TaskType.GET for tid in task_ids)
         all_put = all(self.tasks[tid].task_type == TaskType.PUT for tid in task_ids)
-        if (len(task_ids) > 1 or layerwise_transfer) and as_batch and (all_get or all_put):
+        # A graph with ops the merge cannot fuse (a global-dedup PUT's
+        # H2PEERSSD) goes out on its own, in the same submit.
+        mergeable = layerwise_transfer or all(
+            batch_mergeable(self.tasks[tid].graph) for tid in task_ids)
+        if ((len(task_ids) > 1 or layerwise_transfer) and as_batch and (all_get or all_put)
+                and mergeable):
             if batch_id == -1:
                 batch_id = self._gen_task_id()
             if layerwise_transfer:

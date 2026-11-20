@@ -443,12 +443,21 @@ class ModelConfig:
         return self.num_kv_heads * self.head_size * self.kv_dim * self.dtype.itemsize
 
     @property
+    def host_tp_copies(self) -> int:
+        """TP ranks a CPU/SSD block of layer groups keeps a slot for: every rank
+        on the node when the KV heads are split across TP (a node's pool holds
+        only its own ranks' KV), one when all ranks hold the same KV
+        (``num_kv_heads == 1``, MLA), which they also read and write as one
+        copy."""
+        return self.tp_size_per_node if self.num_kv_heads > 1 else 1
+
+    @property
     def token_size_in_bytes(self) -> int:
         """Whole-model per-token KV footprint (bytes) across all layers/groups."""
         kv_dim = self.kv_dim
         if self.layer_groups:
-            # layer_groups store per-GPU num_kv_heads; multiply by tp_size
-            # to get full-model per-token size (matching CPU/SSD block sizing).
+            # layer_groups store per-GPU num_kv_heads; multiply by the TP slots
+            # of a host block (matching CPU/SSD block sizing).
             # Each group may carry its own dtype (None = inherit ModelConfig.dtype),
             # so indexer-as-group (fp8/uint8) and main KV (bf16) sum correctly.
             # ``compress_ratio`` shrinks the per-token contribution. This
@@ -460,7 +469,7 @@ class ModelConfig:
                 * (g.dtype or self.dtype).itemsize
                 // g.compress_ratio
                 for g in self.layer_groups
-            ) * self.tp_size
+            ) * self.host_tp_copies
         return self.num_layers * self.num_kv_heads * self.head_size * kv_dim * self.dtype.itemsize
 
     def __str__(self) -> str:
@@ -1172,7 +1181,7 @@ def block_size_in_bytes_for_cache(
                     f"does not divide tokens_per_block="
                     f"{cache_config.tokens_per_block}"
                 )
-        return model_config.tp_size * sum(
+        return model_config.host_tp_copies * sum(
             group.num_layers
             * model_config.kv_dim
             * (cache_config.tokens_per_block // group.compress_ratio)

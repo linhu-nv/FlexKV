@@ -82,6 +82,14 @@ class KVManager:
                 "and enable_p2p_ssd=False (cross-node reuse follows the "
                 "radix-server's cluster flags)"
             )
+        if (self.enable_radixshmem and model_config.nnodes > 1
+                and model_config.local_dp_size is None):
+            raise ValueError(
+                "radix_shmem needs every replica on one node (or node-local DP, "
+                "local_dp_size): for a replica spanning nodes only the master "
+                "node's radix-server indexes a block, and a peer pull fills "
+                "that node's slots alone"
+            )
         flexkv_logger.info(
             f"[KVManager] IPC ports: server_recv_port={self.server_recv_port}, "
             f"gpu_register_port={self.gpu_register_port}"
@@ -496,6 +504,15 @@ class KVManager:
             return self.dp_client.wait(task_ids, timeout, completely)
         else:
             return self.kv_task_engine.wait(task_ids, timeout, completely)
+
+    def has_running_graphs(self) -> bool:
+        """Whether the caller must keep polling (``try_wait``) although it waits
+        for no task: a graph still runs after its task was returned, like a
+        PUT's SSD write. False when another loop drives the engine (the
+        chunked-prefetch runtime) and in server-client mode."""
+        if self.server_client_mode or self.kv_task_engine._runtime is not None:
+            return False
+        return self.kv_task_engine.has_running_graphs()
 
     def try_wait(self, task_ids: Union[int, List[int]]) -> Dict[int, KVResponse]:
         if isinstance(task_ids, int):
