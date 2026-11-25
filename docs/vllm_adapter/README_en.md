@@ -6,7 +6,7 @@
 
 Starting from **vLLM v0.17.2rc0** (commit [`8cb24d3`](https://github.com/vllm-project/vllm/commit/8cb24d3aedb9f431fb15a636a3e11a00262f5991)), `FlexKVConnectorV1` is built into vLLM — **no patch is needed anymore**.
 
-> **Recommended**: Install vLLM v0.17.2 ~ v0.28.x, or v0.33.0 / v0.34.1 with [its patch](#patching-vllm). Since v0.29.0 the built-in connector can no longer start FlexKV. The other patch files under `examples/vllm_adaption/` are retained for users who need to use vLLM < 0.17.2.
+> **Recommended**: Install vLLM v0.17.2 ~ v0.28.x, or v0.33.0 / v0.34.1 with [its patch](#patching-vllm). Since v0.29.0 the built-in connector can no longer start FlexKV.
 
 ---
 
@@ -17,7 +17,7 @@ In commit [`0290841dce65ae9b036a23d733cf94e47e814934`](https://github.com/taco-p
 This change involves significant API adjustments. Therefore, please note:
 
 - **Version >= `1.0.0`**: Use the **current version API**.
-- **Version == `0.1.0`**: Supports the **legacy version API** only; the vLLM patch is located in `examples/vllm_adaption_legacy/`.
+- **Version == `0.1.0`**: Supports the **legacy version API** only.
 
 ---
 
@@ -28,7 +28,6 @@ This change involves significant API adjustments. Therefore, please note:
 - vLLM `0.17.2` ~ `0.28.x`: FlexKVConnectorV1 is built in — no patch required
 - vLLM `0.33.0`: the built-in FlexKVConnectorV1 must be patched, see [Patching vLLM](#patching-vllm)
 - vLLM `0.34.1` (main [`d51a514`](https://github.com/vllm-project/vllm/commit/d51a5147112a31dfbed08cfa4b774c27c34ce90d), nightly `0.34.1rc1.dev96`; not 0.34.0): the built-in FlexKVConnectorV1 must be patched, see [Patching vLLM](#patching-vllm)
-- vLLM `0.10.1` ~ `0.17.1`: Manual patch required, see [Patching vLLM](#patching-vllm)
 
 ### Configuration
 
@@ -113,9 +112,7 @@ VLLM_USE_V1=1 python -m vllm.entrypoints.cli.main serve MODEL \
 `use_layerwise=true` is required so vLLM selects PIECEWISE CUDA graph mode;
 the per-layer eventfd waits cannot execute correctly inside a captured full
 CUDA graph. For safety, setting `FLEXKV_ENABLE_LAYERWISE_TRANSFER=1` alone is
-ignored by the vLLM adapter. The vLLM 0.33.0 and 0.34.1 patches already contain
-the matching wrapper change; for other versions, until it is merged upstream, apply
-`examples/vllm_adaption/vllm_main-flexkv-layerwise-wrapper.patch` to vLLM.
+ignored by the vLLM adapter. It needs the vLLM 0.33.0 or 0.34.1 patch.
 
 The feature currently pipelines GET/H2D only. PUT remains request-level async.
 Context parallelism (`context_parallel_size > 1`) is not supported yet because
@@ -135,16 +132,13 @@ Apply the patch matching your vLLM version:
 
 | vLLM Version | Patch File |
 |---|---|
-| 0.10.1.1 | `examples/vllm_adaption/vllm_0_10_1_1-flexkv-connector.patch` |
-| 0.14.1+ | `examples/vllm_adaption/vllm_up_0_14_1-flexkv-connector.patch` |
-| 0.16.0 | `examples/vllm_adaption/vllm_0_16_0-flexkv-connector.patch` |
 | 0.33.0 | `examples/vllm_adaption/vllm_0_33_0-flexkv-connector.patch` |
 | 0.34.1 | `examples/vllm_adaption/vllm_0_34_1-flexkv-connector.patch` |
 
 ```bash
 cd vllm
 # Set FLEXKV_DIR and choose the patch matching your vLLM version.
-PATCH_FILE=vllm_0_16_0-flexkv-connector.patch
+PATCH_FILE=vllm_0_34_1-flexkv-connector.patch
 git apply "$FLEXKV_DIR/examples/vllm_adaption/$PATCH_FILE"
 pip install -e .
 ```
@@ -178,36 +172,3 @@ While FlexKV still copies a finished request's KV out of its GPU blocks, a vLLM
 short of blocks waits for them rather than preempting a running request. It
 stops waiting once the oldest such copy has run for `FLEXKV_PENDING_FREE_WAIT_S`
 seconds (default `5`; `0` turns the wait off).
-
----
-
-## Legacy Version (<= 0.1.0) – Not Recommended for Current Use
-
-### Supported Versions
-- FlexKV <= `0.1.0`
-
-### Configuration
-
-Legacy version configuration:
-```bash
-# generate config
-cat <<EOF > ./flexkv_config.json
-{
-    "server_recv_port": "ipc:///tmp/flexkv_test",
-    "cache_config": {
-          "enable_cpu": true,
-          "num_cpu_blocks": 10240
-    },
-    "num_log_interval_requests": 200
-}
-EOF
-export FLEXKV_CONFIG_PATH="./flexkv_config.json"
-```
-
-### Running
-
-The legacy patches in `examples/vllm_adaption_legacy/` target vLLM 0.8.4 and
-0.10.0 respectively. The historical `benchmarks/flexkv_benchmark/` launch
-scripts are not present in this checkout. To reproduce a legacy deployment,
-use a compatible historical FlexKV revision containing its scripts; the current
-branch and its configuration examples target the current API.
