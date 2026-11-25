@@ -54,7 +54,7 @@ def _page(raw, config, name, block):
     """The bytes of block ``block`` of cache ``name`` in a rank's allocation."""
     for tensor in config.kv_cache_tensors:
         if name in tensor.layers:
-            spec = config.kv_cache_groups[0].kv_cache_spec.kv_cache_specs[name]
+            spec = config.kv_cache_groups[0].kv_cache_specs[name]
             start = (tensor.offset + tensor.layers.index(name) * tensor.layer_stride
                      + block * tensor.block_stride)
             return raw[start:start + spec.page_size_bytes]
@@ -67,7 +67,7 @@ def _page(raw, config, name, block):
 def test_split_heads_round_trip_through_per_rank_slots(
         monkeypatch, tp_size, nnodes, layout, region_batch):
     monkeypatch.setattr(GLOBAL_CONFIG_FROM_ENV, "region_batch", region_batch)
-    config = _gqa_config(scheduler=False, layout=layout)
+    config = _gqa_config(layout)
     flexkv_config = FlexKVConfig()
     flexkv_config.model_config.tp_size = tp_size
     flexkv_config.model_config.nnodes = nnodes

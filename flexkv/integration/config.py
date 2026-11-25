@@ -186,6 +186,16 @@ def vllm_transfer_group_id(kv_cache_config: "KVCacheConfig") -> int:
     return cacheable[0]
 
 
+def _vllm_layer_specs(group) -> list:
+    """The KV cache specs of a vLLM KV cache group's layers."""
+    specs = getattr(group, "kv_cache_specs", None)
+    if specs is not None:
+        return list(specs.values())
+    from vllm.v1.kv_cache_interface import iter_layer_specs  # vLLM <= 0.34.0
+
+    return list(iter_layer_specs(group.kv_cache_spec))
+
+
 def _vllm_page_bytes(kv_cache_config: "KVCacheConfig") -> dict:
     """Bytes of one block of every vLLM cache layer, padding included."""
     layout = getattr(kv_cache_config, "kv_cache_layout", None)
@@ -561,7 +571,7 @@ class FlexKVConfig:
         kv_cache_config: "KVCacheConfig",
     ) -> None:
         """Populate the packed storage layout from vLLM resolved KV specs."""
-        from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec, iter_layer_specs
+        from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
 
         group_id = vllm_transfer_group_id(kv_cache_config)
         group = kv_cache_config.kv_cache_groups[group_id]
@@ -573,7 +583,7 @@ class FlexKVConfig:
             return
 
         layouts = set()
-        for spec in iter_layer_specs(group.kv_cache_spec):
+        for spec in _vllm_layer_specs(group):
             if not isinstance(spec, AttentionSpec):
                 raise ValueError(
                     "FlexKV only supports attention KV cache specs; got "
@@ -657,16 +667,16 @@ class FlexKVConfig:
         A CPU/SSD block keeps one copy of a block's pages when every TP rank
         holds the same ones (vLLM's ``kv_tp_replicas``, or an MLA first layer),
         and one per rank otherwise. Of the group's specs only the first layer's
-        is read, as the scheduler's KVCacheConfig keeps no other, so both sides
-        agree; the workers, which see every spec, refuse a group whose first
-        layer is MLA while other caches differ across ranks.
+        decides, as the scheduler KVCacheConfig of vLLM <= 0.34.0 keeps no
+        other, so both sides agree; the workers, which see every spec, refuse a group whose
+        first layer is MLA while other caches differ across ranks.
         """
         from vllm.model_executor.models.utils import extract_layer_index
-        from vllm.v1.kv_cache_interface import MLAAttentionSpec, iter_layer_specs
+        from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
         group = kv_cache_config.kv_cache_groups[group_id]
-        specs = iter_layer_specs(group.kv_cache_spec)
-        first_spec = next(iter(specs))
+        specs = _vllm_layer_specs(group)
+        first_spec = specs[0]
         replicated = (
             getattr(kv_cache_config, "kv_tp_replicas", 1) >= self.model_config.tp_size)
         kv_shared_across_ranks = replicated or isinstance(first_spec, MLAAttentionSpec)
@@ -696,7 +706,7 @@ class FlexKVConfig:
                 layer_names[index] = name
             layer_of[name] = index
 
-        tokens_per_block = group.kv_cache_spec.block_size
+        tokens_per_block = first_spec.block_size
         layer_groups, group_layer_names = [], []
         for tensor in kv_cache_config.kv_cache_tensors:
             names = [name for name in tensor.layers if name in layer_of]
