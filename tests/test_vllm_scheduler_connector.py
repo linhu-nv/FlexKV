@@ -118,6 +118,21 @@ def test_logged_stats_sum_the_step_reports():
     assert Impl.build_kv_connector_stats(None).is_empty()
 
 
+def test_connector_hooks_ask_for_what_flexkv_needs():
+    assert not object.__new__(Impl).requires_kv_delivery
+    assert not Impl.supports_lookahead_block_hashes(None)
+    assert Impl.get_required_kvcache_layout(None) == "LBNHC"
+    assert Impl.requires_piecewise_for_cudagraph({"use_layerwise": True})
+    assert not Impl.requires_piecewise_for_cudagraph({})
+
+
+def test_the_extensible_kv_cache_stays_off():
+    access = getattr(pytest.importorskip("vllm.config.kv_transfer"), "KVCacheAccess", None)
+    if access is None:
+        pytest.skip("vLLM without KVCacheAccess")
+    assert Impl.kv_cache_access(None) == access.LEGACY_IPC
+
+
 @pytest.mark.parametrize("group, loaded", [
     pytest.param(None, (0,), id="one-group"),
     pytest.param(VllmKVGroup(1, ("layers.0.attn",)), (1,), id="hybrid"),

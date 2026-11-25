@@ -102,7 +102,8 @@ except ImportError:
     _HAS_KV_CONNECTOR_OUTPUT = False
 
 if TYPE_CHECKING:
-    from vllm.config import VllmConfig
+    from vllm.config import KVTransferConfig, VllmConfig
+    from vllm.config.kv_transfer import KVCacheAccess
     from vllm.v1.core.sched.output import SchedulerOutput
     try:
         from vllm.v1.attention.backend import AttentionMetadata
@@ -175,7 +176,7 @@ def _attention_waits_for_layers(forward_context: Optional[dict],
     """Whether vLLM's attention calls ``wait_for_layer_load`` before it reads
     each of these layers: Attention and MLAAttention do through their custom
     ops (MLAAttention's direct call skips it); DeepSeek-V4.1's own attention
-    does with examples/vllm_adaption/vllm_0_33_0-deepseek-v41-layerwise.patch."""
+    does with the deepseek-v41-layerwise patch in examples/vllm_adaption/."""
     if forward_context is None:
         return True
     try:
@@ -1376,8 +1377,8 @@ class FlexKVWorkerConnector:
             raise NotImplementedError(
                 "use_layerwise needs a model whose attention waits for every "
                 "layer it reads (wait_for_layer_load); this one does not. For "
-                "DeepSeek-V4.1 on vLLM 0.33.0 apply "
-                "examples/vllm_adaption/vllm_0_33_0-deepseek-v41-layerwise.patch, "
+                "DeepSeek-V4.1 apply the deepseek-v41-layerwise patch for your "
+                "vLLM version in examples/vllm_adaption/, "
                 "otherwise set use_layerwise to false")
         pool = LayerwiseCounterPool(layer_names)
         self.layerwise_counter_pool = pool
@@ -1595,6 +1596,33 @@ class FlexKVConnectorV1Impl:
 
     def shutdown(self):
         self.connector.shutdown()
+
+    @property
+    def requires_kv_delivery(self) -> bool:
+        """A dropped save is only a later cache miss."""
+        return False
+
+    @classmethod
+    def supports_lookahead_block_hashes(cls, kv_transfer_config: "KVTransferConfig") -> bool:
+        """FlexKV keys a block by its own tokens, not by the ones after it."""
+        return False
+
+    @classmethod
+    def kv_cache_access(cls, kv_transfer_config: "KVTransferConfig") -> "KVCacheAccess":
+        """The transfer engine opens the KV cache through CUDA IPC."""
+        from vllm.config.kv_transfer import KVCacheAccess
+
+        return KVCacheAccess.LEGACY_IPC
+
+    @classmethod
+    def get_required_kvcache_layout(cls, vllm_config: "VllmConfig") -> Optional[str]:
+        """FlexKV addresses each layer's blocks token-major."""
+        return "LBNHC"
+
+    @classmethod
+    def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
+        """Layer-wise loads wait for each layer between CUDA graph pieces."""
+        return bool(extra_config.get("use_layerwise", False))
 
     def reset_cache(self) -> Optional[bool]:
         """Reset the FlexKV cache. Only meaningful on the scheduler side
