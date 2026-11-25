@@ -52,13 +52,19 @@ def _counter(llm, name):
     return 0
 
 
-def _verl_clear(llm):
-    """Reproduce verl's clear_kv_cache() (vllm_async_server.py:809-820).
+def _verl_clear(llm, retries=50, delay=0.1):
+    """Reproduce verl's clear_kv_cache() (vllm_async_server.py:809-820), retried
+    while FlexKV's async put still holds blocks: the reset returns False until
+    it has drained.
 
     The llm fixture already skips vLLM < 0.13.0, so reset_connector is always
     forwarded and reset_mm_cache always exists here.
     """
-    ok = llm.reset_prefix_cache(reset_connector=True)
+    for _ in range(retries):
+        ok = llm.reset_prefix_cache(reset_connector=True)
+        if ok is not False:
+            break
+        time.sleep(delay)
     llm.reset_mm_cache()
     # reset_encoder_cache is multimodal-only; skipped for a text model.
     return ok
@@ -154,15 +160,6 @@ _DATASET = [
 PROMPTS = [f"[{turn}] {prompt * 800}" for turn, prompt in enumerate(_DATASET)]
 
 
-def test_reset_prefix_cache_reset_connector_succeeds(llm):
-    """Smoke: the exact verl call returns without error (wire is connected)."""
-    llm.generate(PROMPTS, SamplingParams(max_tokens=8, temperature=0))
-    # time.sleep(5)  # drain FlexKV's async D2H put -> quiesced boundary before reset
-    ok = _verl_clear(llm)
-    # Scheduler treats only a literal False as failure.
-    assert ok is not False
-
-
 def test_flexkv_populates_before_asserting_reset(llm):
     """Sanity: with FlexKV warm but the LOCAL cache cleared, a re-run must hit
     FlexKV.
@@ -199,7 +196,7 @@ def test_reset_invalidates_flexkv_hits(llm):
     ehw, eqw = generate(llm, PROMPTS, sp)
 
     # CLEAR: exactly what verl's clear_kv_cache does (drops LOCAL + FlexKV).
-    _verl_clear(llm)
+    assert _verl_clear(llm) is not False, "verl's clear kept failing"
 
     # run1: local was just cleared -> full ext query; FlexKV also cleared -> ~0
     # hits. This is the run that proves the reset reached FlexKV.
