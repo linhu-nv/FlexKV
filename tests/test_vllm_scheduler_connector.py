@@ -4,7 +4,7 @@ its PUTs to free blocks, and how a failed load reaches vLLM."""
 import importlib.util
 import time
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import numpy as np
 import pytest
@@ -16,7 +16,7 @@ from vllm.v1.outputs import KVConnectorOutput  # noqa: E402
 
 from flexkv.common.config import RankInfo  # noqa: E402
 from flexkv.common.request import KVResponseStatus  # noqa: E402
-from flexkv.integration.config import FlexKVConfig, VllmKVGroup  # noqa: E402
+from flexkv.integration.config import FlexKVConfig, VllmKVGroup, VllmSWAGroups  # noqa: E402
 from flexkv.integration.stats import FlexKVStats  # noqa: E402
 from flexkv.integration.vllm import vllm_v1_adapter as adapter  # noqa: E402
 
@@ -349,3 +349,163 @@ def test_vllm_without_failed_receives_takes_a_failed_get_as_finished(scheduler, 
 
     assert output.finished_recving == {REQ}
     assert not _step(scheduler).failed_recving
+
+
+SWA = VllmSWAGroups(group_ids=(0, 1), block_size=32, window_blocks=4,
+                    block_bytes=1024, region_layer_names=("layers.0.attn.swa_cache",))
+SNAPSHOT = 11
+# A 200-token prompt: full-attention group 2 in 64-token blocks, the two
+# sliding-window groups in 32-token blocks; it snapshots at token 192.
+BLOCK_IDS = ([20, 21, 22, 23, 24, 25, 26], [30, 31, 32, 33, 34, 35, 36], [10, 11, 12, 13])
+WINDOW = [22, 23, 24, 25, 32, 33, 34, 35]
+
+
+class _BlockPool:
+    """Stands in for vLLM's BlockPool: counts the references FlexKV takes."""
+
+    def __init__(self):
+        self.blocks = [SimpleNamespace(block_id=i, ref_cnt=1) for i in range(40)]
+        self.null_block = self.blocks[0]
+
+    def touch(self, blocks):
+        for block in blocks:
+            block.ref_cnt += 1
+
+    def free_blocks(self, blocks):
+        for block in blocks:
+            block.ref_cnt -= 1
+
+    def refs(self, block_ids):
+        return [self.blocks[i].ref_cnt for i in block_ids]
+
+
+@pytest.fixture
+def swa(manager):
+    config = FlexKVConfig()
+    config.cache_config.tokens_per_block = 64
+    config.vllm_kv_group = VllmKVGroup(2, ("layers.0.attn",), swa=SWA)
+    scheduler = _scheduler(config)
+    pool = _BlockPool()
+    scheduler.bind_kv_cache_manager(SimpleNamespace(block_pool=pool))
+    manager.put_match.return_value = (SNAPSHOT, np.ones(192, dtype=bool))
+    manager.launch.side_effect = lambda task_ids, **kwargs: list(task_ids)
+    return scheduler, pool
+
+
+def _prompt(finished_reason=None):
+    request = SimpleNamespace(
+        request_id=REQ, num_tokens=200, num_prompt_tokens=200,
+        all_token_ids=list(range(200)), num_output_tokens=0)
+    request.is_finished = lambda: finished_reason is not None
+    request.get_finished_reason = lambda: finished_reason
+    return request
+
+
+def _prompt_step(num_computed, num_scheduled, preempted=()):
+    return SimpleNamespace(
+        scheduled_new_reqs=[SimpleNamespace(req_id=REQ, num_computed_tokens=num_computed)],
+        scheduled_cached_reqs=SimpleNamespace(req_ids=[], num_computed_tokens=[]),
+        num_scheduled_tokens={REQ: num_scheduled},
+        kv_connector_block_state=SimpleNamespace(get_block_ids=lambda req_id: BLOCK_IDS),
+        preempted_req_ids=set(preempted), finished_req_ids=set())
+
+
+def _launches(manager):
+    return [c for c in manager.launch.call_args_list if c.kwargs["task_ids"] == [SNAPSHOT]]
+
+
+def test_prompt_end_snapshot_pins_its_blocks_until_it_lands(swa, manager):
+    scheduler, pool = swa
+    request = _prompt()
+    scheduler.on_new_request(request)
+
+    scheduler.build_connector_meta(_prompt_step(0, 128))
+    manager.put_match.assert_not_called()
+
+    scheduler.build_connector_meta(_prompt_step(128, 72))
+    kwargs = manager.put_match.call_args.kwargs
+    assert len(kwargs["token_ids"]) == 192 and kwargs["swa"] is True
+    pinned = [10, 11, 12] + WINDOW
+    assert pool.refs(pinned) == [2] * len(pinned)
+
+    scheduler.update_connector_output(KVConnectorOutput())
+    assert not _launches(manager)
+
+    request.num_output_tokens = 1
+    scheduler.update_connector_output(KVConnectorOutput())
+    (launch,) = _launches(manager)
+    tpb = 64
+    assert list(launch.kwargs["slot_mappings"][0][::tpb] // tpb) == [10, 11, 12]
+    assert list(launch.kwargs["swa_slot_mappings"][0][::tpb] // tpb) == WINDOW
+
+    manager.try_wait.return_value = {SNAPSHOT: SimpleNamespace(status=KVResponseStatus.SUCCESS)}
+    output = KVConnectorOutput()
+    scheduler.update_connector_output(output)
+    assert pool.refs(pinned) == [1] * len(pinned)
+    assert not output.finished_sending
+
+
+def test_a_short_prompt_takes_no_snapshot(swa, manager):
+    scheduler, _ = swa
+    request = _prompt()
+    request.num_prompt_tokens = 128
+    scheduler.on_new_request(request)
+
+    scheduler.build_connector_meta(_prompt_step(0, 128))
+
+    manager.put_match.assert_not_called()
+
+
+@pytest.mark.parametrize("reason, launched", [
+    pytest.param(FinishReason.STOP, True, id="stop"),
+    pytest.param(FinishReason.ABORT, False, id="abort"),
+])
+def test_finishing_settles_a_pending_snapshot(swa, manager, reason, launched):
+    scheduler, pool = swa
+    request = _prompt(reason)
+    scheduler.on_new_request(request)
+    scheduler.build_connector_meta(_prompt_step(0, 200))
+
+    scheduler.request_finished(request, [10, 11, 12, 13])
+
+    assert bool(_launches(manager)) == launched
+    assert (call(task_ids=[SNAPSHOT]) in manager.cancel.call_args_list) != launched
+    assert pool.refs(WINDOW) == [2 if launched else 1] * len(WINDOW)
+    # The request's own PUT stores Full KV only.
+    assert [c.kwargs["swa"] for c in manager.put_match.call_args_list] == (
+        [True, False] if launched else [True])
+
+
+def test_preemption_drops_a_pending_snapshot(swa, manager):
+    scheduler, pool = swa
+    scheduler.on_new_request(_prompt())
+    scheduler.build_connector_meta(_prompt_step(0, 200))
+
+    scheduler.build_connector_meta(_prompt_step(0, 0, preempted=[REQ]))
+
+    manager.cancel.assert_any_call(task_ids=[SNAPSHOT])
+    assert pool.refs(WINDOW) == [1] * len(WINDOW)
+    assert not _launches(manager)
+
+
+def test_a_hit_loads_the_window_before_its_end(swa, manager):
+    scheduler, _ = swa
+    request = _prompt()
+    manager.get_match.return_value = (TASK, np.ones(192, dtype=bool))
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (192, True)
+    assert manager.get_match.call_args.kwargs["swa_aware"] is True
+
+    blocks = SimpleNamespace(get_block_ids=lambda: BLOCK_IDS)
+    scheduler.update_state_after_alloc(request, blocks, 192)
+    task = scheduler.connector.tasks_to_launch[TASK]
+    assert list(task.swa_slot_mapping[::64] // 64) == WINDOW
+    assert scheduler.get_loaded_kv_cache_group_ids(request) == (2, 0, 1)
+
+
+def test_a_hit_shorter_than_the_window_is_dropped(swa, manager):
+    scheduler, _ = swa
+    manager.get_match.return_value = (TASK, np.ones(64, dtype=bool))
+
+    assert scheduler.get_num_new_matched_tokens(_prompt(), 0) == (0, False)
+    manager.cancel.assert_called_with(task_ids=[TASK])

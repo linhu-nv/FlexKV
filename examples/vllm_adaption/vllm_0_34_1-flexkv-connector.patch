@@ -1,5 +1,5 @@
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/flexkv_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/flexkv_connector.py
-index 4b502ba63c..27816d067c 100644
+index 4b502ba63c..d2793cd71f 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/flexkv_connector.py
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/flexkv_connector.py
 @@ -6,10 +6,13 @@ from typing import TYPE_CHECKING, Any
@@ -16,7 +16,15 @@ index 4b502ba63c..27816d067c 100644
  )
  from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
  from vllm.logger import init_logger
-@@ -27,12 +30,21 @@ if TYPE_CHECKING:
+@@ -20,19 +23,28 @@ if TYPE_CHECKING:
+     from vllm.distributed.kv_events import KVCacheEvent
+     from vllm.forward_context import ForwardContext
+     from vllm.v1.attention.backend import AttentionMetadata
+-    from vllm.v1.core.kv_cache_manager import KVCacheBlocks
++    from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
+     from vllm.v1.kv_cache_interface import KVCacheConfig
+     from vllm.v1.request import Request
+ 
  logger = init_logger(__name__)
  
  
@@ -172,7 +180,7 @@ index 4b502ba63c..27816d067c 100644
          """Get the number of new tokens that can be loaded from the
          external KV cache beyond `num_computed_tokens`.
  
-@@ -202,7 +261,8 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
+@@ -202,13 +261,18 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
          Returns:
              Tuple of (num_external_tokens, is_ready) where
              num_external_tokens is the number of additional tokens that
@@ -182,7 +190,17 @@ index 4b502ba63c..27816d067c 100644
  
          """
          return self._flexkv_connector.get_num_new_matched_tokens(
-@@ -217,6 +277,10 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
+             request, num_computed_tokens
+         )
+ 
++    def bind_kv_cache_manager(self, kv_cache_manager: "KVCacheManager") -> None:
++        super().bind_kv_cache_manager(kv_cache_manager)
++        self._flexkv_connector.bind_kv_cache_manager(kv_cache_manager)
++
+     def update_state_after_alloc(
+         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
+     ):
+@@ -217,6 +281,10 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
              request, blocks, num_external_tokens
          )
  
@@ -193,7 +211,7 @@ index 4b502ba63c..27816d067c 100644
      def build_connector_meta(
          self, scheduler_output: SchedulerOutput
      ) -> KVConnectorMetadata:
-@@ -258,6 +322,29 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
+@@ -258,6 +326,29 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
          """
          return self._flexkv_connector.request_finished(request, block_ids)
  
@@ -223,7 +241,7 @@ index 4b502ba63c..27816d067c 100644
      def take_events(self) -> Iterable["KVCacheEvent"]:
          """Collect buffered KV cache events.
  
-@@ -271,6 +358,23 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
+@@ -271,6 +362,23 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
          """Get the KV connector stats collected during the last interval."""
          return self._flexkv_connector.get_kv_connector_stats()
  
