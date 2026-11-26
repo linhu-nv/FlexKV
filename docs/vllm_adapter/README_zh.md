@@ -119,9 +119,13 @@ VLLM_USE_V1=1 python -m vllm.entrypoints.cli.main serve MODEL \
 不是直接 `DISK2D`。如果某一层在
 `FLEXKV_LAYERWISE_WAIT_TIMEOUT_S`（默认 `60` 秒）内未就绪，forward 会失败，
 而不是永久卡住。模型的 attention 必须在读每一层之前等待该层加载，否则 FlexKV
-拒绝启动；DeepSeek-V4.1 在 vLLM 0.33.0 上需再打
-`examples/vllm_adaption/vllm_0_33_0-deepseek-v41-layerwise.patch`，在 vLLM 0.34.1 上需再打
-`examples/vllm_adaption/vllm_0_34_1-deepseek-v41-layerwise.patch`。
+拒绝启动；下列模型需再打 `examples/vllm_adaption/` 中对应 vLLM 0.33.0（`vllm_0_33_0-*`）
+或 0.34.1（`vllm_0_34_1-*`）的 patch：
+
+| 模型 | patch |
+|---|---|
+| DeepSeek-V4.1 | `vllm_<版本>-deepseek-v41-layerwise.patch` |
+| DeepSeek-V3.2、GLM-5.x（`GlmMoeDsaForCausalLM`，如 GLM-5.3） | `vllm_<版本>-deepseek-v32-layerwise.patch` |
 
 ### 给 vLLM 打 patch
 

@@ -122,9 +122,14 @@ CPU/SSD/remote staging rather than direct `DISK2D` operations.
 If a layer does not become ready within
 `FLEXKV_LAYERWISE_WAIT_TIMEOUT_S` (default `60` seconds), the forward fails
 instead of hanging indefinitely. The model's attention must wait for each layer
-it reads; FlexKV refuses to start otherwise. DeepSeek-V4.1's does with
-`examples/vllm_adaption/vllm_0_33_0-deepseek-v41-layerwise.patch` on vLLM 0.33.0,
-or `examples/vllm_adaption/vllm_0_34_1-deepseek-v41-layerwise.patch` on vLLM 0.34.1.
+it reads; FlexKV refuses to start otherwise. These models' attention does with a
+patch in `examples/vllm_adaption/` for vLLM 0.33.0 (`vllm_0_33_0-*`) or 0.34.1
+(`vllm_0_34_1-*`):
+
+| Model | Patch |
+|---|---|
+| DeepSeek-V4.1 | `vllm_<version>-deepseek-v41-layerwise.patch` |
+| DeepSeek-V3.2, GLM-5.x (`GlmMoeDsaForCausalLM`, e.g. GLM-5.3) | `vllm_<version>-deepseek-v32-layerwise.patch` |
 
 ### Patching vLLM
 

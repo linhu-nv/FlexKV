@@ -175,8 +175,9 @@ def _attention_waits_for_layers(forward_context: Optional[dict],
                                 layer_names: Iterable[str]) -> bool:
     """Whether vLLM's attention calls ``wait_for_layer_load`` before it reads
     each of these layers: Attention and MLAAttention do through their custom
-    ops (MLAAttention's direct call skips it); DeepSeek-V4.1's own attention
-    does with the deepseek-v41-layerwise patch in examples/vllm_adaption/."""
+    ops, which MLAAttention's direct call and a subclass's own forward
+    (DeepSeek-V3.2, GLM-5) skip; DeepSeek-V4.1's and DeepSeek-V3.2's attention
+    do with the deepseek-v41/v32-layerwise patches in examples/vllm_adaption/."""
     if forward_context is None:
         return True
     try:
@@ -186,9 +187,11 @@ def _attention_waits_for_layers(forward_context: Optional[dict],
         return True
 
     def waits(layer) -> bool:
+        if hasattr(layer, "_wait_for_kv_layer_load"):
+            return True
         if isinstance(layer, MLAAttention):
-            return not layer.use_direct_call
-        return isinstance(layer, Attention) or hasattr(layer, "_wait_for_kv_layer_load")
+            return not layer.use_direct_call and type(layer).forward is MLAAttention.forward
+        return isinstance(layer, Attention)
 
     return all(waits(forward_context.get(name)) for name in layer_names)
 
@@ -1559,9 +1562,9 @@ class FlexKVWorkerConnector:
             raise NotImplementedError(
                 "use_layerwise needs a model whose attention waits for every "
                 "layer it reads (wait_for_layer_load); this one does not. For "
-                "DeepSeek-V4.1 apply the deepseek-v41-layerwise patch for your "
-                "vLLM version in examples/vllm_adaption/, "
-                "otherwise set use_layerwise to false")
+                "DeepSeek-V4.1 or DeepSeek-V3.2/GLM-5 apply the deepseek-v41- or "
+                "deepseek-v32-layerwise patch for your vLLM version in "
+                "examples/vllm_adaption/, otherwise set use_layerwise to false")
         pool = LayerwiseCounterPool(layer_names)
         swa = self.flexkv_config.vllm_kv_group and self.flexkv_config.vllm_kv_group.swa
         if swa is not None:

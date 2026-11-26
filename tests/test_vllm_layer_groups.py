@@ -23,9 +23,14 @@ from vllm.v1.kv_cache_interface import (  # noqa: E402
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout as VllmKVCacheLayout  # noqa: E402
 
-from flexkv.common.config import LayerGroupSpec, block_size_in_bytes_for_cache  # noqa: E402
+from flexkv.common.config import (  # noqa: E402
+    LayerGroupSpec,
+    block_size_in_bytes_for_cache,
+    build_layer_member_map,
+)
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType  # noqa: E402
 from flexkv.integration.config import FlexKVConfig, VllmSWAGroups  # noqa: E402
+from flexkv.integration.vllm import vllm_v1_adapter as adapter  # noqa: E402
 from flexkv.integration.vllm.vllm_v1_adapter import FlexKVWorkerConnector  # noqa: E402
 from flexkv.transfer.template import compile_gpu_regions  # noqa: E402
 
@@ -284,6 +289,82 @@ def test_caches_vllm_replicates_keep_one_copy():
     model_config = flexkv_config.model_config
     assert flexkv_config.vllm_kv_group.kv_shared_across_ranks
     assert (model_config.num_kv_heads, model_config.host_rank_copies) == (1, 1)
+
+
+GLM5_MLA = MLAAttentionSpec(block_size=64, num_kv_heads=1, max_tp_shards=1, head_size=576,
+                            dtype=torch.bfloat16)
+GLM5_INDEX_K = MLAAttentionSpec(block_size=64, num_kv_heads=1, max_tp_shards=1, head_size=132,
+                                dtype=torch.uint8)
+
+
+def _glm5_config() -> KVCacheConfig:
+    """GLM-5's one KV cache group, layers outermost: MLA in every layer, index
+    K only in the layers IndexCache computes top-k in (0 and 3 here), whose
+    MLA vLLM keeps in a tensor of its own."""
+    indexed, rest = (0, 3), (1, 2, 4, 5)
+    mla = [f"{G}.{i}.self_attn.attn" for i in range(6)]
+    index_k = [f"{G}.{i}.self_attn.indexer.k_cache" for i in indexed]
+    k_page, mla_page = GLM5_INDEX_K.page_size_bytes, GLM5_MLA.page_size_bytes
+    size = NUM_BLOCKS * (2 * k_page + 6 * mla_page)
+    tensors = [
+        KVCacheTensor(size, index_k, NUM_BLOCKS * k_page, k_page),
+        KVCacheTensor(size, [mla[i] for i in indexed], NUM_BLOCKS * mla_page, mla_page,
+                      2 * NUM_BLOCKS * k_page),
+        KVCacheTensor(size, [mla[i] for i in rest], NUM_BLOCKS * mla_page, mla_page,
+                      2 * NUM_BLOCKS * (k_page + mla_page)),
+    ]
+    specs = {**dict.fromkeys(mla, GLM5_MLA), **dict.fromkeys(index_k, GLM5_INDEX_K)}
+    config = KVCacheConfig(num_blocks=NUM_BLOCKS, kv_cache_tensors=tensors,
+                           kv_cache_groups=[_group(FullAttentionManager, specs)], kv_tp_replicas=8)
+    config.kv_cache_layout = "LBNHC"
+    return config
+
+
+def test_glm5_indexcache_group_as_layer_groups():
+    config = _glm5_config()
+    flexkv_config = FlexKVConfig()
+    flexkv_config.model_config.tp_size = 8
+    flexkv_config._configure_kv_layout_from_vllm_cache_config(config)
+
+    group = flexkv_config.vllm_kv_group
+    assert group.layer_names == tuple(f"{G}.{i}.self_attn.attn" for i in range(6))
+    model_config = flexkv_config.model_config
+    assert [(g.head_size, g.layer_indices) for g in model_config.layer_groups] == [
+        (8448, [0, 3]), (73728, [0, 3]), (73728, [1, 2, 4, 5])]
+    assert model_config.host_rank_copies == 1
+    # A layer-wise load posts layer 3 once its index K and MLA pages landed.
+    assert build_layer_member_map(model_config.layer_groups, 6).members_of(3) == ((0, 1), (1, 1))
+
+    raw = torch.zeros(config.kv_cache_tensors[0].size, dtype=torch.int8)
+    registration = _register(flexkv_config, _vllm_cache_views(config, group.cache_layer_names,
+                                                              raw=raw))
+    assert [[t.data_ptr() - raw.data_ptr() for t in tensors]
+            for tensors in registration["handles_per_group"]] == [
+        [t.offset + i * t.layer_stride for i in range(len(t.layers))]
+        for t in config.kv_cache_tensors]
+
+
+def test_layerwise_needs_an_attention_that_waits_for_its_layer():
+    from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+
+    class OwnForward(MLAAttention):  # DeepSeek-V3.2 / GLM-5 without the patch
+        def forward(self, positions, hidden_states):
+            raise NotImplementedError
+
+    class Patched(OwnForward):
+        def _wait_for_kv_layer_load(self):
+            raise NotImplementedError
+
+    def layer(cls, direct_call=False):
+        obj = object.__new__(cls)
+        obj.__dict__["use_direct_call"] = direct_call
+        return obj
+
+    def waits(cls, direct_call=False):
+        return adapter._attention_waits_for_layers({"a": layer(cls, direct_call)}, ["a"])
+
+    assert waits(MLAAttention) and waits(Patched)
+    assert not waits(OwnForward) and not waits(MLAAttention, direct_call=True)
 
 
 def test_dsv41_without_bounded_replay_snapshots_its_sliding_window_groups():
