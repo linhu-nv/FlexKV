@@ -654,9 +654,9 @@ RADIX_SWA_WINDOW_BLOCKS = 8
 class SWAPoolConfig:
     """Configuration for SWA (Sliding Window Attention) host pool(s).
 
-    SWA is managed at PAGE granularity: one pool slot stores exactly one
-    ``tokens_per_block`` page of SWA KV, and all SWA IO moves a whole page
-    (one slot) at a time.
+    SWA is managed at PAGE granularity: one pool slot stores
+    ``pages_per_slot`` ``tokens_per_block`` pages of SWA KV, and all SWA IO
+    moves whole slots.
     """
     enabled: bool = False
     num_slots: int = 1024              # Number of CPU SWA pool slots
@@ -674,6 +674,8 @@ class SWAPoolConfig:
     evict_ratio: float = 0.1           # Fraction of pool to evict when full
     pin_memory: bool = True            # Use pinned memory for async DMA
     layer_groups: Optional[List['LayerGroupSpec']] = None
+    # Pages of one snapshot, e.g. the window blocks of every vLLM SWA group.
+    pages_per_slot: int = 1
 
     def for_ssd_tier(self) -> "SWAPoolConfig":
         """Derive the SSD-tier SWA config (same slot geometry, num_ssd_slots slots).

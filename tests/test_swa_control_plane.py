@@ -25,6 +25,7 @@ CPU-only (the GPU SWA slot is a placeholder bound late); byte movement is the
 data plane's job (test_swa_control_plane_e2e.py / the KVManager GPU e2e).
 Requires flexkv.c_ext (production CacheEngineAccel / CRadixTreeIndex).
 """
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -502,6 +503,30 @@ def test_no_swa_slot_mapping_leaves_placeholder():
     # Only full-KV late-bind runs (no swa_slot_mapping).
     graph.set_gpu_blocks(np.arange(50, 50 + len(tok) // TPB, dtype=np.int64))
     assert swa_d2h.src_block_ids.tolist() == before  # untouched by full-KV bind
+    _complete(op_cb, cb)
+
+
+def test_multi_page_slots_move_every_page():
+    cc = _cache_config()
+    cc.swa = replace(cc.swa, pages_per_slot=3)
+    eng = GlobalCacheEngine(cc, _model_config())
+    tok = _tokens(4, base=14)
+    mask = np.ones_like(tok, dtype=np.int64)
+    sm = np.arange(tok.shape[0], dtype=np.int64)
+
+    graph, _rm, cb, op_cb, _e = eng.put(1, tok, mask, sm, dp_client_id=0)
+    (d2h,) = _swa_ops(graph)
+    first = d2h.dst_block_ids[0]
+    assert first % 3 == 0 and d2h.dst_block_ids.tolist() == [first, first + 1, first + 2]
+    graph.set_swa_gpu_blocks(np.array([7, 8, 9], dtype=np.int64))
+    assert d2h.src_block_ids.tolist() == [7, 8, 9]
+    _complete(op_cb, cb)
+
+    graph, _rm, cb, op_cb, _e = eng.get(2, tok, mask, sm, dp_client_id=0, swa_aware=True)
+    (h2d,) = _swa_ops(graph)
+    assert h2d.src_block_ids.tolist() == d2h.dst_block_ids.tolist()
+    graph.set_swa_gpu_blocks(np.array([4, 5, 6], dtype=np.int64))
+    assert h2d.dst_block_ids.tolist() == [4, 5, 6]
     _complete(op_cb, cb)
 
 

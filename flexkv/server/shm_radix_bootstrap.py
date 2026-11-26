@@ -326,7 +326,9 @@ def swa_cpu_kv_layout(model_config: ModelConfig, cache_config: CacheConfig,
 
 
 def swa_block_bytes(model_config: ModelConfig, cache_config: CacheConfig) -> int:
-    return layout_block_bytes(swa_cpu_kv_layout(model_config, cache_config, 1), torch.uint8)
+    """Bytes of one SWA slot: ``pages_per_slot`` pages."""
+    return cache_config.swa.pages_per_slot * layout_block_bytes(
+        swa_cpu_kv_layout(model_config, cache_config, 1), torch.uint8)
 
 
 def slot_align_for(*sizes: int) -> int:

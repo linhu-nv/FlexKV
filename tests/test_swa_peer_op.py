@@ -34,6 +34,7 @@ from flexkv.common.transfer import (
 )
 from flexkv.cache.transfer_pattern import add_virtual_op_for_multiple_finished_ops
 from flexkv.cache.swa_cache_engine import SWAOpConstructor
+from flexkv.common.config import SWAPoolConfig
 
 pytestmark = pytest.mark.unit
 
@@ -83,7 +84,7 @@ def _mgr(enabled=True, cpu=True, ssd=False, remote=False):
         engines[DeviceType.REMOTE] = SimpleNamespace(swa_enabled=True)
     gce = SimpleNamespace(
         cache_engines=engines,
-        cache_config=SimpleNamespace(enable_swa_transfer=enabled),
+        cache_config=SimpleNamespace(enable_swa_transfer=enabled, swa=SWAPoolConfig()),
     )
     return SWAOpConstructor(gce)
 

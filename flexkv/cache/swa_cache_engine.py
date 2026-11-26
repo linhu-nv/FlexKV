@@ -122,6 +122,10 @@ class SWAOpConstructor:
         dst = np.asarray(dst_slot_ids, dtype=np.int64)
         if src.size == 0 or dst.size == 0:
             return None
+        pages = self._gce.cache_config.swa.pages_per_slot
+        if pages > 1:
+            src = self._slot_pages(src, pages, transfer_type is TransferType.D2H)
+            dst = self._slot_pages(dst, pages, transfer_type is TransferType.H2D)
         is_remote = transfer_type in (TransferType.H2REMOTE, TransferType.REMOTE2H)
         tail_hashes = (
             [str(h) for h in mooncake_tail_hashes]
@@ -139,6 +143,18 @@ class SWAOpConstructor:
         )
         graph.add_transfer_op(op)
         return op.op_id
+
+    def host_pages(self, slot_ids: np.ndarray) -> np.ndarray:
+        """The CPU/SSD pages of SWA pool slots ``slot_ids``."""
+        return self._slot_pages(np.asarray(slot_ids, dtype=np.int64),
+                                self._gce.cache_config.swa.pages_per_slot, on_gpu=False)
+
+    @staticmethod
+    def _slot_pages(slot_ids: np.ndarray, pages: int, on_gpu: bool) -> np.ndarray:
+        """The page ids of ``slot_ids``; GPU ids are placeholders bound at launch."""
+        if on_gpu:
+            return np.repeat(slot_ids, pages)
+        return (slot_ids[:, None] * pages + np.arange(pages, dtype=np.int64)).ravel()
 
     def build_get_chain(self,
                         graph: TransferOpGraph,
