@@ -319,7 +319,7 @@ class FlexKVSchedulerConnector:
         self.block_pool = None
         self.requests: dict[str, Request] = {}
         self.pending_snapshots: dict[str, PromptSnapshot] = {}
-        self.running_snapshots: dict[int, PromptSnapshot] = {}
+        self.running_snapshots: dict[int, list[PromptSnapshot]] = {}
 
         if os.getenv('DYNAMO_USE_FLEXKV', '0') == '1':
             self.collector = KVEventCollector()
@@ -380,8 +380,7 @@ class FlexKVSchedulerConnector:
         # only support local batching for now
         self.enable_batch = (not self.cache_config.enable_kv_sharing
                              and not self.cache_config.enable_remote
-                             and not self.cache_config.enable_gds
-                             and self.swa is None)
+                             and not self.cache_config.enable_gds)
 
         while not self.is_ready():
             logger.info("Waiting for flexkv init...")
@@ -725,12 +724,9 @@ class FlexKVSchedulerConnector:
         self._forget_prefetch(request.request_id)
         self.failed_load_req_ids.discard(request.request_id)
         self.requests.pop(request.request_id, None)
-        snapshot = self.pending_snapshots.pop(request.request_id, None)
-        if snapshot is not None:
-            if request.get_finished_reason() in (FinishReason.STOP, FinishReason.LENGTH):
-                self._launch_snapshot(snapshot)
-            else:
-                self._drop_snapshot(snapshot)
+        if (request.request_id in self.pending_snapshots and request.get_finished_reason()
+                not in (FinishReason.STOP, FinishReason.LENGTH)):
+            self._drop_snapshot(self.pending_snapshots.pop(request.request_id))
         if request.request_id in self.failed_loads_unreported:
             # Its blocks hold no KV; vLLM frees them once the failed load's
             # report arrives.
@@ -934,20 +930,26 @@ class FlexKVSchedulerConnector:
                 swa_slot_mapping)
 
     def launch_ready_snapshots(self) -> None:
-        for req_id, snapshot in list(self.pending_snapshots.items()):
-            if snapshot.request.num_output_tokens > snapshot.num_output_tokens:
-                del self.pending_snapshots[req_id]
-                self._launch_snapshot(snapshot)
-
-    def _launch_snapshot(self, snapshot: PromptSnapshot) -> None:
+        ready = [snapshot for snapshot in self.pending_snapshots.values()
+                 if snapshot.request.is_finished()
+                 or snapshot.request.num_output_tokens > snapshot.num_output_tokens]
+        if not ready:
+            return
+        for snapshot in ready:
+            del self.pending_snapshots[snapshot.request.request_id]
         launched = self.flexkv_manager.launch(
-            task_ids=[snapshot.task_id],
-            slot_mappings=[snapshot.slot_mapping],
-            swa_slot_mappings=[snapshot.swa_slot_mapping])
-        if launched:
-            self.running_snapshots[launched[0]] = snapshot
+            task_ids=[snapshot.task_id for snapshot in ready],
+            slot_mappings=[snapshot.slot_mapping for snapshot in ready],
+            swa_slot_mappings=[snapshot.swa_slot_mapping for snapshot in ready],
+            as_batch=self.enable_batch and len(ready) > 1)
+        if len(launched) == len(ready):
+            for task_id, snapshot in zip(launched, ready, strict=True):
+                self.running_snapshots[task_id] = [snapshot]
+        elif len(launched) == 1:
+            self.running_snapshots[launched[0]] = ready
         else:
-            self._unpin(snapshot)
+            for snapshot in ready:
+                self._unpin(snapshot)
 
     def _drop_snapshot(self, snapshot: PromptSnapshot) -> None:
         self.flexkv_manager.cancel(task_ids=[snapshot.task_id])
@@ -1094,13 +1096,15 @@ class FlexKVSchedulerConnector:
         num_failed_tasks = 0
         for task_id, response in responses_from_manager.items():
             success = (response.status == KVResponseStatus.SUCCESS)
-            snapshot = self.running_snapshots.pop(task_id, None)
-            if snapshot is not None:
-                self._unpin(snapshot)
+            snapshots = self.running_snapshots.pop(task_id, None)
+            if snapshots is not None:
+                for snapshot in snapshots:
+                    self._unpin(snapshot)
                 if not success:
                     logger.warning(
-                        f"FlexKV prompt snapshot of {snapshot.request.request_id} "
-                        f"failed, status: {response.status}")
+                        "FlexKV prompt snapshots of "
+                        f"{[s.request.request_id for s in snapshots]} failed, "
+                        f"status: {response.status}")
                 continue
             if task_id in self.get_tasks:
                 tasks = self.get_tasks.pop(task_id)

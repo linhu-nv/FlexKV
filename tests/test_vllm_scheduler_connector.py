@@ -392,20 +392,21 @@ def swa(manager):
     return scheduler, pool
 
 
-def _prompt(finished_reason=None):
+def _prompt(finished_reason=None, request_id=REQ):
     request = SimpleNamespace(
-        request_id=REQ, num_tokens=200, num_prompt_tokens=200,
+        request_id=request_id, num_tokens=200, num_prompt_tokens=200,
         all_token_ids=list(range(200)), num_output_tokens=0)
     request.is_finished = lambda: finished_reason is not None
     request.get_finished_reason = lambda: finished_reason
     return request
 
 
-def _prompt_step(num_computed, num_scheduled, preempted=()):
+def _prompt_step(num_computed, num_scheduled, preempted=(), req_ids=(REQ,)):
     return SimpleNamespace(
-        scheduled_new_reqs=[SimpleNamespace(req_id=REQ, num_computed_tokens=num_computed)],
+        scheduled_new_reqs=[SimpleNamespace(req_id=req_id, num_computed_tokens=num_computed)
+                            for req_id in req_ids],
         scheduled_cached_reqs=SimpleNamespace(req_ids=[], num_computed_tokens=[]),
-        num_scheduled_tokens={REQ: num_scheduled},
+        num_scheduled_tokens=dict.fromkeys(req_ids, num_scheduled),
         kv_connector_block_state=SimpleNamespace(get_block_ids=lambda req_id: BLOCK_IDS),
         preempted_req_ids=set(preempted), finished_req_ids=set())
 
@@ -467,6 +468,7 @@ def test_finishing_settles_a_pending_snapshot(swa, manager, reason, launched):
     scheduler.build_connector_meta(_prompt_step(0, 200))
 
     scheduler.request_finished(request, [10, 11, 12, 13])
+    scheduler.update_connector_output(KVConnectorOutput())
 
     assert bool(_launches(manager)) == launched
     assert (call(task_ids=[SNAPSHOT]) in manager.cancel.call_args_list) != launched
@@ -474,6 +476,28 @@ def test_finishing_settles_a_pending_snapshot(swa, manager, reason, launched):
     # The request's own PUT stores Full KV only.
     assert [c.kwargs["swa"] for c in manager.put_match.call_args_list] == (
         [True, False] if launched else [True])
+
+
+def test_snapshots_ready_in_one_step_launch_as_one_batch(swa, manager):
+    scheduler, pool = swa
+    requests = [_prompt(request_id=f"req-{i}") for i in range(2)]
+    for request in requests:
+        scheduler.on_new_request(request)
+    manager.put_match.side_effect = [(SNAPSHOT, np.ones(192, dtype=bool)),
+                                     (SNAPSHOT + 1, np.ones(192, dtype=bool))]
+    manager.launch.side_effect = lambda task_ids, **kwargs: [TASK]
+    scheduler.build_connector_meta(_prompt_step(0, 200, req_ids=("req-0", "req-1")))
+    assert pool.refs(WINDOW) == [3] * len(WINDOW)
+
+    for request in requests:
+        request.num_output_tokens = 1
+    scheduler.update_connector_output(KVConnectorOutput())
+    launch = manager.launch.call_args.kwargs
+    assert launch["task_ids"] == [SNAPSHOT, SNAPSHOT + 1] and launch["as_batch"]
+
+    manager.try_wait.return_value = {TASK: SimpleNamespace(status=KVResponseStatus.SUCCESS)}
+    scheduler.update_connector_output(KVConnectorOutput())
+    assert pool.refs(WINDOW) == [1] * len(WINDOW)
 
 
 def test_preemption_drops_a_pending_snapshot(swa, manager):
