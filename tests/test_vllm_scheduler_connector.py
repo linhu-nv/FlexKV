@@ -527,6 +527,20 @@ def test_a_hit_loads_the_window_before_its_end(swa, manager):
     assert scheduler.get_loaded_kv_cache_group_ids(request) == (2, 0, 1)
 
 
+def test_a_layerwise_hit_keeps_its_window_from_zeroing(swa, manager):
+    scheduler, _ = swa
+    request = _prompt()
+    manager.get_match.return_value = (TASK, np.ones(192, dtype=bool))
+    scheduler.get_num_new_matched_tokens(request, 0)
+    scheduler.update_state_after_alloc(request, SimpleNamespace(get_block_ids=lambda: BLOCK_IDS), 192)
+    scheduler.connector.enable_layerwise_transfer = True
+    step = SimpleNamespace(new_block_ids_to_zero=[10, 12, 13, 22, 26, 35, 36])
+
+    scheduler.connector.keep_loads_from_zeroing(step)
+
+    assert step.new_block_ids_to_zero == [13, 26, 36]
+
+
 def test_a_hit_shorter_than_the_window_is_dropped(swa, manager):
     scheduler, _ = swa
     manager.get_match.return_value = (TASK, np.ones(64, dtype=bool))

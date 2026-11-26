@@ -144,8 +144,7 @@ pip install -e .
 并转发缓存清空、sleep/wake 和逐层加载；还让 connector 支持 vLLM 的 hybrid KV cache
 manager（DeepSeek-V4.1 需要）。加 `--no-swa-bounded-replay` 时，FlexKV 还会在每个 prompt
 的最后一个 block 边界处存下滑动窗口 KV，命中止于这样的边界；FlexKV 配置中的
-`swa.num_cpu_slots`（默认 1024）与 `swa.num_ssd_slots` 决定 CPU、SSD 层各保留多少份；
-逐层加载暂不加载它。
+`swa.num_cpu_slots`（默认 1024）与 `swa.num_ssd_slots` 决定 CPU、SSD 层各保留多少份。
 FlexKV 所存各层的 page 大小可以不同：所有 TP rank 的 page 相同时（MLA，或 vLLM 的
 `kv_tp_replicas` 如此判定），CPU/SSD block 只存一份；否则（如 head 被 TP 切分的
 GQA/MHA）每个 TP rank 各存一份。在 0.34.1 上，patch 还会关闭 vLLM 的 extensible

@@ -1,5 +1,5 @@
 diff --git a/vllm/models/deepseek_v41/attention.py b/vllm/models/deepseek_v41/attention.py
-index a5823da6c6..3f8900491e 100644
+index a5823da6c6..862c7796ce 100644
 --- a/vllm/models/deepseek_v41/attention.py
 +++ b/vllm/models/deepseek_v41/attention.py
 @@ -57,6 +57,11 @@ from vllm.config import (
@@ -27,16 +27,16 @@ index a5823da6c6..3f8900491e 100644
          self.forward_mqa(q, kv, positions, out)
  
 +    def _wait_for_kv_layer_load(self) -> None:
-+        """Wait for a KV connector's layer-wise load of the compressed KV and
-+        index K this layer reads, which its kv-source layer owns."""
-+        if (
-+            self.compressed_cache_prefix is None
-+            or not has_kv_transfer_group()
-+            or not is_v1_kv_transfer_group()
-+        ):
++        """Wait for a KV connector's layer-wise load of the caches this layer
++        reads: its sliding window, and the compressed KV and index K its
++        kv-source layer owns."""
++        if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
 +            return
 +        connector = get_kv_transfer_group()
-+        if connector.has_connector_metadata():
++        if not connector.has_connector_metadata():
++            return
++        connector.wait_for_layer_load(self.swa_cache_layer.prefix)
++        if self.compressed_cache_prefix is not None:
 +            connector.wait_for_layer_load(self.compressed_cache_prefix)
 +
      def _fused_qnorm_rope_kv_insert(

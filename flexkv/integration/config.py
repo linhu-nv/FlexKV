@@ -180,12 +180,15 @@ class VllmSWAGroups:
     prompt's end as pages. All groups share one block id space, and a block
     is one opaque ``block_bytes`` run in each region of the cache: the whole
     block of a block-outermost cache, or each layer region of a
-    layer-outermost one, whose bytes ``region_layer_names``' views start."""
+    layer-outermost one, whose bytes ``region_layer_names``' views start. A
+    layer-wise load lands region ``r`` with FlexKV layer ``r``, which the
+    caches in it (``layer_regions``) wait for."""
     group_ids: Tuple[int, ...]
     block_size: int
     window_blocks: int
     block_bytes: int
     region_layer_names: Tuple[str, ...]
+    layer_regions: Tuple[Tuple[str, int], ...] = ()
 
     @property
     def window_tokens(self) -> int:
@@ -745,15 +748,18 @@ class FlexKVConfig:
         tensors = kv_cache_config.kv_cache_tensors
         swa_tensors = [t for t in tensors if t.layers[0] in names]
         regions: Tuple[str, ...] = ()
+        layer_regions: Tuple[Tuple[str, int], ...] = ()
         if layout is not None and layout.is_block_outermost:
             if len({t.block_stride for t in tensors}) == 1:
                 regions = tuple(t.layers[0] for t in swa_tensors if t.offset == 0)[:1]
+                layer_regions = tuple((name, 0) for name in sorted(names))
         elif (layout is not None and layout.is_layer_compact and layout.is_block_compact
                 and len(swa_tensors) == len(groups) and all(t.offset == 0 for t in swa_tensors)
                 and len({t.block_stride for t in swa_tensors}) == 1
                 and max(len(t.layers) for t in swa_tensors)
                 <= len(self.vllm_kv_group.cache_layer_names)):
             regions = tuple(max((t.layers for t in swa_tensors), key=len))
+            layer_regions = tuple((name, i) for t in swa_tensors for i, name in enumerate(t.layers))
         if len(shapes) != 1 or not regions:
             raise NotImplementedError(
                 "FlexKV snapshots vLLM sliding-window groups of one block size "
@@ -767,7 +773,7 @@ class FlexKVConfig:
                 f"FlexKV blocks of {tokens_per_block} tokens cannot hold vLLM "
                 f"sliding-window blocks of {block_size} tokens and {block_bytes} B")
         swa = VllmSWAGroups(tuple(group_ids), block_size,
-                            -(-(window - 1) // block_size), block_bytes, regions)
+                            -(-(window - 1) // block_size), block_bytes, regions, layer_regions)
         capacities = self.user_config.swa or {}
         if capacities.get("num_remote_slots", 0):
             raise NotImplementedError(

@@ -149,9 +149,8 @@ the connector run under vLLM's hybrid KV cache manager, which DeepSeek-V4.1
 needs. With `--no-swa-bounded-replay` FlexKV also stores the sliding-window KV
 at the last block boundary of each prompt, and a hit ends at such a boundary;
 `swa.num_cpu_slots` (default 1024) and `swa.num_ssd_slots` in the FlexKV config
-set how many the CPU and SSD tiers keep; layer-wise loading does not load it yet.
-The layers FlexKV stores may keep pages of different sizes: a CPU/SSD block
-then holds one copy of the
+set how many the CPU and SSD tiers keep. The layers FlexKV stores may keep
+pages of different sizes: a CPU/SSD block then holds one copy of the
 pages when every TP rank holds the same ones (MLA, or vLLM's `kv_tp_replicas`
 says so), and one copy per TP rank otherwise (e.g. GQA/MHA, whose heads TP
 splits). On 0.34.1 the patch also keeps vLLM's extensible KV cache off, as

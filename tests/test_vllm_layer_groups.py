@@ -1,4 +1,7 @@
 """vLLM KV cache groups with mixed page sizes (DeepSeek-V4.1, GQA) as FlexKV layer groups."""
+import threading
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -336,7 +339,8 @@ def test_layer_outermost_sliding_window_groups_snapshot_each_layer_region():
     group = flexkv_config.vllm_kv_group
     regions = tuple(f"{G}.{i}.self_attn.attn" for i in range(1, 8, 2))
     assert group.group_id == 1
-    assert group.swa == VllmSWAGroups((0,), 16, 8, WIDE, regions)
+    assert group.swa == VllmSWAGroups(
+        (0,), 16, 8, WIDE, regions, tuple((name, i) for i, name in enumerate(regions)))
     swa = flexkv_config.cache_config.swa
     assert (swa.pages_per_slot, swa.num_swa_layers) == (8, 4)
 
@@ -351,3 +355,33 @@ def test_layer_outermost_sliding_window_groups_snapshot_each_layer_region():
     assert all(r.shape == (NUM_BLOCKS, WIDE) for r in registration["swa_caches"])
     assert registration["swa_layout"].num_layer == 4
 
+
+@pytest.mark.parametrize("config, tokens_per_block, waits", [
+    pytest.param(_dsv41_config(bounded_replay=False), 64,
+                 {f"{P}.{i}.attn.swa_cache": f"{P}.2.attn" for i in (0, 13, 39)},
+                 id="blocks-outermost"),
+    pytest.param(_sliding_window_hybrid_config(), 16,
+                 {f"{G}.{i}.self_attn.attn": f"{G}.{i - 1}.self_attn.attn" for i in (1, 5)},
+                 id="layers-outermost"),
+])
+def test_a_layerwise_load_lands_each_window_region_with_its_flexkv_layer(
+        config, tokens_per_block, waits):
+    flexkv_config = FlexKVConfig()
+    flexkv_config.cache_config.tokens_per_block = tokens_per_block
+    flexkv_config.model_config.dtype = torch.bfloat16
+    flexkv_config._configure_kv_layout_from_vllm_cache_config(config)
+    group = flexkv_config.vllm_kv_group
+    connector = object.__new__(FlexKVWorkerConnector)
+    connector.flexkv_config = flexkv_config
+    connector.rank_info = SimpleNamespace(dp_client_id=0, pp_rank=0, effective_tp_rank=0,
+                                          model_config=flexkv_config.model_config)
+    connector._forward_context = None
+    connector.layerwise_counter_pool = connector._layerwise_sender_error = None
+    connector._layerwise_sender_cancel = threading.Event()
+    connector._layerwise_sender_cancel.set()
+
+    connector._start_layerwise_eventfd_sender(group.layer_names or group.cache_layer_names)
+    pool = connector.layerwise_counter_pool
+    connector.shutdown()
+
+    assert {name: pool.layer_names[pool.layer_to_index[name]] for name in waits} == waits

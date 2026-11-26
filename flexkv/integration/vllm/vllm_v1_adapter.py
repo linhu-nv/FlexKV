@@ -992,12 +992,13 @@ class FlexKVSchedulerConnector:
         zero = getattr(scheduler_output, "new_block_ids_to_zero", None)
         if not zero or not self.enable_layerwise_transfer:
             return
-        loaded = {
-            block_id
-            for task in self.tasks_to_launch.values()
-            if isinstance(task, FlexKVGetTask)
-            for block_id in task.block_ids
-        }
+        loaded = set()
+        for task in self.tasks_to_launch.values():
+            if isinstance(task, FlexKVGetTask):
+                loaded.update(task.block_ids)
+                if task.swa_slot_mapping is not None:
+                    loaded.update((task.swa_slot_mapping[::self.block_size]
+                                   // self.block_size).tolist())
         if loaded:
             scheduler_output.new_block_ids_to_zero = [
                 block_id for block_id in zero if block_id not in loaded
@@ -1562,6 +1563,9 @@ class FlexKVWorkerConnector:
                 "vLLM version in examples/vllm_adaption/, "
                 "otherwise set use_layerwise to false")
         pool = LayerwiseCounterPool(layer_names)
+        swa = self.flexkv_config.vllm_kv_group and self.flexkv_config.vllm_kv_group.swa
+        if swa is not None:
+            pool.layer_to_index.update(swa.layer_regions)
         self.layerwise_counter_pool = pool
         socket_path = build_layerwise_eventfd_socket_path(
             dp_client_id=self.rank_info.dp_client_id,
@@ -1726,11 +1730,6 @@ class FlexKVConnectorV1Impl:
                 "context_parallel_size=1; runtime DCP/PCP rank mapping is not "
                 "yet wired into the eventfd index space"
             )
-        if (self.enable_layerwise_transfer and flexkv_config.vllm_kv_group is not None
-                and flexkv_config.vllm_kv_group.swa is not None):
-            raise NotImplementedError(
-                "use_layerwise does not load vLLM sliding-window groups yet; keep "
-                "SWA bounded replay on or set use_layerwise to false")
         if self.enable_layerwise_transfer and flexkv_config.cache_config.enable_gds:
             raise NotImplementedError(
                 "vLLM FlexKV layer-wise transfer is incompatible with GDS; "
