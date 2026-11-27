@@ -288,18 +288,25 @@ class FlexKVPutTask(FlexKVTask):
                 f"task execute cost {self.task_execute_cost*1000:.2f} ms)")
 
 
-@dataclass(slots=True)
-class PromptSnapshot:
-    """A PUT of a prompt's prefix with its sliding-window snapshot. Its blocks
-    stay pinned until it completes, and it launches once the request has a
-    new output token or has finished: the step that computed the prompt's end
-    is done."""
-    task_id: int
+@dataclass(slots=True, eq=False)
+class WindowSnapshot:
+    """A PUT of a request's KV before token ``end``, in the stored group's
+    ``block_ids``, with the sliding windows before it. Its blocks stay pinned
+    until it completes or is dropped. It matches and launches once vLLM has
+    processed the step that computed token ``end - 1``, when that token's id
+    is known too; without ``launch``, only if the request ends there."""
     request: "Request"
-    num_output_tokens: int
-    pinned_block_ids: list[int]
-    slot_mapping: np.ndarray
+    end: int
+    block_ids: list[int]
     swa_slot_mapping: np.ndarray
+    launch: bool = True
+    task_id: int = -1
+
+
+def _processed_tokens(request: "Request") -> int:
+    """The tokens whose KV the steps vLLM has processed computed."""
+    return (request.num_computed_tokens - request.num_in_flight_tokens
+            + request.num_stale_output_tokens)
 
 
 class FlexKVSchedulerConnector:
@@ -321,8 +328,8 @@ class FlexKVSchedulerConnector:
                     if flexkv_config.vllm_kv_group is not None else None)
         self.block_pool = None
         self.requests: dict[str, Request] = {}
-        self.pending_snapshots: dict[str, PromptSnapshot] = {}
-        self.running_snapshots: dict[int, list[PromptSnapshot]] = {}
+        self.pending_snapshots: dict[str, list[WindowSnapshot]] = {}
+        self.running_snapshots: dict[int, list[WindowSnapshot]] = {}
 
         if os.getenv('DYNAMO_USE_FLEXKV', '0') == '1':
             self.collector = KVEventCollector()
@@ -727,9 +734,18 @@ class FlexKVSchedulerConnector:
         self._forget_prefetch(request.request_id)
         self.failed_load_req_ids.discard(request.request_id)
         self.requests.pop(request.request_id, None)
-        if (request.request_id in self.pending_snapshots and request.get_finished_reason()
-                not in (FinishReason.STOP, FinishReason.LENGTH)):
-            self._drop_snapshot(self.pending_snapshots.pop(request.request_id))
+        snapshots = self.pending_snapshots.pop(request.request_id, [])
+        keep = []
+        if request.get_finished_reason() in (FinishReason.STOP, FinishReason.LENGTH):
+            done = [s for s in snapshots if s.end <= _processed_tokens(request)]
+            keep = [s for s in done if s.launch] + [s for s in done if not s.launch][-1:]
+            for snapshot in keep:
+                snapshot.launch = True
+        for snapshot in snapshots:
+            if snapshot not in keep:
+                self._unpin(snapshot)
+        if keep:
+            self.pending_snapshots[request.request_id] = keep
         if request.request_id in self.failed_loads_unreported:
             # Its blocks hold no KV; vLLM frees them once the failed load's
             # report arrives.
@@ -766,7 +782,8 @@ class FlexKVSchedulerConnector:
             ((request.num_tokens - 1) // self.block_size) * self.block_size,
             max_backed_tokens,
         )
-        if num_tokens_to_put == 0:
+        if num_tokens_to_put == 0 or any(s.end >= num_tokens_to_put for s in keep):
+            # A window snapshot stores this prefix too, its blocks pinned.
             return False
 
         task_id, num_matched_tokens, num_unmatched_tokens = self._put_match(
@@ -885,11 +902,15 @@ class FlexKVSchedulerConnector:
     #### Common Method ####
     #######################
 
-    def plan_prompt_snapshots(self, scheduler_output: "SchedulerOutput") -> None:
-        """Snapshot the sliding-window groups of each request whose prompt this
-        step completes, at the prompt's last block boundary: pin the blocks
-        the PUT reads, which vLLM frees as the window moves on, until the PUT
-        launched after this step (launch_ready_snapshots) completes."""
+    def plan_snapshots(self, scheduler_output: "SchedulerOutput") -> None:
+        """Snapshot the sliding-window groups of each request at the block
+        boundary this step's KV reaches: its prompt's last one; with
+        ``swa.interval``, the last multiple of the interval inside a prefill
+        chunk; and every block boundary in decode, stored at multiples of the
+        interval and otherwise only where the request ends (request_finished).
+        Pin the blocks the PUT reads, which vLLM frees as the window moves on,
+        until the PUT launched once the step is processed (launch_ready_snapshots)
+        lands or a deeper processed window supersedes them."""
         block_state = getattr(scheduler_output, "kv_connector_block_state", None)
         if self.swa is None or self.block_pool is None or block_state is None:
             return
@@ -897,70 +918,96 @@ class FlexKVSchedulerConnector:
         scheduled = [(req.req_id, req.num_computed_tokens)
                      for req in scheduler_output.scheduled_new_reqs]
         scheduled += zip(cached.req_ids, cached.num_computed_tokens, strict=True)
+        interval = self.swa.interval
         for req_id, num_computed in scheduled:
             request = self.requests.get(req_id)
-            if request is None or req_id in self.pending_snapshots:
+            if request is None:
                 continue
             num_prompt = request.num_prompt_tokens
-            end = (num_prompt - 1) // self.block_size * self.block_size
-            num_scheduled = scheduler_output.num_scheduled_tokens[req_id]
-            if (not num_computed < num_prompt <= num_computed + num_scheduled
-                    or end < self.swa.window_tokens):
+            stop = num_computed + scheduler_output.num_scheduled_tokens[req_id]
+            end = stop // self.block_size * self.block_size
+            if num_computed < num_prompt <= stop:
+                end, launch = (num_prompt - 1) // self.block_size * self.block_size, True
+            elif num_prompt <= num_computed < end:
+                launch = bool(interval) and end % interval == 0
+            elif interval and num_computed < stop // interval * interval:
+                end, launch = stop // interval * interval, True
+            else:
                 continue
+            snapshots = self.pending_snapshots.get(req_id, [])
             block_ids = block_state.get_block_ids(req_id)
-            swa_slot_mapping = (None if block_ids is None
+            swa_slot_mapping = (None if block_ids is None or end < self.swa.window_tokens
+                                or any(s.end == end for s in snapshots)
                                 else self._swa_slot_mapping(block_ids, end))
             if swa_slot_mapping is None:
                 continue
-            task_id, unmatched_mask = self.flexkv_manager.put_match(
-                token_ids=np.asarray(request.all_token_ids[:end], dtype=np.int64),
-                namespace=self._extract_namespace(request),
-                swa=True,
-                **self._block_hashes(request, end),
-            )
-            num_unmatched = int(np.count_nonzero(unmatched_mask))
-            if num_unmatched == 0:
-                self.flexkv_manager.cancel(task_ids=[task_id])
-                continue
-            put_ids = block_ids[self.group_id][
-                (end - num_unmatched) // self.block_size:end // self.block_size]
-            pinned = list(put_ids) + (swa_slot_mapping[::self.block_size]
-                                      // self.block_size).tolist()
-            self.block_pool.touch([self.block_pool.blocks[i] for i in pinned])
-            self.pending_snapshots[req_id] = PromptSnapshot(
-                task_id, request, request.num_output_tokens, pinned,
-                np.array(put_ids, dtype=np.int64).repeat(self.block_size) * self.block_size,
-                swa_slot_mapping)
+            snapshot = WindowSnapshot(request, end,
+                                      list(block_ids[self.group_id][:end // self.block_size]),
+                                      swa_slot_mapping, launch)
+            self.block_pool.touch([self.block_pool.blocks[i] for i in self._pinned(snapshot)])
+            self.pending_snapshots[req_id] = self._supersede(snapshots + [snapshot])
+
+    def _supersede(self, snapshots: list[WindowSnapshot]) -> list[WindowSnapshot]:
+        """Drop the windows a request might end at below its deepest processed one."""
+        processed = _processed_tokens(snapshots[0].request)
+        deepest = max((s.end for s in snapshots if s.end <= processed), default=0)
+        kept = [s for s in snapshots if s.launch or s.end >= deepest]
+        for snapshot in snapshots:
+            if snapshot not in kept:
+                self._unpin(snapshot)
+        return kept
 
     def launch_ready_snapshots(self) -> None:
-        ready = [snapshot for snapshot in self.pending_snapshots.values()
-                 if snapshot.request.is_finished()
-                 or snapshot.request.num_output_tokens > snapshot.num_output_tokens]
+        ready = []
+        for req_id, snapshots in list(self.pending_snapshots.items()):
+            processed = _processed_tokens(snapshots[0].request)
+            launching = [s for s in snapshots if s.launch and s.end <= processed]
+            if not launching:
+                continue
+            kept = [s for s in snapshots if s not in launching]
+            if kept:
+                self.pending_snapshots[req_id] = kept
+            else:
+                del self.pending_snapshots[req_id]
+            for snapshot in launching:
+                request, end = snapshot.request, snapshot.end
+                snapshot.task_id, unmatched_mask = self.flexkv_manager.put_match(
+                    token_ids=np.asarray(request.all_token_ids[:end], dtype=np.int64),
+                    namespace=self._extract_namespace(request),
+                    swa=True,
+                    **self._block_hashes(request, end),
+                )
+                num_unmatched = int(np.count_nonzero(unmatched_mask))
+                if num_unmatched:
+                    ready.append((snapshot, snapshot.block_ids[(end - num_unmatched) // self.block_size:]))
+                else:
+                    self.flexkv_manager.cancel(task_ids=[snapshot.task_id])
+                    self._unpin(snapshot)
         if not ready:
             return
-        for snapshot in ready:
-            del self.pending_snapshots[snapshot.request.request_id]
         launched = self.flexkv_manager.launch(
-            task_ids=[snapshot.task_id for snapshot in ready],
-            slot_mappings=[snapshot.slot_mapping for snapshot in ready],
-            swa_slot_mappings=[snapshot.swa_slot_mapping for snapshot in ready],
+            task_ids=[snapshot.task_id for snapshot, _ in ready],
+            slot_mappings=[np.array(ids, dtype=np.int64).repeat(self.block_size) * self.block_size
+                           for _, ids in ready],
+            swa_slot_mappings=[snapshot.swa_slot_mapping for snapshot, _ in ready],
             as_batch=self.enable_batch and len(ready) > 1)
-        if len(launched) == len(ready):
-            for task_id, snapshot in zip(launched, ready, strict=True):
+        snapshots = [snapshot for snapshot, _ in ready]
+        if len(launched) == len(snapshots):
+            for task_id, snapshot in zip(launched, snapshots, strict=True):
                 self.running_snapshots[task_id] = [snapshot]
         elif len(launched) == 1:
-            self.running_snapshots[launched[0]] = ready
+            self.running_snapshots[launched[0]] = snapshots
         else:
-            for snapshot in ready:
+            for snapshot in snapshots:
                 self._unpin(snapshot)
 
-    def _drop_snapshot(self, snapshot: PromptSnapshot) -> None:
-        self.flexkv_manager.cancel(task_ids=[snapshot.task_id])
-        self._unpin(snapshot)
+    def _pinned(self, snapshot: WindowSnapshot) -> list[int]:
+        return snapshot.block_ids + (snapshot.swa_slot_mapping[::self.block_size]
+                                     // self.block_size).tolist()
 
-    def _unpin(self, snapshot: PromptSnapshot) -> None:
+    def _unpin(self, snapshot: WindowSnapshot) -> None:
         self.block_pool.free_blocks(
-            self.block_pool.blocks[i] for i in reversed(snapshot.pinned_block_ids))
+            self.block_pool.blocks[i] for i in reversed(self._pinned(snapshot)))
 
     def cancel_tasks(self) -> None:
         """
@@ -1106,7 +1153,7 @@ class FlexKVSchedulerConnector:
                     self._unpin(snapshot)
                 if not success:
                     logger.warning(
-                        "FlexKV prompt snapshots of "
+                        "FlexKV window snapshots of "
                         f"{[s.request.request_id for s in snapshots]} failed, "
                         f"status: {response.status}")
                 continue
@@ -1161,9 +1208,8 @@ class FlexKVSchedulerConnector:
         and potential race conditions with block reuse.
         """
         for req_id in preempted_req_ids:
-            snapshot = self.pending_snapshots.pop(req_id, None)
-            if snapshot is not None:
-                self._drop_snapshot(snapshot)
+            for snapshot in self.pending_snapshots.pop(req_id, []):
+                self._unpin(snapshot)
             if req_id in self.req_id_to_task_dict:
                 task_id = self.req_id_to_task_dict[req_id]
                 # If the task is waiting to be launched, we can safely cancel it.
@@ -2060,7 +2106,7 @@ class FlexKVConnectorV1Impl:
             self.connector.handle_preemptions(preempted_req_ids)
 
         self.connector.cancel_tasks()
-        self.connector.plan_prompt_snapshots(scheduler_output)
+        self.connector.plan_snapshots(scheduler_output)
         self.connector.keep_loads_from_zeroing(scheduler_output)
         layerwise_metadata = self.connector.launch_tasks()
 

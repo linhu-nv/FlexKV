@@ -3,8 +3,9 @@ it reports, the group a load restores, its prefetches, when vLLM waits for
 its PUTs to free blocks, and how a failed load reaches vLLM."""
 import importlib.util
 import time
+from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -395,19 +396,20 @@ def swa(manager):
 def _prompt(finished_reason=None, request_id=REQ):
     request = SimpleNamespace(
         request_id=request_id, num_tokens=200, num_prompt_tokens=200,
-        all_token_ids=list(range(200)), num_output_tokens=0)
+        all_token_ids=list(range(200)), num_computed_tokens=0,
+        num_in_flight_tokens=0, num_stale_output_tokens=0)
     request.is_finished = lambda: finished_reason is not None
     request.get_finished_reason = lambda: finished_reason
     return request
 
 
-def _prompt_step(num_computed, num_scheduled, preempted=(), req_ids=(REQ,)):
+def _prompt_step(num_computed, num_scheduled, preempted=(), req_ids=(REQ,), block_ids=BLOCK_IDS):
     return SimpleNamespace(
         scheduled_new_reqs=[SimpleNamespace(req_id=req_id, num_computed_tokens=num_computed)
                             for req_id in req_ids],
         scheduled_cached_reqs=SimpleNamespace(req_ids=[], num_computed_tokens=[]),
         num_scheduled_tokens=dict.fromkeys(req_ids, num_scheduled),
-        kv_connector_block_state=SimpleNamespace(get_block_ids=lambda req_id: BLOCK_IDS),
+        kv_connector_block_state=SimpleNamespace(get_block_ids=lambda req_id: block_ids),
         preempted_req_ids=set(preempted), finished_req_ids=set())
 
 
@@ -421,19 +423,20 @@ def test_prompt_end_snapshot_pins_its_blocks_until_it_lands(swa, manager):
     scheduler.on_new_request(request)
 
     scheduler.build_connector_meta(_prompt_step(0, 128))
-    manager.put_match.assert_not_called()
+    assert not scheduler.connector.pending_snapshots
 
     scheduler.build_connector_meta(_prompt_step(128, 72))
-    kwargs = manager.put_match.call_args.kwargs
-    assert len(kwargs["token_ids"]) == 192 and kwargs["swa"] is True
     pinned = [10, 11, 12] + WINDOW
     assert pool.refs(pinned) == [2] * len(pinned)
 
+    request.num_computed_tokens, request.num_in_flight_tokens = 200, 72
     scheduler.update_connector_output(KVConnectorOutput())
-    assert not _launches(manager)
+    manager.put_match.assert_not_called()
 
-    request.num_output_tokens = 1
+    request.num_in_flight_tokens = 0
     scheduler.update_connector_output(KVConnectorOutput())
+    kwargs = manager.put_match.call_args.kwargs
+    assert len(kwargs["token_ids"]) == 192 and kwargs["swa"] is True
     (launch,) = _launches(manager)
     tpb = 64
     assert list(launch.kwargs["slot_mappings"][0][::tpb] // tpb) == [10, 11, 12]
@@ -454,28 +457,29 @@ def test_a_short_prompt_takes_no_snapshot(swa, manager):
 
     scheduler.build_connector_meta(_prompt_step(0, 128))
 
-    manager.put_match.assert_not_called()
+    assert not scheduler.connector.pending_snapshots
 
 
-@pytest.mark.parametrize("reason, launched", [
-    pytest.param(FinishReason.STOP, True, id="stop"),
-    pytest.param(FinishReason.ABORT, False, id="abort"),
+@pytest.mark.parametrize("reason, num_in_flight, launched", [
+    pytest.param(FinishReason.STOP, 0, True, id="stop"),
+    pytest.param(FinishReason.STOP, 200, False, id="stop-in-flight"),
+    pytest.param(FinishReason.ABORT, 0, False, id="abort"),
 ])
-def test_finishing_settles_a_pending_snapshot(swa, manager, reason, launched):
+def test_finishing_settles_a_pending_snapshot(swa, manager, reason, num_in_flight, launched):
     scheduler, pool = swa
     request = _prompt(reason)
     scheduler.on_new_request(request)
     scheduler.build_connector_meta(_prompt_step(0, 200))
+    request.num_computed_tokens, request.num_in_flight_tokens = 200, num_in_flight
 
     scheduler.request_finished(request, [10, 11, 12, 13])
     scheduler.update_connector_output(KVConnectorOutput())
 
     assert bool(_launches(manager)) == launched
-    assert (call(task_ids=[SNAPSHOT]) in manager.cancel.call_args_list) != launched
     assert pool.refs(WINDOW) == [2 if launched else 1] * len(WINDOW)
-    # The request's own PUT stores Full KV only.
+    # The snapshot stores what the request's own Full-only PUT would.
     assert [c.kwargs["swa"] for c in manager.put_match.call_args_list] == (
-        [True, False] if launched else [True])
+        [True] if launched else [False] if reason == FinishReason.STOP else [])
 
 
 def test_snapshots_ready_in_one_step_launch_as_one_batch(swa, manager):
@@ -490,7 +494,7 @@ def test_snapshots_ready_in_one_step_launch_as_one_batch(swa, manager):
     assert pool.refs(WINDOW) == [3] * len(WINDOW)
 
     for request in requests:
-        request.num_output_tokens = 1
+        request.num_computed_tokens = 200
     scheduler.update_connector_output(KVConnectorOutput())
     launch = manager.launch.call_args.kwargs
     assert launch["task_ids"] == [SNAPSHOT, SNAPSHOT + 1] and launch["as_batch"]
@@ -506,10 +510,96 @@ def test_preemption_drops_a_pending_snapshot(swa, manager):
     scheduler.build_connector_meta(_prompt_step(0, 200))
 
     scheduler.build_connector_meta(_prompt_step(0, 0, preempted=[REQ]))
+    scheduler.update_connector_output(KVConnectorOutput())
 
-    manager.cancel.assert_any_call(task_ids=[SNAPSHOT])
+    manager.put_match.assert_not_called()
     assert pool.refs(WINDOW) == [1] * len(WINDOW)
     assert not _launches(manager)
+
+
+def test_a_prefill_chunk_snapshots_the_last_interval_multiple_it_reaches(swa, manager):
+    scheduler, pool = swa
+    scheduler.connector.swa = replace(SWA, interval=128)
+    request = _prompt()
+    scheduler.on_new_request(request)
+    window = [20, 21, 22, 23, 30, 31, 32, 33]
+
+    scheduler.build_connector_meta(_prompt_step(0, 160))
+    assert pool.refs([10, 11] + window) == [2] * 10
+
+    manager.put_match.return_value = (SNAPSHOT, np.ones(128, dtype=bool))
+    request.num_computed_tokens = 160
+    scheduler.update_connector_output(KVConnectorOutput())
+    assert len(manager.put_match.call_args.kwargs["token_ids"]) == 128
+    (launch,) = _launches(manager)
+    assert list(launch.kwargs["slot_mappings"][0][::64] // 64) == [10, 11]
+    assert list(launch.kwargs["swa_slot_mappings"][0][::64] // 64) == window
+
+
+def test_decode_snapshots_every_interval(swa, manager):
+    scheduler, pool = swa
+    scheduler.connector.swa = replace(SWA, interval=256)
+    request = _prompt()
+    request.all_token_ids = list(range(256))
+    scheduler.on_new_request(request)
+    # Token 255 in decode; the sliding windows freed their first blocks.
+    block_ids = ([0, 0, 22, 23, 24, 25, 26, 27], [0, 0, 32, 33, 34, 35, 36, 37], [10, 11, 12, 13])
+    window = [24, 25, 26, 27, 34, 35, 36, 37]
+
+    scheduler.build_connector_meta(_prompt_step(254, 1, block_ids=block_ids))
+    assert not scheduler.connector.pending_snapshots
+    scheduler.build_connector_meta(_prompt_step(255, 1, block_ids=block_ids))
+    assert pool.refs([10, 11, 12, 13] + window) == [2] * 12
+
+    manager.put_match.return_value = (SNAPSHOT, np.arange(256) >= 192)
+    request.num_computed_tokens, request.num_in_flight_tokens = 256, 1
+    scheduler.update_connector_output(KVConnectorOutput())
+    manager.put_match.assert_not_called()
+
+    request.num_in_flight_tokens = 0
+    scheduler.update_connector_output(KVConnectorOutput())
+    assert len(manager.put_match.call_args.kwargs["token_ids"]) == 256
+    (launch,) = _launches(manager)
+    tpb = 64
+    assert list(launch.kwargs["slot_mappings"][0][::tpb] // tpb) == [13]
+    assert list(launch.kwargs["swa_slot_mappings"][0][::tpb] // tpb) == window
+
+
+@pytest.mark.parametrize("interval", [0, 1024])
+@pytest.mark.parametrize("reason", [FinishReason.STOP, FinishReason.ABORT])
+def test_a_request_ending_in_decode_snapshots_its_last_window(swa, manager, reason, interval):
+    scheduler, pool = swa
+    scheduler.connector.swa = replace(SWA, interval=interval)
+    request = _prompt(reason)
+    request.num_tokens, request.all_token_ids = 321, list(range(321))
+    scheduler.on_new_request(request)
+    block_ids = ([0, 0, 0, 0, 24, 25, 26, 27, 28, 29], [0, 0, 0, 0, 34, 35, 36, 37, 38, 39],
+                 [10, 11, 12, 13, 14])
+    window = [26, 27, 28, 29, 36, 37, 38, 39]
+    # Windows at 256 and 320, neither a multiple of the interval: pinned, not stored.
+    for num_computed in (255, 319):
+        request.num_computed_tokens = num_computed
+        scheduler.build_connector_meta(_prompt_step(num_computed, 1, block_ids=block_ids))
+        request.num_computed_tokens = num_computed + 1
+        scheduler.update_connector_output(KVConnectorOutput())
+    assert not _launches(manager)
+    assert pool.refs([24, 26, 28]) == [2, 3, 2]
+
+    manager.put_match.return_value = (SNAPSHOT, np.arange(320) >= 256)
+    scheduler.request_finished(request, [10, 11, 12, 13, 14])
+    scheduler.update_connector_output(KVConnectorOutput())
+
+    assert pool.refs([24, 25, 34, 35]) == [1] * 4
+    if reason == FinishReason.STOP:
+        (launch,) = _launches(manager)
+        assert list(launch.kwargs["slot_mappings"][0][::64] // 64) == [14]
+        assert list(launch.kwargs["swa_slot_mappings"][0][::64] // 64) == window
+        assert pool.refs(window) == [2] * len(window)
+        # The snapshot at token 320 stores what the request's own PUT would.
+        assert [c.kwargs["swa"] for c in manager.put_match.call_args_list] == [True]
+    else:
+        assert not _launches(manager)
+        assert pool.refs(window) == [1] * len(window)
 
 
 def test_a_hit_loads_the_window_before_its_end(swa, manager):

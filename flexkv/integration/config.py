@@ -177,7 +177,8 @@ class VllmSWAGroups:
     """Prefix-cacheable vLLM sliding-window KV cache groups (DeepSeek-V4.1
     without SWA bounded replay). A hit ending at token ``t`` needs each
     group's ``window_blocks`` blocks before ``t``; FlexKV snapshots them at a
-    prompt's end as pages. All groups share one block id space, and a block
+    prompt's or an answer's end as pages, and at multiples of ``interval``.
+    All groups share one block id space, and a block
     is one opaque ``block_bytes`` run in each region of the cache: the whole
     block of a block-outermost cache, or each layer region of a
     layer-outermost one, whose bytes ``region_layer_names``' views start. A
@@ -189,6 +190,7 @@ class VllmSWAGroups:
     block_bytes: int
     region_layer_names: Tuple[str, ...]
     layer_regions: Tuple[Tuple[str, int], ...] = ()
+    interval: int = 0
 
     @property
     def window_tokens(self) -> int:
@@ -729,7 +731,8 @@ class FlexKVConfig:
         self._configure_vllm_swa_groups(kv_cache_config)
 
     def _configure_vllm_swa_groups(self, kv_cache_config: "KVCacheConfig") -> None:
-        """Snapshot vLLM's sliding-window groups at prompt ends in an SWA pool
+        """Snapshot vLLM's sliding-window groups at prompt and answer ends, and
+        at multiples of vLLM's prefix_cache_retention_interval, in an SWA pool
         whose slot holds every group's window blocks. A block is one opaque
         page per region of the cache that only its group uses: the whole
         block when blocks are outermost, each layer region when layers are,
@@ -772,8 +775,10 @@ class FlexKVConfig:
             raise NotImplementedError(
                 f"FlexKV blocks of {tokens_per_block} tokens cannot hold vLLM "
                 f"sliding-window blocks of {block_size} tokens and {block_bytes} B")
+        retention = getattr(kv_cache_config, "prefix_cache_retention_interval", 0)
+        interval = tokens_per_block if retention is None else retention
         swa = VllmSWAGroups(tuple(group_ids), block_size,
-                            -(-(window - 1) // block_size), block_bytes, regions, layer_regions)
+                            -(-(window - 1) // block_size), block_bytes, regions, layer_regions, interval)
         capacities = self.user_config.swa or {}
         if capacities.get("num_remote_slots", 0):
             raise NotImplementedError(
@@ -795,7 +800,7 @@ class FlexKVConfig:
             f"[FlexKV vllm] snapshotting {len(group_ids)} sliding-window groups "
             f"{list(group_ids)}: {swa.window_blocks} blocks of {block_size} "
             f"tokens each ({swa.pages} pages of {block_bytes} B per snapshot), "
-            f"{num_slots} CPU snapshots")
+            f"{num_slots} CPU snapshots, interval {interval}")
 
     def _configure_vllm_layer_groups(
         self,

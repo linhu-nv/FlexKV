@@ -367,16 +367,18 @@ def test_layerwise_needs_an_attention_that_waits_for_its_layer():
     assert not waits(OwnForward) and not waits(MLAAttention, direct_call=True)
 
 
-def test_dsv41_without_bounded_replay_snapshots_its_sliding_window_groups():
+@pytest.mark.parametrize("retention, interval", [(0, 0), (1024, 1024), (None, 64)])
+def test_dsv41_without_bounded_replay_snapshots_its_sliding_window_groups(retention, interval):
     config = _dsv41_config(bounded_replay=False)
+    config.prefix_cache_retention_interval = retention
     flexkv_config = FlexKVConfig()
     flexkv_config.model_config.tp_size = 8
     flexkv_config._configure_kv_layout_from_vllm_cache_config(config)
 
     group = flexkv_config.vllm_kv_group
     assert group.group_id == 7
-    assert (group.swa.group_ids, group.swa.window_blocks, group.swa.region_layer_names) == (
-        tuple(range(7)), 4, (f"{P}.0.attn.swa_cache",))
+    assert (group.swa.group_ids, group.swa.window_blocks, group.swa.region_layer_names,
+            group.swa.interval) == (tuple(range(7)), 4, (f"{P}.0.attn.swa_cache",), interval)
     swa = flexkv_config.cache_config.swa
     assert (swa.pages_per_slot, swa.num_swa_layers, swa.bytes_per_token_per_layer) == (
         28, 1, BLOCK // 64)
@@ -405,7 +407,8 @@ def _sliding_window_hybrid_config() -> KVCacheConfig:
                sliding_window=128, bounded_replay=False),
         _group(FullAttentionManager, dict.fromkeys(full, WIDE_SPEC)),
     ]
-    config = KVCacheConfig(num_blocks=NUM_BLOCKS, kv_cache_tensors=tensors, kv_cache_groups=groups)
+    config = KVCacheConfig(num_blocks=NUM_BLOCKS, kv_cache_tensors=tensors, kv_cache_groups=groups,
+                           prefix_cache_retention_interval=0)
     config.kv_cache_layout = "LBHNC"
     return config
 
