@@ -25,10 +25,10 @@ engine and the etcd membership. FlexKV neither creates it nor sizes it:
     ``swa.num_slots`` are the server's, not ``cpu_cache_gb``'s.
 
 Geometry: one FULL slot holds exactly one CPU block as ``StorageEngine`` lays
-it out (BLOCKFIRST: all layers of a block contiguous), one SWA slot one SWA
-page. ``slot_align`` is chosen so that the SlotStore stride equals the block
-size exactly, which lets the H2D / D2H workers address the pool with the
-strides of a plain tensor.
+it out (BLOCKFIRST: all layers of a block contiguous), one SWA slot
+``swa.pages_per_slot`` SWA pages. ``slot_align`` is chosen so that the
+SlotStore stride equals the slot size exactly, which lets the H2D / D2H workers
+address the pool with the strides of a plain tensor.
 """
 from __future__ import annotations
 
@@ -308,8 +308,8 @@ def swa_pool_config(cache_config: CacheConfig) -> Optional[SWAPoolConfig]:
 
 def swa_cpu_kv_layout(model_config: ModelConfig, cache_config: CacheConfig,
                       num_blocks: int) -> KVCacheLayout:
-    """The CPU SWA layout exactly as ``StorageEngine`` builds it (uint8, one page
-    per slot; DSv4 sidecar groups come from ``SWAPoolConfig.layer_groups``)."""
+    """The CPU SWA layout of ``num_blocks`` pages exactly as ``StorageEngine``
+    builds it (uint8; DSv4 sidecar groups come from ``SWAPoolConfig.layer_groups``)."""
     swa = cache_config.swa
     return KVCacheLayout(
         type=GLOBAL_CONFIG_FROM_ENV.cpu_layout_type,

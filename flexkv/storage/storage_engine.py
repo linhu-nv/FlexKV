@@ -329,11 +329,12 @@ class StorageEngine:
         """CPU pool from the radix-server's SlotStore (radixshmem mode).
 
         The FULL pool backs the main KV blocks, the SWA pool the SWA pages; a
-        slot is one block, so the pool viewed as a tensor has exactly the layout
-        FlexKV's own allocation would have had. Slot count and stride are
-        re-checked against ``layout`` here: a mismatch would otherwise become a
-        misaddressed transfer, not an error. Workers re-attach the pool by name
-        through the ``SlotStoreTensorHandle`` in ``worker_data``.
+        FULL slot is one block and an SWA slot ``pages_per_slot`` pages, so the
+        pool viewed as a tensor has exactly the layout FlexKV's own allocation
+        would have had. Slot count and stride are re-checked against ``layout``
+        here: a mismatch would otherwise become a misaddressed transfer, not an
+        error. Workers re-attach the pool by name through the
+        ``SlotStoreTensorHandle`` in ``worker_data``.
         """
         from radixshmem import ComponentType
         from flexkv.server.shm_radix_bootstrap import layout_block_bytes
