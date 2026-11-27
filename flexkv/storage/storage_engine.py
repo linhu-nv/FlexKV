@@ -224,7 +224,7 @@ class StorageEngine:
                 self._swa_cpu_layout = KVCacheLayout(
                     type=GLOBAL_CONFIG_FROM_ENV.cpu_layout_type,
                     num_layer=swa_cfg.num_swa_layers,
-                    num_block=swa_cfg.num_slots,
+                    num_block=swa_cfg.num_slots * swa_cfg.pages_per_slot,
                     tokens_per_block=swa_tokens_per_block,
                     num_head=1,
                     head_size=swa_cfg.bytes_per_token_per_layer,
@@ -258,7 +258,7 @@ class StorageEngine:
                 self._swa_ssd_layout = KVCacheLayout(
                     type=GLOBAL_CONFIG_FROM_ENV.ssd_layout_type,
                     num_layer=swa_cfg.num_swa_layers,
-                    num_block=swa_cfg.num_ssd_slots,
+                    num_block=swa_cfg.num_ssd_slots * swa_cfg.pages_per_slot,
                     tokens_per_block=swa_tokens_per_block,
                     num_head=1,
                     head_size=swa_cfg.bytes_per_token_per_layer,
@@ -295,7 +295,7 @@ class StorageEngine:
                     self._swa_remote_layout = KVCacheLayout(
                         type=GLOBAL_CONFIG_FROM_ENV.remote_layout_type,
                         num_layer=swa_cfg.num_swa_layers,
-                        num_block=swa_cfg.num_remote_slots,
+                        num_block=swa_cfg.num_remote_slots * swa_cfg.pages_per_slot,
                         tokens_per_block=swa_tokens_per_block,
                     num_head=1,
                     head_size=swa_cfg.bytes_per_token_per_layer,
@@ -329,11 +329,12 @@ class StorageEngine:
         """CPU pool from the radix-server's SlotStore (radixshmem mode).
 
         The FULL pool backs the main KV blocks, the SWA pool the SWA pages; a
-        slot is one block, so the pool viewed as a tensor has exactly the layout
-        FlexKV's own allocation would have had. Slot count and stride are
-        re-checked against ``layout`` here: a mismatch would otherwise become a
-        misaddressed transfer, not an error. Workers re-attach the pool by name
-        through the ``SlotStoreTensorHandle`` in ``worker_data``.
+        FULL slot is one block and an SWA slot ``pages_per_slot`` pages, so the
+        pool viewed as a tensor has exactly the layout FlexKV's own allocation
+        would have had. Slot count and stride are re-checked against ``layout``
+        here: a mismatch would otherwise become a misaddressed transfer, not an
+        error. Workers re-attach the pool by name through the
+        ``SlotStoreTensorHandle`` in ``worker_data``.
         """
         from radixshmem import ComponentType
         from flexkv.server.shm_radix_bootstrap import layout_block_bytes
@@ -345,8 +346,9 @@ class StorageEngine:
                 f"radix-server SlotStore {store.name} has no {kind.name} pool but the "
                 f"FlexKV configuration needs one")
         pool = store.pool(kind)
-        block_bytes = layout_block_bytes(layout, dtype)
-        if int(pool.num_slots) != int(layout.num_block):
+        pages = self._cache_config.swa.pages_per_slot if is_swa else 1
+        block_bytes = layout_block_bytes(layout, dtype) * pages
+        if int(pool.num_slots) * pages != int(layout.num_block):
             raise ValueError(
                 f"radix-server {kind.name} pool has {pool.num_slots} slots, FlexKV's CPU "
                 f"layout has {layout.num_block} blocks; the bootstrap and the TE disagree "

@@ -102,7 +102,8 @@ except ImportError:
     _HAS_KV_CONNECTOR_OUTPUT = False
 
 if TYPE_CHECKING:
-    from vllm.config import VllmConfig
+    from vllm.config import KVTransferConfig, VllmConfig
+    from vllm.config.kv_transfer import KVCacheAccess
     from vllm.v1.core.sched.output import SchedulerOutput
     try:
         from vllm.v1.attention.backend import AttentionMetadata
@@ -174,8 +175,9 @@ def _attention_waits_for_layers(forward_context: Optional[dict],
                                 layer_names: Iterable[str]) -> bool:
     """Whether vLLM's attention calls ``wait_for_layer_load`` before it reads
     each of these layers: Attention and MLAAttention do through their custom
-    ops (MLAAttention's direct call skips it); DeepSeek-V4.1's own attention
-    does with examples/vllm_adaption/vllm_0_33_0-deepseek-v41-layerwise.patch."""
+    ops, which MLAAttention's direct call and a subclass's own forward
+    (DeepSeek-V3.2, GLM-5) skip; DeepSeek-V4.1's and DeepSeek-V3.2's attention
+    do with the deepseek-v41/v32-layerwise patches in examples/vllm_adaption/."""
     if forward_context is None:
         return True
     try:
@@ -185,9 +187,11 @@ def _attention_waits_for_layers(forward_context: Optional[dict],
         return True
 
     def waits(layer) -> bool:
+        if hasattr(layer, "_wait_for_kv_layer_load"):
+            return True
         if isinstance(layer, MLAAttention):
-            return not layer.use_direct_call
-        return isinstance(layer, Attention) or hasattr(layer, "_wait_for_kv_layer_load")
+            return not layer.use_direct_call and type(layer).forward is MLAAttention.forward
+        return isinstance(layer, Attention)
 
     return all(waits(forward_context.get(name)) for name in layer_names)
 
@@ -218,6 +222,7 @@ class FlexKVTask(ABC):
 
     # slot mapping
     slot_mapping: Optional[np.ndarray] = None
+    swa_slot_mapping: Optional[np.ndarray] = None
     # block ids for tracking errors
     block_ids: list[int] = field(default_factory=list)
 
@@ -283,6 +288,27 @@ class FlexKVPutTask(FlexKVTask):
                 f"task execute cost {self.task_execute_cost*1000:.2f} ms)")
 
 
+@dataclass(slots=True, eq=False)
+class WindowSnapshot:
+    """A PUT of a request's KV before token ``end``, in the stored group's
+    ``block_ids``, with the sliding windows before it. Its blocks stay pinned
+    until it completes or is dropped. It matches and launches once vLLM has
+    processed the step that computed token ``end - 1``, when that token's id
+    is known too; without ``launch``, only if the request ends there."""
+    request: "Request"
+    end: int
+    block_ids: list[int]
+    swa_slot_mapping: np.ndarray
+    launch: bool = True
+    task_id: int = -1
+
+
+def _processed_tokens(request: "Request") -> int:
+    """The tokens whose KV the steps vLLM has processed computed."""
+    return (request.num_computed_tokens - request.num_in_flight_tokens
+            + request.num_stale_output_tokens)
+
+
 class FlexKVSchedulerConnector:
     def __init__(
         self,
@@ -298,6 +324,12 @@ class FlexKVSchedulerConnector:
         # The vLLM KV cache group whose blocks FlexKV stores.
         self.group_id = (flexkv_config.vllm_kv_group.group_id
                          if flexkv_config.vllm_kv_group is not None else 0)
+        self.swa = (flexkv_config.vllm_kv_group.swa
+                    if flexkv_config.vllm_kv_group is not None else None)
+        self.block_pool = None
+        self.requests: dict[str, Request] = {}
+        self.pending_snapshots: dict[str, list[WindowSnapshot]] = {}
+        self.running_snapshots: dict[int, list[WindowSnapshot]] = {}
 
         if os.getenv('DYNAMO_USE_FLEXKV', '0') == '1':
             self.collector = KVEventCollector()
@@ -398,10 +430,14 @@ class FlexKVSchedulerConnector:
         request has a task in flight; the caller retries once the scheduler has
         reported their completions and freed their GPU blocks.
         """
-        if self.req_id_to_task_dict or self.prefetch_tasks:
+        if (self.req_id_to_task_dict or self.prefetch_tasks
+                or self.pending_snapshots or self.running_snapshots):
             return False
         self.flexkv_manager.reset()
         return True
+
+    def bind_kv_cache_manager(self, kv_cache_manager) -> None:
+        self.block_pool = kv_cache_manager.block_pool
 
     ####################
     #### Get Method ####
@@ -447,6 +483,8 @@ class FlexKVSchedulerConnector:
         and peer SSD into the local CPU tier) while it waits in vLLM's queue;
         get_num_new_matched_tokens waits for it. Its local GPU hit is not known
         yet, so the prefetch covers all of the prompt's full blocks."""
+        if self.swa is not None:
+            self.requests[request.request_id] = request
         if not self.enable_prefetch:
             return
         num_tokens = request.num_tokens // self.block_size * self.block_size
@@ -456,6 +494,7 @@ class FlexKVSchedulerConnector:
             task_id = self.flexkv_manager.prefetch_async(
                 token_ids=np.asarray(request.all_token_ids[:num_tokens], dtype=np.int64),
                 namespace=self._extract_namespace(request),
+                swa_aware=self.swa is not None,
                 **self._block_hashes(request, num_tokens))
         except Exception as e:  # noqa: BLE001 - serve from the local tiers
             logger.warning(f"FlexKV prefetch of {request.request_id} failed: {e}")
@@ -485,7 +524,8 @@ class FlexKVSchedulerConnector:
     def has_pending_work(self) -> bool:
         """Whether vLLM must keep stepping with no request left: a returned
         task's graph (a PUT's SSD write) completes only when polled."""
-        return self.flexkv_manager.has_running_graphs()
+        return (bool(self.pending_snapshots or self.running_snapshots)
+                or self.flexkv_manager.has_running_graphs())
 
     def has_pending_block_frees(self) -> bool:
         """Whether a PUT will soon free a finished request's blocks, so that
@@ -581,9 +621,12 @@ class FlexKVSchedulerConnector:
             token_ids=np_token_ids,
             token_mask=np_token_mask,
             namespace=namespace,
+            swa_aware=self.swa is not None,
             **self._block_hashes(request, num_tokens_to_get),
         )
         num_new_matched_tokens = int(np.count_nonzero(matched_mask))
+        if self.swa is not None and num_new_matched_tokens < self.swa.window_tokens:
+            num_new_matched_tokens = 0
 
         # Auto cancel if not call update_state_after_alloc()
         match_end_time = time.perf_counter()
@@ -647,6 +690,18 @@ class FlexKVSchedulerConnector:
         block_ids_to_get = all_block_ids[num_computed_blocks:num_computed_blocks+num_blocks_to_get]
         task.block_ids = block_ids_to_get
         task.slot_mapping = np.array(block_ids_to_get).repeat(self.block_size)*self.block_size
+        if self.swa is not None:
+            end = task.num_computed_tokens + num_new_matched_tokens
+            task.swa_slot_mapping = self._swa_slot_mapping(blocks.get_block_ids(), end)
+            if task.swa_slot_mapping is None:
+                raise RuntimeError(
+                    f"vLLM does not hold the sliding windows before token {end} "
+                    f"of request {request.request_id}")
+
+    def _swa_slot_mapping(self, block_ids: tuple[list[int], ...],
+                          end: int) -> Optional[np.ndarray]:
+        null = self.block_pool.null_block.block_id if self.block_pool is not None else 0
+        return self.swa.slot_mapping(block_ids, end, self.block_size, null)
 
     def wait_for_all_get_tasks(self) -> list[FlexKVResponse]:
         """
@@ -678,6 +733,19 @@ class FlexKVSchedulerConnector:
         """
         self._forget_prefetch(request.request_id)
         self.failed_load_req_ids.discard(request.request_id)
+        self.requests.pop(request.request_id, None)
+        snapshots = self.pending_snapshots.pop(request.request_id, [])
+        keep = []
+        if request.get_finished_reason() in (FinishReason.STOP, FinishReason.LENGTH):
+            done = [s for s in snapshots if s.end <= _processed_tokens(request)]
+            keep = [s for s in done if s.launch] + [s for s in done if not s.launch][-1:]
+            for snapshot in keep:
+                snapshot.launch = True
+        for snapshot in snapshots:
+            if snapshot not in keep:
+                self._unpin(snapshot)
+        if keep:
+            self.pending_snapshots[request.request_id] = keep
         if request.request_id in self.failed_loads_unreported:
             # Its blocks hold no KV; vLLM frees them once the failed load's
             # report arrives.
@@ -714,7 +782,8 @@ class FlexKVSchedulerConnector:
             ((request.num_tokens - 1) // self.block_size) * self.block_size,
             max_backed_tokens,
         )
-        if num_tokens_to_put == 0:
+        if num_tokens_to_put == 0 or any(s.end >= num_tokens_to_put for s in keep):
+            # A window snapshot stores this prefix too, its blocks pinned.
             return False
 
         task_id, num_matched_tokens, num_unmatched_tokens = self._put_match(
@@ -785,6 +854,7 @@ class FlexKVSchedulerConnector:
         task_id, unmatched_mask = self.flexkv_manager.put_match(
             token_ids=np_token_ids,
             namespace=namespace,
+            swa=False,
             **self._block_hashes(request, num_tokens_to_put),
         )
 
@@ -832,6 +902,113 @@ class FlexKVSchedulerConnector:
     #### Common Method ####
     #######################
 
+    def plan_snapshots(self, scheduler_output: "SchedulerOutput") -> None:
+        """Snapshot the sliding-window groups of each request at the block
+        boundary this step's KV reaches: its prompt's last one; with
+        ``swa.interval``, the last multiple of the interval inside a prefill
+        chunk; and every block boundary in decode, stored at multiples of the
+        interval and otherwise only where the request ends (request_finished).
+        Pin the blocks the PUT reads, which vLLM frees as the window moves on,
+        until the PUT launched once the step is processed (launch_ready_snapshots)
+        lands or a deeper processed window supersedes them."""
+        block_state = getattr(scheduler_output, "kv_connector_block_state", None)
+        if self.swa is None or self.block_pool is None or block_state is None:
+            return
+        cached = scheduler_output.scheduled_cached_reqs
+        scheduled = [(req.req_id, req.num_computed_tokens)
+                     for req in scheduler_output.scheduled_new_reqs]
+        scheduled += zip(cached.req_ids, cached.num_computed_tokens, strict=True)
+        interval = self.swa.interval
+        for req_id, num_computed in scheduled:
+            request = self.requests.get(req_id)
+            if request is None:
+                continue
+            num_prompt = request.num_prompt_tokens
+            stop = num_computed + scheduler_output.num_scheduled_tokens[req_id]
+            end = stop // self.block_size * self.block_size
+            if num_computed < num_prompt <= stop:
+                end, launch = (num_prompt - 1) // self.block_size * self.block_size, True
+            elif num_prompt <= num_computed < end:
+                launch = bool(interval) and end % interval == 0
+            elif interval and num_computed < stop // interval * interval:
+                end, launch = stop // interval * interval, True
+            else:
+                continue
+            snapshots = self.pending_snapshots.get(req_id, [])
+            block_ids = block_state.get_block_ids(req_id)
+            swa_slot_mapping = (None if block_ids is None or end < self.swa.window_tokens
+                                or any(s.end == end for s in snapshots)
+                                else self._swa_slot_mapping(block_ids, end))
+            if swa_slot_mapping is None:
+                continue
+            snapshot = WindowSnapshot(request, end,
+                                      list(block_ids[self.group_id][:end // self.block_size]),
+                                      swa_slot_mapping, launch)
+            self.block_pool.touch([self.block_pool.blocks[i] for i in self._pinned(snapshot)])
+            self.pending_snapshots[req_id] = self._supersede(snapshots + [snapshot])
+
+    def _supersede(self, snapshots: list[WindowSnapshot]) -> list[WindowSnapshot]:
+        """Drop the windows a request might end at below its deepest processed one."""
+        processed = _processed_tokens(snapshots[0].request)
+        deepest = max((s.end for s in snapshots if s.end <= processed), default=0)
+        kept = [s for s in snapshots if s.launch or s.end >= deepest]
+        for snapshot in snapshots:
+            if snapshot not in kept:
+                self._unpin(snapshot)
+        return kept
+
+    def launch_ready_snapshots(self) -> None:
+        ready = []
+        for req_id, snapshots in list(self.pending_snapshots.items()):
+            processed = _processed_tokens(snapshots[0].request)
+            launching = [s for s in snapshots if s.launch and s.end <= processed]
+            if not launching:
+                continue
+            kept = [s for s in snapshots if s not in launching]
+            if kept:
+                self.pending_snapshots[req_id] = kept
+            else:
+                del self.pending_snapshots[req_id]
+            for snapshot in launching:
+                request, end = snapshot.request, snapshot.end
+                snapshot.task_id, unmatched_mask = self.flexkv_manager.put_match(
+                    token_ids=np.asarray(request.all_token_ids[:end], dtype=np.int64),
+                    namespace=self._extract_namespace(request),
+                    swa=True,
+                    **self._block_hashes(request, end),
+                )
+                num_unmatched = int(np.count_nonzero(unmatched_mask))
+                if num_unmatched:
+                    ready.append((snapshot, snapshot.block_ids[(end - num_unmatched) // self.block_size:]))
+                else:
+                    self.flexkv_manager.cancel(task_ids=[snapshot.task_id])
+                    self._unpin(snapshot)
+        if not ready:
+            return
+        launched = self.flexkv_manager.launch(
+            task_ids=[snapshot.task_id for snapshot, _ in ready],
+            slot_mappings=[np.array(ids, dtype=np.int64).repeat(self.block_size) * self.block_size
+                           for _, ids in ready],
+            swa_slot_mappings=[snapshot.swa_slot_mapping for snapshot, _ in ready],
+            as_batch=self.enable_batch and len(ready) > 1)
+        snapshots = [snapshot for snapshot, _ in ready]
+        if len(launched) == len(snapshots):
+            for task_id, snapshot in zip(launched, snapshots, strict=True):
+                self.running_snapshots[task_id] = [snapshot]
+        elif len(launched) == 1:
+            self.running_snapshots[launched[0]] = snapshots
+        else:
+            for snapshot in snapshots:
+                self._unpin(snapshot)
+
+    def _pinned(self, snapshot: WindowSnapshot) -> list[int]:
+        return snapshot.block_ids + (snapshot.swa_slot_mapping[::self.block_size]
+                                     // self.block_size).tolist()
+
+    def _unpin(self, snapshot: WindowSnapshot) -> None:
+        self.block_pool.free_blocks(
+            self.block_pool.blocks[i] for i in reversed(self._pinned(snapshot)))
+
     def cancel_tasks(self) -> None:
         """
         Cancel tasks in self.cancel_tasks.
@@ -865,12 +1042,13 @@ class FlexKVSchedulerConnector:
         zero = getattr(scheduler_output, "new_block_ids_to_zero", None)
         if not zero or not self.enable_layerwise_transfer:
             return
-        loaded = {
-            block_id
-            for task in self.tasks_to_launch.values()
-            if isinstance(task, FlexKVGetTask)
-            for block_id in task.block_ids
-        }
+        loaded = set()
+        for task in self.tasks_to_launch.values():
+            if isinstance(task, FlexKVGetTask):
+                loaded.update(task.block_ids)
+                if task.swa_slot_mapping is not None:
+                    loaded.update((task.swa_slot_mapping[::self.block_size]
+                                   // self.block_size).tolist())
         if loaded:
             scheduler_output.new_block_ids_to_zero = [
                 block_id for block_id in zero if block_id not in loaded
@@ -886,6 +1064,7 @@ class FlexKVSchedulerConnector:
         task_launch_time = time.perf_counter()
         get_task_ids: list[int] = []
         get_slot_mappings: list[np.ndarray] = []
+        get_swa_slot_mappings: list[Optional[np.ndarray]] = []
         get_tasks_to_launch: list[FlexKVGetTask] = []
         put_task_ids: list[int] = []
         put_slot_mappings: list[np.ndarray] = []
@@ -896,6 +1075,7 @@ class FlexKVSchedulerConnector:
             if isinstance(task, FlexKVGetTask):
                 get_task_ids.append(task_id)
                 get_slot_mappings.append(task.slot_mapping)
+                get_swa_slot_mappings.append(task.swa_slot_mapping)
                 get_tasks_to_launch.append(task)
             else:
                 put_task_ids.append(task_id)
@@ -907,6 +1087,7 @@ class FlexKVSchedulerConnector:
                 layerwise_metadata)
             launched_get_task_ids = self.flexkv_manager.launch(task_ids=get_task_ids,
                                        slot_mappings=get_slot_mappings,
+                                       swa_slot_mappings=get_swa_slot_mappings,
                                        as_batch=(
                                            bool(layerwise_launch["as_batch"])
                                            or (self.enable_batch
@@ -951,12 +1132,13 @@ class FlexKVSchedulerConnector:
         Returns:
             list[FlexKVResponse]: Responses of finished tasks.
         """
-        if len(self.req_id_to_task_dict) == 0:
+        if len(self.req_id_to_task_dict) == 0 and not self.running_snapshots:
             if self.flexkv_manager.has_running_graphs():
                 self.flexkv_manager.try_wait([])
             return set(), set()
         # logger.debug(f"unfinished task: {self.req_id_to_task_dict}")
-        task_ids = list(self.get_tasks.keys()) + list(self.put_tasks.keys())
+        task_ids = (list(self.get_tasks.keys()) + list(self.put_tasks.keys())
+                    + list(self.running_snapshots))
         responses_from_manager = self.flexkv_manager.try_wait(task_ids)
         task_finished_time = time.perf_counter()
         # responses_to_return: list[FlexKVResponse] = []
@@ -965,6 +1147,16 @@ class FlexKVSchedulerConnector:
         num_failed_tasks = 0
         for task_id, response in responses_from_manager.items():
             success = (response.status == KVResponseStatus.SUCCESS)
+            snapshots = self.running_snapshots.pop(task_id, None)
+            if snapshots is not None:
+                for snapshot in snapshots:
+                    self._unpin(snapshot)
+                if not success:
+                    logger.warning(
+                        "FlexKV window snapshots of "
+                        f"{[s.request.request_id for s in snapshots]} failed, "
+                        f"status: {response.status}")
+                continue
             if task_id in self.get_tasks:
                 tasks = self.get_tasks.pop(task_id)
                 if not self.enable_layerwise_transfer:
@@ -1016,6 +1208,8 @@ class FlexKVSchedulerConnector:
         and potential race conditions with block reuse.
         """
         for req_id in preempted_req_ids:
+            for snapshot in self.pending_snapshots.pop(req_id, []):
+                self._unpin(snapshot)
             if req_id in self.req_id_to_task_dict:
                 task_id = self.req_id_to_task_dict[req_id]
                 # If the task is waiting to be launched, we can safely cancel it.
@@ -1119,6 +1313,7 @@ class FlexKVWorkerConnector:
             logger.info("Finish register kv_caches")
             self._registered_kv_caches = dict(kv_caches)
             return
+        swa_registration = self._swa_registration(kv_caches, group)
         if group is not None:
             # Under vLLM's hybrid KV cache manager the caches of every group
             # arrive here; FlexKV stores one of them.
@@ -1213,6 +1408,7 @@ class FlexKVWorkerConnector:
                 kv_caches=gpu_blocks,
                 kv_layout=gpu_layout,
                 resume=resume,
+                **swa_registration,
             )
         else:
             indexer_buffers = list(indexer_kv_caches.values())
@@ -1260,6 +1456,7 @@ class FlexKVWorkerConnector:
                 gpu_layouts=[gpu_layout, indexer_layout],
                 handles_per_group=[gpu_blocks, indexer_buffers],
                 resume=resume,
+                **swa_registration,
             )
 
         # NOTE: deliberately NOT joining the eventfd sender here.
@@ -1344,7 +1541,42 @@ class FlexKVWorkerConnector:
             gpu_layouts=gpu_layouts,
             handles_per_group=handles_per_group,
             resume=resume,
+            **self._swa_registration(kv_caches, group),
         )
+
+    def _swa_registration(
+        self, kv_caches: dict[str, torch.Tensor], group: VllmKVGroup,
+    ) -> dict:
+        """The KV cache as SWA pages, one per vLLM block in each of its
+        regions: a sliding-window group's window blocks are pages of it."""
+        swa = group.swa if group is not None else None
+        if swa is None:
+            return {}
+        regions = []
+        for name in swa.region_layer_names:
+            view = kv_caches[name]
+            storage = view.untyped_storage()
+            base = view.storage_offset() * view.element_size()
+            if base + group.num_blocks * swa.block_bytes > storage.nbytes():
+                raise ValueError(
+                    f"KV cache {name} does not start {group.num_blocks} "
+                    f"blocks of {swa.block_bytes} B")
+            regions.append(torch.empty(0, dtype=torch.uint8, device=view.device).set_(
+                storage, base, (group.num_blocks, swa.block_bytes), (swa.block_bytes, 1)))
+        tokens_per_block = self.flexkv_config.cache_config.tokens_per_block
+        return {
+            "swa_caches": regions,
+            "swa_layout": KVCacheLayout(
+                type=KVCacheLayoutType.LAYERFIRST,
+                num_layer=len(regions),
+                num_block=group.num_blocks,
+                tokens_per_block=tokens_per_block,
+                num_head=1,
+                head_size=swa.block_bytes // tokens_per_block,
+                kv_dim=1,
+                num_kv_heads=1,
+            ),
+        }
 
     def before_device_sleep(self) -> int:
         return self.tp_client.suspend_gpu_mappings()
@@ -1376,10 +1608,13 @@ class FlexKVWorkerConnector:
             raise NotImplementedError(
                 "use_layerwise needs a model whose attention waits for every "
                 "layer it reads (wait_for_layer_load); this one does not. For "
-                "DeepSeek-V4.1 on vLLM 0.33.0 apply "
-                "examples/vllm_adaption/vllm_0_33_0-deepseek-v41-layerwise.patch, "
-                "otherwise set use_layerwise to false")
+                "DeepSeek-V4.1 or DeepSeek-V3.2/GLM-5 apply the deepseek-v41- or "
+                "deepseek-v32-layerwise patch for your vLLM version in "
+                "examples/vllm_adaption/, otherwise set use_layerwise to false")
         pool = LayerwiseCounterPool(layer_names)
+        swa = self.flexkv_config.vllm_kv_group and self.flexkv_config.vllm_kv_group.swa
+        if swa is not None:
+            pool.layer_to_index.update(swa.layer_regions)
         self.layerwise_counter_pool = pool
         socket_path = build_layerwise_eventfd_socket_path(
             dp_client_id=self.rank_info.dp_client_id,
@@ -1596,6 +1831,33 @@ class FlexKVConnectorV1Impl:
     def shutdown(self):
         self.connector.shutdown()
 
+    @property
+    def requires_kv_delivery(self) -> bool:
+        """A dropped save is only a later cache miss."""
+        return False
+
+    @classmethod
+    def supports_lookahead_block_hashes(cls, kv_transfer_config: "KVTransferConfig") -> bool:
+        """FlexKV keys a block by its own tokens, not by the ones after it."""
+        return False
+
+    @classmethod
+    def kv_cache_access(cls, kv_transfer_config: "KVTransferConfig") -> "KVCacheAccess":
+        """The transfer engine opens the KV cache through CUDA IPC."""
+        from vllm.config.kv_transfer import KVCacheAccess
+
+        return KVCacheAccess.LEGACY_IPC
+
+    @classmethod
+    def get_required_kvcache_layout(cls, vllm_config: "VllmConfig") -> Optional[str]:
+        """FlexKV addresses each layer's blocks token-major."""
+        return "LBNHC"
+
+    @classmethod
+    def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
+        """Layer-wise loads wait for each layer between CUDA graph pieces."""
+        return bool(extra_config.get("use_layerwise", False))
+
     def reset_cache(self) -> Optional[bool]:
         """Reset the FlexKV cache. Only meaningful on the scheduler side
         (vLLM invokes connector.reset_cache() from the scheduler process).
@@ -1608,6 +1870,10 @@ class FlexKVConnectorV1Impl:
         self, metadata: FlexKVConnectorMetadata
     ) -> None:
         self._bound_metadata = metadata
+
+    def bind_kv_cache_manager(self, kv_cache_manager) -> None:
+        if self.role == KVConnectorRole.SCHEDULER:
+            self.connector.bind_kv_cache_manager(kv_cache_manager)
 
     def clear_connector_metadata(self) -> None:
         self._bound_metadata = None
@@ -1840,6 +2106,7 @@ class FlexKVConnectorV1Impl:
             self.connector.handle_preemptions(preempted_req_ids)
 
         self.connector.cancel_tasks()
+        self.connector.plan_snapshots(scheduler_output)
         self.connector.keep_loads_from_zeroing(scheduler_output)
         layerwise_metadata = self.connector.launch_tasks()
 
@@ -1865,6 +2132,7 @@ class FlexKVConnectorV1Impl:
         if not _HAS_KV_CONNECTOR_OUTPUT:
             return
 
+        self.connector.launch_ready_snapshots()
         finished_sending, finished_recving = self.connector.query_finished_task()
         # What the workers report as received are the failed loads of an
         # earlier step's metadata (get_transfer_results).
@@ -1901,10 +2169,11 @@ class FlexKVConnectorV1Impl:
         return self.request_finished(request, block_ids[self.connector.group_id])
 
     def get_loaded_kv_cache_group_ids(self, request: "Request") -> tuple[int, ...]:
-        """The KV cache group a FlexKV load restores: the one FlexKV stores.
-        vLLM keeps an async load's blocks of it out of zeroing, and replays
-        the sliding window of any group a hit does not restore."""
-        return (self.connector.group_id,)
+        """The KV cache groups a FlexKV load restores. vLLM keeps an async
+        load's blocks of them out of zeroing, and replays the sliding window of
+        any group a hit does not restore."""
+        swa = self.connector.swa
+        return (self.connector.group_id,) + (swa.group_ids if swa is not None else ())
 
     def has_pending_push_work(self) -> bool:
         """Keep vLLM stepping while a FlexKV graph completes only when polled."""

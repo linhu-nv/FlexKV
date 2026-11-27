@@ -1,0 +1,41 @@
+diff --git a/vllm/models/deepseek_v32/attention.py b/vllm/models/deepseek_v32/attention.py
+index ed079204d2..4d3ddeb220 100644
+--- a/vllm/models/deepseek_v32/attention.py
++++ b/vllm/models/deepseek_v32/attention.py
+@@ -9,6 +9,11 @@ from transformers import DeepseekV2Config, DeepseekV3Config
+ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+ from vllm.config import CacheConfig, CUDAGraphMode, VllmConfig
+ from vllm.distributed import get_tensor_model_parallel_world_size
++from vllm.distributed.kv_transfer import (
++    get_kv_transfer_group,
++    has_kv_transfer_group,
++    is_v1_kv_transfer_group,
++)
+ from vllm.distributed.parallel_state import get_tp_group
+ from vllm.forward_context import get_forward_context
+ from vllm.model_executor.layers.attention import MLAAttention
+@@ -463,6 +468,16 @@ class DeepseekV32Attention(MLAAttention):
+         )
+         return self.o_proj(output)[0]
+ 
++    def _wait_for_kv_layer_load(self) -> None:
++        """Wait for a KV connector's layer-wise load of this layer's MLA and
++        index K caches, which the MLAAttention custom op this forward skips
++        would do."""
++        if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
++            return
++        connector = get_kv_transfer_group()
++        if connector.has_connector_metadata():
++            connector.wait_for_layer_load(self.layer_name)
++
+     @eager_break_during_capture
+     def _sparse_indexer_and_attn(
+         self,
+@@ -479,6 +494,7 @@ class DeepseekV32Attention(MLAAttention):
+         mqa_q: torch.Tensor,
+         output: torch.Tensor,
+     ) -> None:
++        self._wait_for_kv_layer_load()
+         if self.indexer is not None and not self.skip_topk:
+             assert index_q_fp8 is not None
+             assert index_weights_out is not None

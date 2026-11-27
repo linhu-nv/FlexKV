@@ -18,7 +18,7 @@ namespace into its session/planner before advertising that capability.
 
 ### vLLM
 
-- For vLLM, please use the `examples/vllm_adaption/vllm_0_10_1_1-flexkv-connector-namespace.patch` patch to support namespace functionality
+- vLLM requests are namespaced by their LoRA name and `cache_salt`; no patch is needed
 ### TensorRT-LLM
 
 **Important**: Namespace isolation feature is only supported in **TensorRT-LLM v1.1.0rc5**.

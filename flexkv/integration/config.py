@@ -1,10 +1,11 @@
 
 import json
 import os
+import numpy as np
 import torch
 import tempfile
-from typing import TYPE_CHECKING, Optional, Tuple
-from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Optional, Sequence, Tuple
+from dataclasses import dataclass, field, replace
 
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.config import *
@@ -159,7 +160,8 @@ class VllmKVGroup:
     layer group ``g``, and FlexKV layer ``i`` holds the caches of one model
     layer, named ``layer_names[i]`` after its attention cache, the name vLLM's
     attention waits on with ``wait_for_layer_load``. ``kv_shared_across_ranks``
-    says every TP rank holds the same pages of the group.
+    says every TP rank holds the same pages of the group. ``swa`` are the
+    sliding-window groups a hit restores with it.
     """
     group_id: int
     cache_layer_names: Tuple[str, ...]
@@ -167,23 +169,107 @@ class VllmKVGroup:
     layer_names: Tuple[str, ...] = ()
     group_layer_names: Tuple[Tuple[str, ...], ...] = ()
     kv_shared_across_ranks: bool = False
+    swa: Optional["VllmSWAGroups"] = None
+
+
+@dataclass(frozen=True)
+class VllmSWAGroups:
+    """Prefix-cacheable vLLM sliding-window KV cache groups (DeepSeek-V4.1
+    without SWA bounded replay). A hit ending at token ``t`` needs each
+    group's ``window_blocks`` blocks before ``t``; FlexKV snapshots them at a
+    prompt's or an answer's end as pages, and at multiples of ``interval``.
+    All groups share one block id space, and a block
+    is one opaque ``block_bytes`` run in each region of the cache: the whole
+    block of a block-outermost cache, or each layer region of a
+    layer-outermost one, whose bytes ``region_layer_names``' views start. A
+    layer-wise load lands region ``r`` with FlexKV layer ``r``, which the
+    caches in it (``layer_regions``) wait for."""
+    group_ids: Tuple[int, ...]
+    block_size: int
+    window_blocks: int
+    block_bytes: int
+    region_layer_names: Tuple[str, ...]
+    layer_regions: Tuple[Tuple[str, int], ...] = ()
+    interval: int = 0
+
+    @property
+    def window_tokens(self) -> int:
+        return self.block_size * self.window_blocks
+
+    @property
+    def pages(self) -> int:
+        return self.window_blocks * len(self.group_ids)
+
+    def slot_mapping(self, block_ids: Sequence[Sequence[int]], end: int,
+                     tokens_per_block: int, null_block: int) -> Optional[np.ndarray]:
+        """The pages of a snapshot of the window before token ``end``, every
+        group's blocks in turn, as a slot mapping in blocks of
+        ``tokens_per_block``; None unless vLLM still holds them all."""
+        stop = end // self.block_size
+        ids = [b for g in self.group_ids
+               for b in block_ids[g][max(stop - self.window_blocks, 0):stop]]
+        if len(ids) != self.pages or null_block in ids:
+            return None
+        return np.array(ids, dtype=np.int64).repeat(tokens_per_block) * tokens_per_block
+
+
+def _vllm_sliding_window(group) -> Optional[Tuple[int, int]]:
+    """The block size and window of a vLLM sliding-window KV cache group."""
+    params = getattr(getattr(group, "manager_config", None), "params", None)
+    if params is not None:
+        from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
+
+        if isinstance(params, SlidingWindowManager.Params):
+            return group.block_size, params.sliding_window
+        return None
+    if getattr(group, "kv_cache_spec", None) is None:
+        return None
+    from vllm.v1.kv_cache_interface import SlidingWindowSpec  # vLLM <= 0.34.0
+
+    shapes = {(spec.block_size, spec.sliding_window)
+              if isinstance(spec, SlidingWindowSpec) else None
+              for spec in _vllm_layer_specs(group)}
+    return shapes.pop() if len(shapes) == 1 else None
+
+
+def vllm_swa_group_ids(kv_cache_config: "KVCacheConfig") -> Tuple[int, ...]:
+    """The prefix-cacheable vLLM sliding-window KV cache groups FlexKV
+    snapshots with the group it stores (DeepSeek-V4.1 without SWA bounded
+    replay)."""
+    groups = kv_cache_config.kv_cache_groups
+    if len(groups) == 1:
+        return ()
+    return tuple(g for g in kv_cache_config.prefix_cacheable_group_ids
+                 if _vllm_sliding_window(groups[g]))
 
 
 def vllm_transfer_group_id(kv_cache_config: "KVCacheConfig") -> int:
     """The one vLLM KV cache group FlexKV stores: the only group, or with the
-    hybrid KV cache manager the only prefix-cacheable one. DeepSeek-V4.1's
-    sliding-window and compressor-state groups are rebuilt by vLLM's SWA
-    bounded replay after a prefix hit, so they need no store."""
+    hybrid KV cache manager the only prefix-cacheable one besides
+    sliding-window ones. DeepSeek-V4.1's sliding-window and compressor-state
+    groups are rebuilt by vLLM's SWA bounded replay after a prefix hit, so
+    they need no store."""
     groups = kv_cache_config.kv_cache_groups
     if len(groups) == 1:
         return 0
-    cacheable = kv_cache_config.prefix_cacheable_group_ids
+    swa = vllm_swa_group_ids(kv_cache_config)
+    cacheable = [g for g in kv_cache_config.prefix_cacheable_group_ids if g not in swa]
     if len(cacheable) != 1:
         raise ValueError(
-            "FlexKV stores one prefix-cacheable vLLM KV cache group, but this "
-            f"model has {len(cacheable)} of {len(groups)} groups; run vLLM "
-            "with --disable-hybrid-kv-cache-manager")
+            "FlexKV stores one prefix-cacheable vLLM KV cache group besides "
+            f"sliding-window ones, but this model has {len(cacheable)} of "
+            f"{len(groups)} groups; run vLLM with --disable-hybrid-kv-cache-manager")
     return cacheable[0]
+
+
+def _vllm_layer_specs(group) -> list:
+    """The KV cache specs of a vLLM KV cache group's layers."""
+    specs = getattr(group, "kv_cache_specs", None)
+    if specs is not None:
+        return list(specs.values())
+    from vllm.v1.kv_cache_interface import iter_layer_specs  # vLLM <= 0.34.0
+
+    return list(iter_layer_specs(group.kv_cache_spec))
 
 
 def _vllm_page_bytes(kv_cache_config: "KVCacheConfig") -> dict:
@@ -561,7 +647,7 @@ class FlexKVConfig:
         kv_cache_config: "KVCacheConfig",
     ) -> None:
         """Populate the packed storage layout from vLLM resolved KV specs."""
-        from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec, iter_layer_specs
+        from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
 
         group_id = vllm_transfer_group_id(kv_cache_config)
         group = kv_cache_config.kv_cache_groups[group_id]
@@ -570,10 +656,11 @@ class FlexKVConfig:
         pages = _vllm_page_bytes(kv_cache_config)
         if len({pages.get(name) for name in group.layer_names}) > 1:
             self._configure_vllm_layer_groups(kv_cache_config, group_id, pages)
+            self._configure_vllm_swa_groups(kv_cache_config)
             return
 
         layouts = set()
-        for spec in iter_layer_specs(group.kv_cache_spec):
+        for spec in _vllm_layer_specs(group):
             if not isinstance(spec, AttentionSpec):
                 raise ValueError(
                     "FlexKV only supports attention KV cache specs; got "
@@ -641,6 +728,79 @@ class FlexKVConfig:
             f"total_storage_heads={self.model_config.num_kv_heads}, "
             f"head_size={physical_head_size}, kv_dim=1, dtype={dtype}"
         )
+        self._configure_vllm_swa_groups(kv_cache_config)
+
+    def _configure_vllm_swa_groups(self, kv_cache_config: "KVCacheConfig") -> None:
+        """Snapshot vLLM's sliding-window groups at prompt and answer ends, and
+        at multiples of vLLM's prefix_cache_retention_interval, in an SWA pool
+        whose slot holds every group's window blocks. A block is one opaque
+        page per region of the cache that only its group uses: the whole
+        block when blocks are outermost, each layer region when layers are,
+        the groups' layers sharing the regions from the first."""
+        from vllm.v1.kv_cache_layout import KVCacheLayout as VllmKVCacheLayout
+
+        group_ids = vllm_swa_group_ids(kv_cache_config)
+        if not group_ids:
+            return
+        groups = [kv_cache_config.kv_cache_groups[g] for g in group_ids]
+        shapes = {_vllm_sliding_window(g) for g in groups}
+        tokens_per_block = self.cache_config.tokens_per_block
+        layout = (VllmKVCacheLayout[kv_cache_config.kv_cache_layout]
+                  if kv_cache_config.kv_cache_layout is not None else None)
+        names = {name for g in groups for name in g.layer_names}
+        tensors = kv_cache_config.kv_cache_tensors
+        swa_tensors = [t for t in tensors if t.layers[0] in names]
+        regions: Tuple[str, ...] = ()
+        layer_regions: Tuple[Tuple[str, int], ...] = ()
+        if layout is not None and layout.is_block_outermost:
+            if len({t.block_stride for t in tensors}) == 1:
+                regions = tuple(t.layers[0] for t in swa_tensors if t.offset == 0)[:1]
+                layer_regions = tuple((name, 0) for name in sorted(names))
+        elif (layout is not None and layout.is_layer_compact and layout.is_block_compact
+                and len(swa_tensors) == len(groups) and all(t.offset == 0 for t in swa_tensors)
+                and len({t.block_stride for t in swa_tensors}) == 1
+                and max(len(t.layers) for t in swa_tensors)
+                <= len(self.vllm_kv_group.cache_layer_names)):
+            regions = tuple(max((t.layers for t in swa_tensors), key=len))
+            layer_regions = tuple((name, i) for t in swa_tensors for i, name in enumerate(t.layers))
+        if len(shapes) != 1 or not regions:
+            raise NotImplementedError(
+                "FlexKV snapshots vLLM sliding-window groups of one block size "
+                "and window in a KV cache whose blocks or layers are outermost; "
+                f"got {sorted(shapes)}, layout {kv_cache_config.kv_cache_layout}. "
+                "Otherwise run vLLM with --disable-hybrid-kv-cache-manager")
+        ((block_size, window),) = shapes
+        block_bytes = swa_tensors[0].block_stride
+        if tokens_per_block % block_size or block_bytes % tokens_per_block:
+            raise NotImplementedError(
+                f"FlexKV blocks of {tokens_per_block} tokens cannot hold vLLM "
+                f"sliding-window blocks of {block_size} tokens and {block_bytes} B")
+        retention = getattr(kv_cache_config, "prefix_cache_retention_interval", 0)
+        interval = tokens_per_block if retention is None else retention
+        swa = VllmSWAGroups(tuple(group_ids), block_size,
+                            -(-(window - 1) // block_size), block_bytes, regions, layer_regions, interval)
+        capacities = self.user_config.swa or {}
+        if capacities.get("num_remote_slots", 0):
+            raise NotImplementedError(
+                "FlexKV snapshots vLLM sliding-window groups in the CPU and SSD tiers only")
+        num_slots = capacities.get("num_cpu_slots", SWAPoolConfig.num_slots)
+        self.cache_config.swa = SWAPoolConfig(
+            enabled=True,
+            num_slots=num_slots,
+            num_ssd_slots=capacities.get(
+                "num_ssd_slots", num_slots if self.user_config.ssd_cache_gb > 0 else 0),
+            num_swa_layers=len(regions),
+            bytes_per_token_per_layer=block_bytes // tokens_per_block,
+            window_blocks=1,
+            pages_per_slot=swa.pages,
+        )
+        self.cache_config.enable_swa_transfer = True
+        self.vllm_kv_group = replace(self.vllm_kv_group, swa=swa)
+        logger.info(
+            f"[FlexKV vllm] snapshotting {len(group_ids)} sliding-window groups "
+            f"{list(group_ids)}: {swa.window_blocks} blocks of {block_size} "
+            f"tokens each ({swa.pages} pages of {block_bytes} B per snapshot), "
+            f"{num_slots} CPU snapshots, interval {interval}")
 
     def _configure_vllm_layer_groups(
         self,
@@ -657,16 +817,16 @@ class FlexKVConfig:
         A CPU/SSD block keeps one copy of a block's pages when every TP rank
         holds the same ones (vLLM's ``kv_tp_replicas``, or an MLA first layer),
         and one per rank otherwise. Of the group's specs only the first layer's
-        is read, as the scheduler's KVCacheConfig keeps no other, so both sides
-        agree; the workers, which see every spec, refuse a group whose first
-        layer is MLA while other caches differ across ranks.
+        decides, as the scheduler KVCacheConfig of vLLM <= 0.34.0 keeps no
+        other, so both sides agree; the workers, which see every spec, refuse a group whose
+        first layer is MLA while other caches differ across ranks.
         """
         from vllm.model_executor.models.utils import extract_layer_index
-        from vllm.v1.kv_cache_interface import MLAAttentionSpec, iter_layer_specs
+        from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
         group = kv_cache_config.kv_cache_groups[group_id]
-        specs = iter_layer_specs(group.kv_cache_spec)
-        first_spec = next(iter(specs))
+        specs = _vllm_layer_specs(group)
+        first_spec = specs[0]
         replicated = (
             getattr(kv_cache_config, "kv_tp_replicas", 1) >= self.model_config.tp_size)
         kv_shared_across_ranks = replicated or isinstance(first_spec, MLAAttentionSpec)
@@ -696,7 +856,7 @@ class FlexKVConfig:
                 layer_names[index] = name
             layer_of[name] = index
 
-        tokens_per_block = group.kv_cache_spec.block_size
+        tokens_per_block = first_spec.block_size
         layer_groups, group_layer_names = [], []
         for tensor in kv_cache_config.kv_cache_tensors:
             names = [name for name in tensor.layers if name in layer_of]

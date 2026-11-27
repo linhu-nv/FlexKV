@@ -14,7 +14,7 @@ FlexKV connector 的 `lookup_kv`、`store_kv` 和 `prefetch_async` 接收
 
 ### vLLM
 
-- 对于 vLLM，请使用 `examples/vllm_adaption/vllm_0_10_1_1-flexkv-connector-namespace.patch` 补丁以支持 namespace 功能
+- vLLM 按请求的 LoRA 名与 `cache_salt` 划分 namespace，无需补丁
 ### TensorRT-LLM
 
 **重要提示**：Namespace 隔离功能仅在 **TensorRT-LLM v1.1.0rc5** 中支持。

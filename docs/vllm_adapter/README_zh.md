@@ -6,8 +6,7 @@
 
 从 **vLLM v0.17.2rc0**（commit [`8cb24d3`](https://github.com/vllm-project/vllm/commit/8cb24d3aedb9f431fb15a636a3e11a00262f5991)）起，`FlexKVConnectorV1` 已内置于 vLLM，**无需再手动打 patch**。
 
-> **推荐做法**：安装 vLLM v0.17.2 ~ v0.28.x，或 v0.33.0 并打上[对应 patch](#给-vllm-打-patch)。从 v0.29.0 起，内置 connector 已无法启动 FlexKV。  
-> 其余 patch 仍保留于 `examples/vllm_adaption/` 目录，供需要使用 vLLM < 0.17.2 的用户参考。
+> **推荐做法**：安装 vLLM v0.17.2 ~ v0.28.x，或 v0.33.0、v0.34.1 并打上[对应 patch](#给-vllm-打-patch)。从 v0.29.0 起，内置 connector 已无法启动 FlexKV。
 
 ---
 
@@ -17,7 +16,7 @@
 这一变更引发了较大的 API 调整。因此，请注意：
 
 - **版本 >= `1.0.0`**：应使用 **当前版本 API**。
-- **版本 == `0.1.0`**：仅支持 **Legacy 版本 API**, vLLM patch位于`examples/vllm_adaption_legacy/`。
+- **版本 == `0.1.0`**：仅支持 **Legacy 版本 API**。
 
 ---
 
@@ -27,7 +26,7 @@
 - FlexKV >= `1.0.0`
 - vLLM `0.17.2` ~ `0.28.x`：内置 FlexKVConnectorV1，无需打 patch，直接使用
 - vLLM `0.33.0`：需给内置 FlexKVConnectorV1 打 patch，参见[给 vLLM 打 patch](#给-vllm-打-patch)
-- vLLM `0.10.1` ~ `0.17.1`：需手动 apply patch，参见[给 vLLM 打 patch](#给-vllm-打-patch)
+- vLLM `0.34.1`（main [`d51a514`](https://github.com/vllm-project/vllm/commit/d51a5147112a31dfbed08cfa4b774c27c34ce90d)，nightly `0.34.1rc1.dev96`；不是 0.34.0）：需给内置 FlexKVConnectorV1 打 patch，参见[给 vLLM 打 patch](#给-vllm-打-patch)
 
 ### 配置
 
@@ -63,6 +62,9 @@ export FLEXKV_ENABLE_RADIXSHMEM=1
 1. 安装 vLLM，所用版本需要时再打 patch（参见[给 vLLM 打 patch](#给-vllm-打-patch)）
 ```bash
 pip install 'vllm==0.33.0'
+# 或 0.34.1：其 patch 对应的 nightly wheel
+pip install 'vllm==0.34.1rc1.dev96+g249e65290' \
+    --extra-index-url https://wheels.vllm.ai/249e652909228b61bba2c409ca5ae6c84d236783
 ```
 
 2. 安装 FlexKV
@@ -107,9 +109,8 @@ VLLM_USE_V1=1 python -m vllm.entrypoints.cli.main serve MODEL \
 
 必须设置 `use_layerwise=true`，使 vLLM 选择 PIECEWISE CUDA Graph 模式；
 逐层 eventfd 等待无法在完整 CUDA Graph 捕获/回放中正确执行。为保证安全，
-仅设置 `FLEXKV_ENABLE_LAYERWISE_TRANSFER=1` 会被 vLLM adapter 忽略。vLLM 0.33.0
-的 patch 已包含对应的 wrapper 改动；其他版本在该改动合入上游前，请给 vLLM 应用
-`examples/vllm_adaption/vllm_main-flexkv-layerwise-wrapper.patch`。
+仅设置 `FLEXKV_ENABLE_LAYERWISE_TRANSFER=1` 会被 vLLM adapter 忽略。需打 vLLM 0.33.0
+或 0.34.1 的 patch。
 
 当前仅对 GET/H2D 做逐层流水；PUT 仍是请求级异步。
 当前暂不支持 Context Parallel（`context_parallel_size > 1`），因为 vLLM
@@ -118,8 +119,13 @@ VLLM_USE_V1=1 python -m vllm.entrypoints.cli.main serve MODEL \
 不是直接 `DISK2D`。如果某一层在
 `FLEXKV_LAYERWISE_WAIT_TIMEOUT_S`（默认 `60` 秒）内未就绪，forward 会失败，
 而不是永久卡住。模型的 attention 必须在读每一层之前等待该层加载，否则 FlexKV
-拒绝启动；DeepSeek-V4.1 在 vLLM 0.33.0 上需再打
-`examples/vllm_adaption/vllm_0_33_0-deepseek-v41-layerwise.patch`。
+拒绝启动；下列模型需再打 `examples/vllm_adaption/` 中对应 vLLM 0.33.0（`vllm_0_33_0-*`）
+或 0.34.1（`vllm_0_34_1-*`）的 patch：
+
+| 模型 | patch |
+|---|---|
+| DeepSeek-V4.1 | `vllm_<版本>-deepseek-v41-layerwise.patch` |
+| DeepSeek-V3.2、GLM-5.x（`GlmMoeDsaForCausalLM`，如 GLM-5.3） | `vllm_<版本>-deepseek-v32-layerwise.patch` |
 
 ### 给 vLLM 打 patch
 
@@ -127,34 +133,37 @@ VLLM_USE_V1=1 python -m vllm.entrypoints.cli.main serve MODEL \
 
 | vLLM 版本 | patch 文件 |
 |---|---|
-| 0.10.1.1 | `examples/vllm_adaption/vllm_0_10_1_1-flexkv-connector.patch` |
-| 0.14.1+ | `examples/vllm_adaption/vllm_up_0_14_1-flexkv-connector.patch` |
-| 0.16.0 | `examples/vllm_adaption/vllm_0_16_0-flexkv-connector.patch` |
 | 0.33.0 | `examples/vllm_adaption/vllm_0_33_0-flexkv-connector.patch` |
+| 0.34.1 | `examples/vllm_adaption/vllm_0_34_1-flexkv-connector.patch` |
 
 ```bash
 cd vllm
 # 设置 FLEXKV_DIR，并选择与 vLLM 版本匹配的 patch。
-PATCH_FILE=vllm_0_16_0-flexkv-connector.patch
+PATCH_FILE=vllm_0_34_1-flexkv-connector.patch
 git apply "$FLEXKV_DIR/examples/vllm_adaption/$PATCH_FILE"
 pip install -e .
 ```
 
-0.33.0 的 patch 让内置 connector 把 vLLM 的 `KVCacheConfig` 传给 FlexKV，
+0.33.0 与 0.34.1 的 patch 让内置 connector 把 vLLM 的 `KVCacheConfig` 传给 FlexKV，
 并转发缓存清空、sleep/wake 和逐层加载；还让 connector 支持 vLLM 的 hybrid KV cache
-manager（DeepSeek-V4.1 需要）：FlexKV 存取模型唯一的 prefix-cacheable group（各
-KV-source 层的压缩 KV 与 indexer K），命中后 SWA 由 vLLM 的 SWA bounded replay 重算。
-有多个 prefix-cacheable group 的其他模型需加 `--disable-hybrid-kv-cache-manager`。所存
-group 内各层的 page 大小可以不同：所有 TP rank 的 page 相同时（MLA，或 vLLM 的
+manager（DeepSeek-V4.1 需要）。加 `--no-swa-bounded-replay` 时，FlexKV 还会在每个 prompt
+和每个回答的最后一个 block 边界处存下滑动窗口 KV，多轮对话的下一轮可以命中到上一轮回答的末尾；
+若再给 vLLM 加 `--prefix-cache-retention-interval N`（N > 0），还会在 token 位置为 N 的整数倍处存：
+decode 阶段每到一个这样的位置就存一份；prefill 由 vLLM 分块计算，一个分块跨过一个或多个这样的位置时，
+只在其中最靠后的那个位置存一份。从 FlexKV 命中时，命中只能停在存有窗口的位置，该位置之后即使还缓存着
+Full KV 也要重新计算。FlexKV 配置中的 `swa.num_cpu_slots`（默认 1024）与 `swa.num_ssd_slots`
+决定 CPU、SSD 层各保留多少份窗口。
+FlexKV 所存各层的 page 大小可以不同：所有 TP rank 的 page 相同时（MLA，或 vLLM 的
 `kv_tp_replicas` 如此判定），CPU/SSD block 只存一份；否则（如 head 被 TP 切分的
-GQA/MHA）每个 TP rank 各存一份。它也
-可以直接打到已安装的 wheel 上：
+GQA/MHA）每个 TP rank 各存一份。在 0.34.1 上，patch 还会关闭 vLLM 的 extensible
+KV cache，因为 FlexKV 的传输引擎经 CUDA IPC 打开 KV cache。patch 也可以直接打到已安装的
+wheel 上：
 ```bash
 cd "$(python -c 'import os, vllm; print(os.path.dirname(os.path.dirname(vllm.__file__)))')"
-git apply --include='vllm/*' "$FLEXKV_DIR/examples/vllm_adaption/vllm_0_33_0-flexkv-connector.patch"
+git apply --include='vllm/*' "$FLEXKV_DIR/examples/vllm_adaption/$PATCH_FILE"
 ```
 
-打了 0.33.0 的 patch 后，FlexKV 加载失败会作为 failed receive 报给 vLLM，由 vLLM 按
+打了 0.33.0 或 0.34.1 的 patch 后，FlexKV 加载失败会作为 failed receive 报给 vLLM，由 vLLM 按
 `kv_load_failure_policy` 处理：默认（`"fail"`）该请求以错误结束；设为 `"recompute"`
 则 vLLM 不经 FlexKV 重算该请求。在 `--kv-transfer-config` 里设置，例如
 `'{"kv_connector":"FlexKVConnectorV1","kv_role":"kv_both","kv_load_failure_policy":"recompute"}'`。
@@ -163,34 +172,3 @@ layer-wise 加载失败则会让该次 forward 失败（见上文）。
 FlexKV 还在把已结束请求的 KV 从 GPU block 拷出时，vLLM 缺 block 会等这些 block 释放，
 而不是抢占运行中的请求；最早的一次拷贝超过 `FLEXKV_PENDING_FREE_WAIT_S` 秒（默认 `5`，
 设为 `0` 则不等）后就不再等待。
-
----
-
-## Legacy版本（<= 0.1.0），目前的版本尽量不要使用
-
-### 适用版本
-- FlexKV <= `0.1.0`
-
-### 配置
-
-旧版本配置方式如下
-```bash
-# generate config
-cat <<EOF > ./flexkv_config.json
-{
-    "server_recv_port": "ipc:///tmp/flexkv_test",
-    "cache_config": {
-          "enable_cpu": true,
-          "num_cpu_blocks": 10240
-    },
-    "num_log_interval_requests": 200
-}
-EOF
-export FLEXKV_CONFIG_PATH="./flexkv_config.json"
-```
-
-### 运行
-
-`examples/vllm_adaption_legacy/` 中的历史 patch 分别针对 vLLM 0.8.4 和 0.10.0。
-历史 `benchmarks/flexkv_benchmark/` 启动脚本不在当前仓库中。若需复现旧版部署，
-请使用包含对应脚本的兼容历史 FlexKV 版本；当前分支及其配置示例针对当前 API。

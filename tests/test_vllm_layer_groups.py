@@ -1,25 +1,36 @@
 """vLLM KV cache groups with mixed page sizes (DeepSeek-V4.1, GQA) as FlexKV layer groups."""
+import threading
+from types import SimpleNamespace
+
 import pytest
 import torch
 
-pytest.importorskip("vllm.v1.kv_cache_layout")
+if not hasattr(pytest.importorskip("vllm.v1.kv_cache_interface"), "KVCacheGroup"):
+    pytest.skip("needs vLLM 0.34.1's KV cache groups", allow_module_level=True)
 
+from vllm.v1.core.single_type_kv_cache_manager import (  # noqa: E402
+    CircularBufferManager,
+    FullAttentionManager,
+    SlidingWindowManager,
+)
 from vllm.v1.kv_cache_interface import (  # noqa: E402
-    CircularBufferSpec,
-    FullAttentionSpec,
+    AttentionSpec,
     KVCacheConfig,
-    KVCacheGroupSpec,
+    KVCacheGroup,
     KVCacheTensor,
     MLAAttentionSpec,
-    SlidingWindowMLASpec,
-    UniformTypeKVCacheSpecs,
     create_kv_cache_views,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout as VllmKVCacheLayout  # noqa: E402
 
-from flexkv.common.config import LayerGroupSpec, block_size_in_bytes_for_cache  # noqa: E402
+from flexkv.common.config import (  # noqa: E402
+    LayerGroupSpec,
+    block_size_in_bytes_for_cache,
+    build_layer_member_map,
+)
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType  # noqa: E402
-from flexkv.integration.config import FlexKVConfig  # noqa: E402
+from flexkv.integration.config import FlexKVConfig, VllmSWAGroups  # noqa: E402
+from flexkv.integration.vllm import vllm_v1_adapter as adapter  # noqa: E402
 from flexkv.integration.vllm.vllm_v1_adapter import FlexKVWorkerConnector  # noqa: E402
 from flexkv.transfer.template import compile_gpu_regions  # noqa: E402
 
@@ -30,35 +41,36 @@ NUM_BLOCKS = 16
 BLOCK = 116928  # one block of the MLA group: every page below, back to back
 
 
-def _mla(ratio, head, content):
-    return MLAAttentionSpec(block_size=64, num_kv_heads=1, head_size=head, dtype=torch.uint8,
-                            tokens_per_state=ratio, cache_dtype_str="fp8_ds_mla", alignment=576,
+def _mla(ratio, head, content, block_size=64):
+    return MLAAttentionSpec(block_size=block_size, num_kv_heads=1, max_tp_shards=1,
+                            head_size=head, dtype=torch.uint8, tokens_per_state=ratio,
+                            cache_dtype_str="fp8_ds_mla", alignment=576,
                             model_version="deepseek_v4", state_content_bytes=content)
 
 
-def _dsv41_config(scheduler: bool) -> KVCacheConfig:
-    """The H20 TP8 layout: SWA (bounded replay), compressed KV + indexer K,
-    compressor rings; only the MLA group is prefix-cacheable. Every TP rank
-    holds the same caches, yet vLLM's kv_tp_replicas is 1: its DeepSeek-V4.1
-    specs set no max_tp_shards."""
-    swa = SlidingWindowMLASpec(block_size=32, num_kv_heads=1, head_size=512, dtype=torch.uint8,
-                               sliding_window=128, cache_dtype_str="fp8_ds_mla",
-                               state_content_bytes=584, alignment=576,
-                               model_version="deepseek_v4", bounded_replay=True)
+def _group(manager, specs, **params):
+    return KVCacheGroup.from_layers(
+        {name: manager.layer_config(spec, **params) for name, spec in specs.items()})
+
+
+def _dsv41_config(kv_tp_replicas: int = 8, bounded_replay: bool = True) -> KVCacheConfig:
+    """The H20 TP8 layout: SWA, compressed KV + indexer K, compressor rings.
+    With SWA bounded replay only the MLA group is prefix-cacheable; without
+    it so are the SWA layers, in seven groups. Every TP rank holds the same
+    caches, which vLLM's kv_tp_replicas says."""
     swa_names = [f"{P}.{i}.attn.swa_cache" for i in range(40)]
+    num_swa_groups = 1 if bounded_replay else 7
+    swa_groups = [swa_names[g::num_swa_groups] for g in range(num_swa_groups)]
     specs = {}
     for i in (2, 8, 14, 20):
         ratio = 1 if i == 20 else 2
         specs[f"{P}.{i}.attn"] = _mla(ratio, 512, 584)
         specs[f"{P}.{i}.attn.indexer.k_cache"] = _mla(ratio, 132, None)
-    mla_spec = (next(iter(specs.values())) if scheduler
-                else UniformTypeKVCacheSpecs(block_size=64, kv_cache_specs=specs))
-    ring = CircularBufferSpec(block_size=8, num_kv_heads=1, head_size=1024, head_size_v=0,
-                              dtype=torch.float32)
+    ring = AttentionSpec(block_size=8, num_kv_heads=1, max_tp_shards=1, head_size=1024,
+                         head_size_v=0, dtype=torch.float32)
     ring_names = [f"{P}.{i}.attn.compressor.state_cache" for i in (2, 8, 14)]
     size = NUM_BLOCKS * BLOCK
-    tensors = [
-        KVCacheTensor(size, swa_names, 19008, BLOCK),
+    tensors = [KVCacheTensor(size, names, 19008, BLOCK) for names in swa_groups] + [
         KVCacheTensor(size, [f"{P}.{i}.attn" for i in (2, 8, 14)], 19008, BLOCK, 0),
         KVCacheTensor(size, [f"{P}.{i}.attn.indexer.k_cache" for i in (2, 8, 14)], 4608,
                       BLOCK, 57024),
@@ -66,9 +78,16 @@ def _dsv41_config(scheduler: bool) -> KVCacheConfig:
         KVCacheTensor(size, [f"{P}.20.attn.indexer.k_cache"], 8640, BLOCK, 108288),
         KVCacheTensor(size, ring_names, 32768, BLOCK),
     ]
-    groups = [KVCacheGroupSpec(swa_names, swa), KVCacheGroupSpec(list(specs), mla_spec),
-              KVCacheGroupSpec(ring_names, ring)]
-    config = KVCacheConfig(num_blocks=NUM_BLOCKS, kv_cache_tensors=tensors, kv_cache_groups=groups)
+    groups = [
+        _group(SlidingWindowManager, dict.fromkeys(names, _mla(1, 512, 584, block_size=32)),
+               sliding_window=128, bounded_replay=bounded_replay)
+        for names in swa_groups
+    ] + [
+        _group(FullAttentionManager, specs),
+        _group(CircularBufferManager, dict.fromkeys(ring_names, ring)),
+    ]
+    config = KVCacheConfig(num_blocks=NUM_BLOCKS, kv_cache_tensors=tensors, kv_cache_groups=groups,
+                           kv_tp_replicas=kv_tp_replicas)
     config.kv_cache_layout = "BLHNC"
     return config
 
@@ -79,9 +98,7 @@ def _vllm_cache_views(config, layer_names, kernel_block_size=None, raw=None):
     or a zeroed one."""
     specs = {}
     for group in config.kv_cache_groups:
-        specs.update(group.kv_cache_spec.kv_cache_specs
-                     if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
-                     else dict.fromkeys(group.layer_names, group.kv_cache_spec))
+        specs.update(group.kv_cache_specs)
     if raw is None:
         raw = torch.zeros(config.kv_cache_tensors[0].size, dtype=torch.int8)
     layout = VllmKVCacheLayout[config.kv_cache_layout]
@@ -111,11 +128,11 @@ def _register(flexkv_config, caches):
     return connector.tp_client.kwargs
 
 
-@pytest.mark.parametrize("scheduler", [True, False])
-def test_dsv41_mla_group_as_layer_groups(scheduler):
+@pytest.mark.parametrize("kv_tp_replicas", [8, 1])
+def test_dsv41_mla_group_as_layer_groups(kv_tp_replicas):
     flexkv_config = FlexKVConfig()
     flexkv_config.model_config.tp_size = 8
-    flexkv_config._configure_kv_layout_from_vllm_cache_config(_dsv41_config(scheduler))
+    flexkv_config._configure_kv_layout_from_vllm_cache_config(_dsv41_config(kv_tp_replicas))
 
     group = flexkv_config.vllm_kv_group
     assert group.group_id == 1 and group.num_blocks == NUM_BLOCKS
@@ -133,7 +150,7 @@ def test_dsv41_mla_group_as_layer_groups(scheduler):
 
 
 def test_dsv41_layouts_are_one_shared_head_per_page():
-    config = _dsv41_config(scheduler=False)
+    config = _dsv41_config()
     flexkv_config = FlexKVConfig()
     flexkv_config.model_config.tp_size = 8
     flexkv_config._configure_kv_layout_from_vllm_cache_config(config)
@@ -147,22 +164,21 @@ def test_dsv41_layouts_are_one_shared_head_per_page():
 
 
 G = "model.layers"
-WIDE_SPEC = FullAttentionSpec(block_size=16, num_kv_heads=2, head_size=128,
-                              dtype=torch.bfloat16)
-NARROW_SPEC = FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=64,
-                                dtype=torch.bfloat16)
+WIDE_SPEC = AttentionSpec(block_size=16, num_kv_heads=2, head_size=128, dtype=torch.bfloat16)
+NARROW_SPEC = AttentionSpec(block_size=16, num_kv_heads=1, head_size=64, dtype=torch.bfloat16)
 WIDE, NARROW = WIDE_SPEC.page_size_bytes, NARROW_SPEC.page_size_bytes
 GQA_BLOCK = 2 * WIDE + 2 * NARROW
 
 
-def _gqa_config(scheduler: bool, layout: str = "BLHNC") -> KVCacheConfig:
+def _gqa_config(layout: str = "BLHNC", mla_at: int | None = None) -> KVCacheConfig:
     """A GQA model's one KV cache group: four full-attention layers whose
     pages alternate between two sizes, at one TP rank's heads. TP splits the
-    heads, so the ranks' pages differ."""
+    heads, so the ranks' pages differ. ``mla_at`` makes one layer's cache MLA."""
     specs = {f"{G}.{i}.self_attn.attn": NARROW_SPEC if i % 2 else WIDE_SPEC
              for i in range(4)}
-    spec = (next(iter(specs.values())) if scheduler
-            else UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs=specs))
+    if mla_at is not None:
+        specs[f"{G}.{mla_at}.self_attn.attn"] = MLAAttentionSpec(
+            block_size=16, num_kv_heads=1, head_size=64, dtype=torch.bfloat16)
     wide_layers = [f"{G}.{i}.self_attn.attn" for i in (0, 2)]
     narrow_layers = [f"{G}.{i}.self_attn.attn" for i in (1, 3)]
     size = NUM_BLOCKS * GQA_BLOCK
@@ -174,17 +190,16 @@ def _gqa_config(scheduler: bool, layout: str = "BLHNC") -> KVCacheConfig:
                    KVCacheTensor(size, narrow_layers, NUM_BLOCKS * NARROW, NARROW,
                                  2 * NUM_BLOCKS * WIDE)]
     config = KVCacheConfig(num_blocks=NUM_BLOCKS, kv_cache_tensors=tensors,
-                           kv_cache_groups=[KVCacheGroupSpec(list(specs), spec)])
+                           kv_cache_groups=[_group(FullAttentionManager, specs)])
     config.kv_cache_layout = layout
     return config
 
 
 @pytest.mark.parametrize("layout", ["BLHNC", "LBHNC"])
-@pytest.mark.parametrize("scheduler", [True, False])
-def test_gqa_group_with_mixed_pages_as_layer_groups(scheduler, layout):
+def test_gqa_group_with_mixed_pages_as_layer_groups(layout):
     flexkv_config = FlexKVConfig()
     flexkv_config.model_config.tp_size = 4
-    flexkv_config._configure_kv_layout_from_vllm_cache_config(_gqa_config(scheduler, layout))
+    flexkv_config._configure_kv_layout_from_vllm_cache_config(_gqa_config(layout))
 
     group = flexkv_config.vllm_kv_group
     assert group.group_id == 0 and group.num_blocks == NUM_BLOCKS
@@ -200,7 +215,7 @@ def test_gqa_group_with_mixed_pages_as_layer_groups(scheduler, layout):
 
 @pytest.mark.parametrize("layout", ["BLHNC", "LBHNC"])
 def test_gqa_layouts_give_each_rank_heads(layout):
-    config = _gqa_config(scheduler=False, layout=layout)
+    config = _gqa_config(layout)
     flexkv_config = FlexKVConfig()
     flexkv_config.model_config.tp_size = 4
     flexkv_config._configure_kv_layout_from_vllm_cache_config(config)
@@ -216,22 +231,10 @@ def test_gqa_layouts_give_each_rank_heads(layout):
     assert (main.num_layer, main.num_head, main.num_kv_heads) == (4, 2, 2 * 4)
 
 
-def _gqa_config_with_mla_at(layer):
-    """The GQA group as a worker sees it, with layer ``layer``'s cache MLA."""
-    config = _gqa_config(scheduler=False)
-    group = config.kv_cache_groups[0]
-    specs = dict(group.kv_cache_spec.kv_cache_specs)
-    specs[f"{G}.{layer}.self_attn.attn"] = MLAAttentionSpec(
-        block_size=16, num_kv_heads=1, head_size=64, dtype=torch.bfloat16)
-    config.kv_cache_groups[0] = KVCacheGroupSpec(
-        group.layer_names, UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs=specs))
-    return config
-
-
 def test_group_mixing_mla_and_split_caches_keeps_a_copy_per_rank():
     flexkv_config = FlexKVConfig()
     flexkv_config.model_config.tp_size = 4
-    flexkv_config._configure_kv_layout_from_vllm_cache_config(_gqa_config_with_mla_at(1))
+    flexkv_config._configure_kv_layout_from_vllm_cache_config(_gqa_config(mla_at=1))
 
     assert not flexkv_config.vllm_kv_group.kv_shared_across_ranks
     assert flexkv_config.model_config.host_rank_copies == 4
@@ -242,11 +245,11 @@ def test_group_led_by_mla_with_split_caches_is_refused():
     flexkv_config.model_config.tp_size = 4
 
     with pytest.raises(ValueError, match="first layer is MLA"):
-        flexkv_config._configure_kv_layout_from_vllm_cache_config(_gqa_config_with_mla_at(0))
+        flexkv_config._configure_kv_layout_from_vllm_cache_config(_gqa_config(mla_at=0))
 
 
 def test_kernel_block_split_view_moves_whole_blocks():
-    config = _gqa_config(scheduler=False, layout="LBHNC")
+    config = _gqa_config("LBHNC")
     flexkv_config = FlexKVConfig()
     flexkv_config.model_config.tp_size = 4
     flexkv_config._configure_kv_layout_from_vllm_cache_config(config)
@@ -277,7 +280,7 @@ def test_block_stride_from_interleaved_view():
 
 
 def test_caches_vllm_replicates_keep_one_copy():
-    config = _gqa_config(scheduler=False)
+    config = _gqa_config()
     config.kv_tp_replicas = 4
     flexkv_config = FlexKVConfig()
     flexkv_config.model_config.tp_size = 4
@@ -286,3 +289,183 @@ def test_caches_vllm_replicates_keep_one_copy():
     model_config = flexkv_config.model_config
     assert flexkv_config.vllm_kv_group.kv_shared_across_ranks
     assert (model_config.num_kv_heads, model_config.host_rank_copies) == (1, 1)
+
+
+GLM5_MLA = MLAAttentionSpec(block_size=64, num_kv_heads=1, max_tp_shards=1, head_size=576,
+                            dtype=torch.bfloat16)
+GLM5_INDEX_K = MLAAttentionSpec(block_size=64, num_kv_heads=1, max_tp_shards=1, head_size=132,
+                                dtype=torch.uint8)
+
+
+def _glm5_config() -> KVCacheConfig:
+    """GLM-5's one KV cache group, layers outermost: MLA in every layer, index
+    K only in the layers IndexCache computes top-k in (0 and 3 here), whose
+    MLA vLLM keeps in a tensor of its own."""
+    indexed, rest = (0, 3), (1, 2, 4, 5)
+    mla = [f"{G}.{i}.self_attn.attn" for i in range(6)]
+    index_k = [f"{G}.{i}.self_attn.indexer.k_cache" for i in indexed]
+    k_page, mla_page = GLM5_INDEX_K.page_size_bytes, GLM5_MLA.page_size_bytes
+    size = NUM_BLOCKS * (2 * k_page + 6 * mla_page)
+    tensors = [
+        KVCacheTensor(size, index_k, NUM_BLOCKS * k_page, k_page),
+        KVCacheTensor(size, [mla[i] for i in indexed], NUM_BLOCKS * mla_page, mla_page,
+                      2 * NUM_BLOCKS * k_page),
+        KVCacheTensor(size, [mla[i] for i in rest], NUM_BLOCKS * mla_page, mla_page,
+                      2 * NUM_BLOCKS * (k_page + mla_page)),
+    ]
+    specs = {**dict.fromkeys(mla, GLM5_MLA), **dict.fromkeys(index_k, GLM5_INDEX_K)}
+    config = KVCacheConfig(num_blocks=NUM_BLOCKS, kv_cache_tensors=tensors,
+                           kv_cache_groups=[_group(FullAttentionManager, specs)], kv_tp_replicas=8)
+    config.kv_cache_layout = "LBNHC"
+    return config
+
+
+def test_glm5_indexcache_group_as_layer_groups():
+    config = _glm5_config()
+    flexkv_config = FlexKVConfig()
+    flexkv_config.model_config.tp_size = 8
+    flexkv_config._configure_kv_layout_from_vllm_cache_config(config)
+
+    group = flexkv_config.vllm_kv_group
+    assert group.layer_names == tuple(f"{G}.{i}.self_attn.attn" for i in range(6))
+    model_config = flexkv_config.model_config
+    assert [(g.head_size, g.layer_indices) for g in model_config.layer_groups] == [
+        (8448, [0, 3]), (73728, [0, 3]), (73728, [1, 2, 4, 5])]
+    assert model_config.host_rank_copies == 1
+    # A layer-wise load posts layer 3 once its index K and MLA pages landed.
+    assert build_layer_member_map(model_config.layer_groups, 6).members_of(3) == ((0, 1), (1, 1))
+
+    raw = torch.zeros(config.kv_cache_tensors[0].size, dtype=torch.int8)
+    registration = _register(flexkv_config, _vllm_cache_views(config, group.cache_layer_names,
+                                                              raw=raw))
+    assert [[t.data_ptr() - raw.data_ptr() for t in tensors]
+            for tensors in registration["handles_per_group"]] == [
+        [t.offset + i * t.layer_stride for i in range(len(t.layers))]
+        for t in config.kv_cache_tensors]
+
+
+def test_layerwise_needs_an_attention_that_waits_for_its_layer():
+    from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+
+    class OwnForward(MLAAttention):  # DeepSeek-V3.2 / GLM-5 without the patch
+        def forward(self, positions, hidden_states):
+            raise NotImplementedError
+
+    class Patched(OwnForward):
+        def _wait_for_kv_layer_load(self):
+            raise NotImplementedError
+
+    def layer(cls, direct_call=False):
+        obj = object.__new__(cls)
+        obj.__dict__["use_direct_call"] = direct_call
+        return obj
+
+    def waits(cls, direct_call=False):
+        return adapter._attention_waits_for_layers({"a": layer(cls, direct_call)}, ["a"])
+
+    assert waits(MLAAttention) and waits(Patched)
+    assert not waits(OwnForward) and not waits(MLAAttention, direct_call=True)
+
+
+@pytest.mark.parametrize("retention, interval", [(0, 0), (1024, 1024), (None, 64)])
+def test_dsv41_without_bounded_replay_snapshots_its_sliding_window_groups(retention, interval):
+    config = _dsv41_config(bounded_replay=False)
+    config.prefix_cache_retention_interval = retention
+    flexkv_config = FlexKVConfig()
+    flexkv_config.model_config.tp_size = 8
+    flexkv_config._configure_kv_layout_from_vllm_cache_config(config)
+
+    group = flexkv_config.vllm_kv_group
+    assert group.group_id == 7
+    assert (group.swa.group_ids, group.swa.window_blocks, group.swa.region_layer_names,
+            group.swa.interval) == (tuple(range(7)), 4, (f"{P}.0.attn.swa_cache",), interval)
+    swa = flexkv_config.cache_config.swa
+    assert (swa.pages_per_slot, swa.num_swa_layers, swa.bytes_per_token_per_layer) == (
+        28, 1, BLOCK // 64)
+    assert flexkv_config.cache_config.enable_swa_transfer
+
+    raw = torch.zeros(config.kv_cache_tensors[0].size, dtype=torch.int8)
+    caches = _vllm_cache_views(config, group.cache_layer_names + group.swa.region_layer_names, raw=raw)
+    registration = _register(flexkv_config, caches)
+
+    (pages,) = registration["swa_caches"]
+    assert pages.shape == (NUM_BLOCKS, BLOCK) and pages.data_ptr() == raw.data_ptr()
+    layout = registration["swa_layout"]
+    assert (layout.num_block, layout.tokens_per_block, layout.head_size) == (
+        NUM_BLOCKS, 64, BLOCK // 64)
+
+
+def _sliding_window_hybrid_config() -> KVCacheConfig:
+    """Four full-attention and four sliding-window layers with layers
+    outermost: the two groups overlay the same four layer regions."""
+    full = [f"{G}.{i}.self_attn.attn" for i in range(0, 8, 2)]
+    swa = [f"{G}.{i}.self_attn.attn" for i in range(1, 8, 2)]
+    size = 4 * NUM_BLOCKS * WIDE
+    tensors = [KVCacheTensor(size, names, NUM_BLOCKS * WIDE, WIDE) for names in (swa, full)]
+    groups = [
+        _group(SlidingWindowManager, dict.fromkeys(swa, WIDE_SPEC),
+               sliding_window=128, bounded_replay=False),
+        _group(FullAttentionManager, dict.fromkeys(full, WIDE_SPEC)),
+    ]
+    config = KVCacheConfig(num_blocks=NUM_BLOCKS, kv_cache_tensors=tensors, kv_cache_groups=groups,
+                           prefix_cache_retention_interval=0)
+    config.kv_cache_layout = "LBHNC"
+    return config
+
+
+def test_layer_outermost_sliding_window_groups_snapshot_each_layer_region():
+    config = _sliding_window_hybrid_config()
+    flexkv_config = FlexKVConfig()
+    flexkv_config.cache_config.tokens_per_block = 16
+    flexkv_config.model_config.dtype = torch.bfloat16
+    flexkv_config._configure_kv_layout_from_vllm_cache_config(config)
+
+    group = flexkv_config.vllm_kv_group
+    regions = tuple(f"{G}.{i}.self_attn.attn" for i in range(1, 8, 2))
+    assert group.group_id == 1
+    assert group.swa == VllmSWAGroups(
+        (0,), 16, 8, WIDE, regions, tuple((name, i) for i, name in enumerate(regions)))
+    swa = flexkv_config.cache_config.swa
+    assert (swa.pages_per_slot, swa.num_swa_layers) == (8, 4)
+
+    raw = torch.zeros(config.kv_cache_tensors[0].size, dtype=torch.int8)
+    connector = object.__new__(FlexKVWorkerConnector)
+    connector.flexkv_config = flexkv_config
+    connector.layerwise_counter_pool = None
+    registration = connector._swa_registration(
+        _vllm_cache_views(config, regions, raw=raw), group)
+    assert [r.data_ptr() - raw.data_ptr() for r in registration["swa_caches"]] == [
+        i * NUM_BLOCKS * WIDE for i in range(4)]
+    assert all(r.shape == (NUM_BLOCKS, WIDE) for r in registration["swa_caches"])
+    assert registration["swa_layout"].num_layer == 4
+
+
+@pytest.mark.parametrize("config, tokens_per_block, waits", [
+    pytest.param(_dsv41_config(bounded_replay=False), 64,
+                 {f"{P}.{i}.attn.swa_cache": f"{P}.2.attn" for i in (0, 13, 39)},
+                 id="blocks-outermost"),
+    pytest.param(_sliding_window_hybrid_config(), 16,
+                 {f"{G}.{i}.self_attn.attn": f"{G}.{i - 1}.self_attn.attn" for i in (1, 5)},
+                 id="layers-outermost"),
+])
+def test_a_layerwise_load_lands_each_window_region_with_its_flexkv_layer(
+        config, tokens_per_block, waits):
+    flexkv_config = FlexKVConfig()
+    flexkv_config.cache_config.tokens_per_block = tokens_per_block
+    flexkv_config.model_config.dtype = torch.bfloat16
+    flexkv_config._configure_kv_layout_from_vllm_cache_config(config)
+    group = flexkv_config.vllm_kv_group
+    connector = object.__new__(FlexKVWorkerConnector)
+    connector.flexkv_config = flexkv_config
+    connector.rank_info = SimpleNamespace(dp_client_id=0, pp_rank=0, effective_tp_rank=0,
+                                          model_config=flexkv_config.model_config)
+    connector._forward_context = None
+    connector.layerwise_counter_pool = connector._layerwise_sender_error = None
+    connector._layerwise_sender_cancel = threading.Event()
+    connector._layerwise_sender_cancel.set()
+
+    connector._start_layerwise_eventfd_sender(group.layer_names or group.cache_layer_names)
+    pool = connector.layerwise_counter_pool
+    connector.shutdown()
+
+    assert {name: pool.layer_names[pool.layer_to_index[name]] for name in waits} == waits

@@ -6,7 +6,7 @@
 
 Starting from **vLLM v0.17.2rc0** (commit [`8cb24d3`](https://github.com/vllm-project/vllm/commit/8cb24d3aedb9f431fb15a636a3e11a00262f5991)), `FlexKVConnectorV1` is built into vLLM — **no patch is needed anymore**.
 
-> **Recommended**: Install vLLM v0.17.2 ~ v0.28.x, or v0.33.0 with [its patch](#patching-vllm). Since v0.29.0 the built-in connector can no longer start FlexKV. The other patch files under `examples/vllm_adaption/` are retained for users who need to use vLLM < 0.17.2.
+> **Recommended**: Install vLLM v0.17.2 ~ v0.28.x, or v0.33.0 / v0.34.1 with [its patch](#patching-vllm). Since v0.29.0 the built-in connector can no longer start FlexKV.
 
 ---
 
@@ -17,7 +17,7 @@ In commit [`0290841dce65ae9b036a23d733cf94e47e814934`](https://github.com/taco-p
 This change involves significant API adjustments. Therefore, please note:
 
 - **Version >= `1.0.0`**: Use the **current version API**.
-- **Version == `0.1.0`**: Supports the **legacy version API** only; the vLLM patch is located in `examples/vllm_adaption_legacy/`.
+- **Version == `0.1.0`**: Supports the **legacy version API** only.
 
 ---
 
@@ -27,7 +27,7 @@ This change involves significant API adjustments. Therefore, please note:
 - FlexKV >= `1.0.0`
 - vLLM `0.17.2` ~ `0.28.x`: FlexKVConnectorV1 is built in — no patch required
 - vLLM `0.33.0`: the built-in FlexKVConnectorV1 must be patched, see [Patching vLLM](#patching-vllm)
-- vLLM `0.10.1` ~ `0.17.1`: Manual patch required, see [Patching vLLM](#patching-vllm)
+- vLLM `0.34.1` (main [`d51a514`](https://github.com/vllm-project/vllm/commit/d51a5147112a31dfbed08cfa4b774c27c34ce90d), nightly `0.34.1rc1.dev96`; not 0.34.0): the built-in FlexKVConnectorV1 must be patched, see [Patching vLLM](#patching-vllm)
 
 ### Configuration
 
@@ -63,6 +63,9 @@ export FLEXKV_ENABLE_RADIXSHMEM=1
 1. Install vLLM, then patch it if its version needs it (see [Patching vLLM](#patching-vllm))
 ```bash
 pip install 'vllm==0.33.0'
+# or 0.34.1, the nightly wheel its patch applies to
+pip install 'vllm==0.34.1rc1.dev96+g249e65290' \
+    --extra-index-url https://wheels.vllm.ai/249e652909228b61bba2c409ca5ae6c84d236783
 ```
 
 2. Install FlexKV
@@ -109,9 +112,7 @@ VLLM_USE_V1=1 python -m vllm.entrypoints.cli.main serve MODEL \
 `use_layerwise=true` is required so vLLM selects PIECEWISE CUDA graph mode;
 the per-layer eventfd waits cannot execute correctly inside a captured full
 CUDA graph. For safety, setting `FLEXKV_ENABLE_LAYERWISE_TRANSFER=1` alone is
-ignored by the vLLM adapter. The vLLM 0.33.0 patch already contains the
-matching wrapper change; for other versions, until it is merged upstream, apply
-`examples/vllm_adaption/vllm_main-flexkv-layerwise-wrapper.patch` to vLLM.
+ignored by the vLLM adapter. It needs the vLLM 0.33.0 or 0.34.1 patch.
 
 The feature currently pipelines GET/H2D only. PUT remains request-level async.
 Context parallelism (`context_parallel_size > 1`) is not supported yet because
@@ -121,8 +122,14 @@ CPU/SSD/remote staging rather than direct `DISK2D` operations.
 If a layer does not become ready within
 `FLEXKV_LAYERWISE_WAIT_TIMEOUT_S` (default `60` seconds), the forward fails
 instead of hanging indefinitely. The model's attention must wait for each layer
-it reads; FlexKV refuses to start otherwise. DeepSeek-V4.1's does on vLLM 0.33.0
-with `examples/vllm_adaption/vllm_0_33_0-deepseek-v41-layerwise.patch`.
+it reads; FlexKV refuses to start otherwise. These models' attention does with a
+patch in `examples/vllm_adaption/` for vLLM 0.33.0 (`vllm_0_33_0-*`) or 0.34.1
+(`vllm_0_34_1-*`):
+
+| Model | Patch |
+|---|---|
+| DeepSeek-V4.1 | `vllm_<version>-deepseek-v41-layerwise.patch` |
+| DeepSeek-V3.2, GLM-5.x (`GlmMoeDsaForCausalLM`, e.g. GLM-5.3) | `vllm_<version>-deepseek-v32-layerwise.patch` |
 
 ### Patching vLLM
 
@@ -130,37 +137,43 @@ Apply the patch matching your vLLM version:
 
 | vLLM Version | Patch File |
 |---|---|
-| 0.10.1.1 | `examples/vllm_adaption/vllm_0_10_1_1-flexkv-connector.patch` |
-| 0.14.1+ | `examples/vllm_adaption/vllm_up_0_14_1-flexkv-connector.patch` |
-| 0.16.0 | `examples/vllm_adaption/vllm_0_16_0-flexkv-connector.patch` |
 | 0.33.0 | `examples/vllm_adaption/vllm_0_33_0-flexkv-connector.patch` |
+| 0.34.1 | `examples/vllm_adaption/vllm_0_34_1-flexkv-connector.patch` |
 
 ```bash
 cd vllm
 # Set FLEXKV_DIR and choose the patch matching your vLLM version.
-PATCH_FILE=vllm_0_16_0-flexkv-connector.patch
+PATCH_FILE=vllm_0_34_1-flexkv-connector.patch
 git apply "$FLEXKV_DIR/examples/vllm_adaption/$PATCH_FILE"
 pip install -e .
 ```
 
-The 0.33.0 patch makes the built-in connector pass vLLM's `KVCacheConfig` to
-FlexKV and forward cache reset, sleep/wake and layer-wise loading. It also lets
+The 0.33.0 and 0.34.1 patches make the built-in connector pass vLLM's
+`KVCacheConfig` to FlexKV and forward cache reset, sleep/wake and layer-wise loading. It also lets
 the connector run under vLLM's hybrid KV cache manager, which DeepSeek-V4.1
-needs: FlexKV stores the model's prefix-cacheable group (the compressed KV and
-indexer K of its KV-source layers), and vLLM's SWA bounded replay rebuilds the
-sliding-window caches after a hit. Other models with several prefix-cacheable
-groups need `--disable-hybrid-kv-cache-manager`. The stored group's layers may
-keep pages of different sizes: a CPU/SSD block then holds one copy of the
+needs. With `--no-swa-bounded-replay` FlexKV also stores the sliding-window KV
+at the last block boundary of each prompt and of each answer, so that the next
+turn of a conversation hits at the end of the last answer. With vLLM's
+`--prefix-cache-retention-interval N` (N > 0) it also stores the window at
+token positions that are multiples of N: at every such position during decode;
+during prefill, which vLLM computes in chunks, only at the last such position
+inside each chunk (a chunk that spans several of them stores just the last
+one). A FlexKV hit can only end where a window is stored, so cached Full KV
+past the last window is recomputed. `swa.num_cpu_slots` (default 1024) and
+`swa.num_ssd_slots` in the FlexKV config set how many windows the CPU and SSD
+tiers keep. The layers FlexKV stores may keep
+pages of different sizes: a CPU/SSD block then holds one copy of the
 pages when every TP rank holds the same ones (MLA, or vLLM's `kv_tp_replicas`
 says so), and one copy per TP rank otherwise (e.g. GQA/MHA, whose heads TP
-splits). The patch also applies to an
-installed wheel:
+splits). On 0.34.1 the patch also keeps vLLM's extensible KV cache off, as
+FlexKV's transfer engine opens the KV cache through CUDA IPC. A patch also
+applies to an installed wheel:
 ```bash
 cd "$(python -c 'import os, vllm; print(os.path.dirname(os.path.dirname(vllm.__file__)))')"
-git apply --include='vllm/*' "$FLEXKV_DIR/examples/vllm_adaption/vllm_0_33_0-flexkv-connector.patch"
+git apply --include='vllm/*' "$FLEXKV_DIR/examples/vllm_adaption/$PATCH_FILE"
 ```
 
-With the 0.33.0 patch a FlexKV load that fails reaches vLLM as a failed receive,
+With the 0.33.0 or 0.34.1 patch a FlexKV load that fails reaches vLLM as a failed receive,
 and vLLM applies its `kv_load_failure_policy`: by default (`"fail"`) the request
 ends with an error, with `"recompute"` vLLM recomputes it without FlexKV. Set it
 in `--kv-transfer-config`, e.g.
@@ -171,36 +184,3 @@ While FlexKV still copies a finished request's KV out of its GPU blocks, a vLLM
 short of blocks waits for them rather than preempting a running request. It
 stops waiting once the oldest such copy has run for `FLEXKV_PENDING_FREE_WAIT_S`
 seconds (default `5`; `0` turns the wait off).
-
----
-
-## Legacy Version (<= 0.1.0) – Not Recommended for Current Use
-
-### Supported Versions
-- FlexKV <= `0.1.0`
-
-### Configuration
-
-Legacy version configuration:
-```bash
-# generate config
-cat <<EOF > ./flexkv_config.json
-{
-    "server_recv_port": "ipc:///tmp/flexkv_test",
-    "cache_config": {
-          "enable_cpu": true,
-          "num_cpu_blocks": 10240
-    },
-    "num_log_interval_requests": 200
-}
-EOF
-export FLEXKV_CONFIG_PATH="./flexkv_config.json"
-```
-
-### Running
-
-The legacy patches in `examples/vllm_adaption_legacy/` target vLLM 0.8.4 and
-0.10.0 respectively. The historical `benchmarks/flexkv_benchmark/` launch
-scripts are not present in this checkout. To reproduce a legacy deployment,
-use a compatible historical FlexKV revision containing its scripts; the current
-branch and its configuration examples target the current API.

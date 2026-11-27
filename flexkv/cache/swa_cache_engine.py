@@ -13,40 +13,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SWAOpConstructor — SWA peer-op graph builder.
+"""SWAOpConstructor: appends SWA ops to a request's transfer graph.
 
-The node-mounted SWA state lives on the Full-KV radix nodes; per-tier match,
-slot allocation, pinning, and node ownership are resolved inside
-``GlobalCacheEngine._get_impl_*`` / ``_put_impl_*`` alongside the Full-KV plan.
-This module is intentionally narrower: given resolved SWA slot ids, it appends
-the peer SWA ops into the same ``TransferOpGraph`` as the Full-KV ops.
+An SWA snapshot, the sliding-window state at the end of a cached prefix, is
+mounted on that prefix's Full-KV radix node but lives in its own pool, addressed
+by SWA slot ids rather than Full-KV block ids. The GET / PUT planners pick and
+pin the slots; this module only builds their ops.
 
-Responsibilities (control plane only — no byte movement):
-  * Build SWA *peer* ops into the SAME ``TransferOpGraph`` as the full-KV ops,
-    with tier dependencies that mirror the full-KV graph exactly. SWA ops reuse
-    the STANDARD transfer types (H2D / D2H / DISK2H / H2DISK / REMOTE2H /
-    H2REMOTE) and carry ``is_swa=True`` so the transfer engine routes them to the
-    dedicated SWA worker; their src/dst block ids are SWA-pool slot ids:
-      - GET: the SWA ``H2D`` depends on the SWA ``DISK2H`` / ``REMOTE2H`` staging
-        ops; only the terminal SWA ``H2D`` is reported as a finished op (joins
-        the VIRTUAL barrier alongside the full-KV ``H2D``).
-      - PUT: the SWA ``H2DISK`` / ``H2REMOTE`` write-through ops depend on the SWA
-        ``D2H`` but are fire-and-forget (NOT reported), only the SWA ``D2H`` is
-        reported — exactly like the full-KV ``D2H`` / ``H2DISK`` / ``H2REMOTE``.
+SWA ops go into the same ``TransferOpGraph`` as the request's Full-KV ops, so
+the request completes only when both do. They are ops of their own, not part of
+a Full-KV op like the indexer layer group, because their ids index another
+pool. They use the standard transfer types, tagged ``pool_id=PoolId.SWA``, and
+the transfer engine picks their worker by ``(pool_id, transfer_type)``.
 
-SWA is a first-class PEER op, NOT a child derived from the full-KV op: the
-full-KV ``pending_count`` child model is PP-sibling
-replica fan-out, the indexer rides the full op as a layer-group sharing block
-ids, and neither fits SWA (independent slot space; the SWA-only case has no full
-op to derive from). The data-plane colleague aligned on the ``is_swa`` flag (a
-plain ``TransferOp`` field) rather than dedicated SWA transfer types, so the
-graph stays homogeneous and routing is a single boolean.
+The SWA ops are chained like the Full-KV ones, with no edge between the chains:
 
-Everything here is gated by ``cache_config.enable_swa_transfer`` (default False):
-until the dedicated SWA transfer worker (data plane) is registered, the build
-helpers are no-ops so an SWA op never reaches the transfer engine. The byte
-movement, kernels, SWA SSD/remote storage and completion callbacks are the data
-plane's responsibility.
+  * GET: ``DISK2H`` / ``REMOTE2H`` -> ``H2D``; the caller adds the ``H2D`` to
+    ``finished_ops_ids``.
+  * PUT: ``D2H`` -> ``H2DISK`` / ``H2REMOTE``; only the ``D2H`` is added, so
+    the SSD / remote writes may finish after the PUT is reported done.
+
+The build helpers are no-ops unless ``cache_config.enable_swa_transfer`` is set
+and the CPU tier has an SWA pool.
 """
 
 from dataclasses import dataclass
@@ -122,6 +110,10 @@ class SWAOpConstructor:
         dst = np.asarray(dst_slot_ids, dtype=np.int64)
         if src.size == 0 or dst.size == 0:
             return None
+        pages = self._gce.cache_config.swa.pages_per_slot
+        if pages > 1:
+            src = self._slot_pages(src, pages, transfer_type is TransferType.D2H)
+            dst = self._slot_pages(dst, pages, transfer_type is TransferType.H2D)
         is_remote = transfer_type in (TransferType.H2REMOTE, TransferType.REMOTE2H)
         tail_hashes = (
             [str(h) for h in mooncake_tail_hashes]
@@ -139,6 +131,18 @@ class SWAOpConstructor:
         )
         graph.add_transfer_op(op)
         return op.op_id
+
+    def host_pages(self, slot_ids: np.ndarray) -> np.ndarray:
+        """The CPU/SSD pages of SWA pool slots ``slot_ids``."""
+        return self._slot_pages(np.asarray(slot_ids, dtype=np.int64),
+                                self._gce.cache_config.swa.pages_per_slot, on_gpu=False)
+
+    @staticmethod
+    def _slot_pages(slot_ids: np.ndarray, pages: int, on_gpu: bool) -> np.ndarray:
+        """The page ids of ``slot_ids``; GPU ids are placeholders bound at launch."""
+        if on_gpu:
+            return np.repeat(slot_ids, pages)
+        return (slot_ids[:, None] * pages + np.arange(pages, dtype=np.int64)).ravel()
 
     def build_get_chain(self,
                         graph: TransferOpGraph,

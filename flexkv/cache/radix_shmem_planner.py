@@ -789,14 +789,15 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
         swa_ops: List[TransferOp] = []
         if swa_slots is not None:
             remote_swa = match.swa_rank != ssd.rank
+            src_pages = self.swa_op_constructor.host_pages(match.swa_slots)
             op = TransferOp(
                 graph_id=transfer_graph.graph_id,
                 transfer_type=TransferType.PEERSSD2H if remote_swa else TransferType.DISK2H,
-                src_block_ids=match.swa_slots,
-                dst_block_ids=swa_slots,
+                src_block_ids=src_pages,
+                dst_block_ids=self.swa_op_constructor.host_pages(swa_slots),
                 dp_client_id=dp_client_id,
                 pool_id=PoolId.SWA,
-                src_block_node_ids=(np.full(len(swa_slots), match.swa_rank, dtype=np.int64)
+                src_block_node_ids=(np.full(len(src_pages), match.swa_rank, dtype=np.int64)
                                     if remote_swa else None),
             )
             transfer_graph.add_transfer_op(op)
@@ -1185,14 +1186,15 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
                 swa_h2disk_id = swa_ops.h2disk_id
                 finished_ops_ids.append(swa_d2h_id)
                 if ssd_peer >= 0 and ssd_swa_new is not None:
+                    src_pages = self.swa_op_constructor.host_pages(swa_new)
                     op = TransferOp(
                         graph_id=transfer_graph.graph_id,
                         transfer_type=TransferType.H2PEERSSD,
-                        src_block_ids=swa_new,
-                        dst_block_ids=ssd_swa_new,
+                        src_block_ids=src_pages,
+                        dst_block_ids=self.swa_op_constructor.host_pages(ssd_swa_new),
                         dp_client_id=dp_client_id,
                         pool_id=PoolId.SWA,
-                        src_block_node_ids=np.full(len(swa_new), ssd_peer, dtype=np.int64),
+                        src_block_node_ids=np.full(len(src_pages), ssd_peer, dtype=np.int64),
                     )
                     transfer_graph.add_transfer_op(op)
                     transfer_graph.add_dependency(op.op_id, swa_d2h_id)

@@ -59,9 +59,10 @@ def _sweep(name: str) -> None:
 
 @contextlib.contextmanager
 def _engine(swa: bool = False, ssd_blocks: int = SSD_BLOCKS, reuse_ssd_server=None,
-            tag: str = ""):
+            tag: str = "", pages: int = 1):
     """A `RadixShmemCacheEngine` on a data-mode CPU server and an index-only
-    SSD server (both in-process). Yields (engine, ssd_server)."""
+    SSD server (both in-process), SWA slots of ``pages`` pages. Yields
+    (engine, ssd_server)."""
     pid = os.getpid()
     cpu_name, ssd_name = f"/ssdtcpu{pid}{tag}", f"/ssdtssd{pid}"
     saved = {k: getattr(GLOBAL_CONFIG_FROM_ENV, k) for k in
@@ -79,7 +80,7 @@ def _engine(swa: bool = False, ssd_blocks: int = SSD_BLOCKS, reuse_ssd_server=No
             cache_config.swa = SWAPoolConfig(enabled=True, num_slots=swa_slots,
                                              num_ssd_slots=4 * swa_slots, num_swa_layers=1,
                                              bytes_per_token_per_layer=64,
-                                             window_blocks=SWA_W)
+                                             window_blocks=SWA_W, pages_per_slot=pages)
             cache_config.enable_swa_transfer = True
         model_config = ModelConfig(num_layers=2, num_kv_heads=4, head_size=64,
                                    dtype=torch.float16, tp_size=1, dp_size=1)
@@ -306,20 +307,22 @@ def test_prefetch_plans_a_peer_ssd_run_as_peerssd2h():
         assert released == [1] and _hit(cpu, tok) == 10
 
 
-def test_swa_rides_through_the_ssd():
-    with _engine(swa=True) as (engine, _):
+@pytest.mark.parametrize("pages", [1, 3])
+def test_swa_rides_through_the_ssd(pages):
+    with _engine(swa=True, pages=pages) as (engine, _):
         cpu, ssd = engine.cpu_cache_engine, engine.ssd_cache_engine
         tok, mask, sm = _request(10)
         graph, _, _, _ = _put(engine, tok, mask, sm)
         ops = _ops(graph)
-        assert len(ops[(TransferType.H2DISK, PoolId.SWA)][0].dst_block_ids) == SWA_W
+        assert len(ops[(TransferType.H2DISK, PoolId.SWA)][0].dst_block_ids) == SWA_W * pages
         assert _hit(ssd, tok, JOINT_MASK) == 10
         cpu.reset()
         graph, ret, cb, _, _ = _get(engine, tok, mask, sm, swa_aware=True)
         ops = _ops(graph)
         swa_read = ops[(TransferType.DISK2H, PoolId.SWA)]
         swa_h2d = ops[(TransferType.H2D, PoolId.SWA)]
-        assert len(swa_read[0].src_block_ids) == SWA_W
+        assert len(swa_read[0].src_block_ids) == SWA_W * pages
+        assert len(swa_h2d[0].dst_block_ids) == SWA_W * pages
         assert swa_read[0].op_id in swa_h2d[0].predecessors
         cb()
         assert _hit(cpu, tok, JOINT_MASK) == 10
@@ -644,9 +647,10 @@ def test_global_dedup_local_fraction_skips_the_cluster_lookup():
         assert (TransferType.H2DISK, PoolId.FULL_KV) in _ops(graph)
 
 
-def test_global_dedup_carries_the_swa_window_to_the_peer():
+@pytest.mark.parametrize("pages", [1, 3])
+def test_global_dedup_carries_the_swa_window_to_the_peer(pages):
     from flexkv.common.transfer import CompletedOp
-    with _engine(swa=True) as (engine, _):
+    with _engine(swa=True, pages=pages) as (engine, _):
         tok, mask, sm = _request(10)
         with _dedup_peer(engine, local_blocks=0, peer_blocks=6) as calls:
             graph, ret, cb, op_cbs = _put(engine, tok, mask, sm, complete=False)
@@ -654,6 +658,9 @@ def test_global_dedup_carries_the_swa_window_to_the_peer():
             (swa_op,) = ops[(TransferType.H2PEERSSD, PoolId.SWA)]
             (full_op,) = ops[(TransferType.H2PEERSSD, PoolId.FULL_KV)]
             assert (TransferType.H2DISK, PoolId.SWA) not in ops
+            first = 700 * pages
+            assert swa_op.dst_block_ids.tolist() == list(range(first, first + SWA_W * pages))
+            assert len(swa_op.src_block_node_ids) == SWA_W * pages
             assert calls["take"] == [(3, 4, SWA_W)]
             for op_id in sorted(op_cbs):
                 if op_id in (swa_op.op_id, full_op.op_id):
